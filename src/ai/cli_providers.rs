@@ -396,10 +396,15 @@ impl AiProvider for CodexCliProvider {
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("");
                             let short_tid: String = tid.chars().take(8).collect();
-                            emit_progress(AiProgressUpdate::Stage(format!(
-                                "Codex 会话已连接 ({})",
-                                short_tid
-                            )));
+                            let locale = crate::i18n::current_thread_locale();
+                            emit_progress(AiProgressUpdate::Stage(
+                                rust_i18n::t!(
+                                    "ai.codex_connected",
+                                    locale = locale.as_str(),
+                                    sid = short_tid
+                                )
+                                .into_owned(),
+                            ));
                         }
                         Some("item.started") | Some("item.completed") => {
                             if let Some(item) = v.get("item") {
@@ -419,10 +424,15 @@ impl AiProvider for CodexCliProvider {
                                         }
                                     }
                                 } else if !kind.is_empty() {
-                                    emit_progress(AiProgressUpdate::Stage(format!(
-                                        "Codex 步骤: {}",
-                                        kind
-                                    )));
+                                    let locale = crate::i18n::current_thread_locale();
+                                    emit_progress(AiProgressUpdate::Stage(
+                                        rust_i18n::t!(
+                                            "ai.codex_step",
+                                            locale = locale.as_str(),
+                                            kind = kind
+                                        )
+                                        .into_owned(),
+                                    ));
                                 }
                             }
                         }
@@ -569,10 +579,16 @@ impl AiProvider for AgyCliProvider {
                         .chars()
                         .take(8)
                         .collect();
-                    emit_progress(AiProgressUpdate::Stage(format!(
-                        "连接 {} ({})",
-                        model, short_cid
-                    )));
+                    let locale = crate::i18n::current_thread_locale();
+                    emit_progress(AiProgressUpdate::Stage(
+                        rust_i18n::t!(
+                            "ai.cli_connected",
+                            locale = locale.as_str(),
+                            model = model,
+                            cid = short_cid
+                        )
+                        .into_owned(),
+                    ));
                 }
                 Some("step_update") => {
                     if let Some(su) = v.get("step_update") {
@@ -591,20 +607,30 @@ impl AiProvider for AgyCliProvider {
                             };
                             if step_key != last_step_key {
                                 last_step_key = step_key;
+                                let locale = crate::i18n::current_thread_locale();
                                 match stype {
                                     "user_input" => {
                                         emit_progress(AiProgressUpdate::Stage(
-                                            "等待响应...".to_string(),
+                                            rust_i18n::t!(
+                                                "ai.waiting_response",
+                                                locale = locale.as_str()
+                                            )
+                                            .into_owned(),
                                         ));
                                     }
                                     "planner_response" | "thought" | "thinking" => {
                                         emit_progress(AiProgressUpdate::Stage(
-                                            "思考中...".to_string(),
+                                            rust_i18n::t!("ai.thinking", locale = locale.as_str())
+                                                .into_owned(),
                                         ));
                                     }
                                     "agent_response" => {
                                         emit_progress(AiProgressUpdate::Stage(
-                                            "输出中...".to_string(),
+                                            rust_i18n::t!(
+                                                "ai.streaming_output",
+                                                locale = locale.as_str()
+                                            )
+                                            .into_owned(),
                                         ));
                                     }
                                     "tool" if state == "ACTIVE" => {
@@ -623,7 +649,12 @@ impl AiProvider for AgyCliProvider {
                                             })
                                             .unwrap_or("");
                                         let label = if target.is_empty() {
-                                            format!("调用 {}", tool_name)
+                                            rust_i18n::t!(
+                                                "ai.calling_tool",
+                                                locale = locale.as_str(),
+                                                tool = tool_name
+                                            )
+                                            .into_owned()
                                         } else {
                                             let short_target: String = target
                                                 .chars()
@@ -639,10 +670,15 @@ impl AiProvider for AgyCliProvider {
                                     }
                                     "tool" => {}
                                     other => {
-                                        emit_progress(AiProgressUpdate::Stage(format!(
-                                            "执行步骤: {} ({})",
-                                            other, state
-                                        )));
+                                        emit_progress(AiProgressUpdate::Stage(
+                                            rust_i18n::t!(
+                                                "ai.exec_step",
+                                                locale = locale.as_str(),
+                                                step = other,
+                                                state = state
+                                            )
+                                            .into_owned(),
+                                        ));
                                     }
                                 }
                             }
@@ -684,10 +720,17 @@ impl AiProvider for AgyCliProvider {
                             .and_then(|u| u.get("output_tokens"))
                             .and_then(|n| n.as_u64());
                         if let (Some(d), Some(it), Some(ot)) = (dur, in_tok, out_tok) {
-                            emit_progress(AiProgressUpdate::LogLine(format!(
-                                "完成 {:.1}s ({} in / {} out)",
-                                d, it, ot
-                            )));
+                            let locale = crate::i18n::current_thread_locale();
+                            emit_progress(AiProgressUpdate::LogLine(
+                                rust_i18n::t!(
+                                    "ai.cli_done",
+                                    locale = locale.as_str(),
+                                    dur = format!("{:.1}", d),
+                                    in_tok = it,
+                                    out_tok = ot
+                                )
+                                .into_owned(),
+                            ));
                         }
                     }
                 }
@@ -784,8 +827,10 @@ impl AiProvider for GeminiCliProvider {
             || raw.contains("invalid_grant")
             || raw.contains("Failed to authenticate")
         {
+            let locale = crate::i18n::current_thread_locale();
             bail!(
-                "Gemini CLI OAuth 授权已过期或未登录 (invalid_grant)，请先在终端直接运行 `gemini` 完成授权登录，或改用 `--ai agy` / `--ai codex`"
+                "{}",
+                rust_i18n::t!("ai.gemini_oauth_expired", locale = locale.as_str())
             );
         }
         if want_json_envelope {

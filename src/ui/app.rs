@@ -15,12 +15,13 @@ use ratatui::text::{Line, Span, Text};
 use crate::ai::{self, ProviderDescriptor};
 use crate::config::AppConfig;
 use crate::difft::{DifftEngine, parse_source_line_from_ansi};
+use crate::i18n;
 use crate::ignore::IgnoreMatcher;
 use crate::model::{
     AiReviewResult, CommitInfo, DiffTarget, DifftDisplayMode, FileDiffRendered, HunkAnalysis,
     ReviewFinding, ReviewGroup, ReviewSessionState, UserNote,
 };
-use crate::ui::export::export_review_markdown;
+use crate::ui::export::export_review_markdown_with_locale;
 use crate::vcs::{DiffBundle, VcsBackend};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +38,10 @@ impl PaneFocus {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: &str) -> String {
         match self {
-            PaneFocus::Tree => "Focus Tree",
-            PaneFocus::Diff => "Continuous Diff",
+            PaneFocus::Tree => rust_i18n::t!("focus.tree", locale = locale).into_owned(),
+            PaneFocus::Diff => rust_i18n::t!("focus.diff", locale = locale).into_owned(),
         }
     }
 }
@@ -64,6 +65,7 @@ pub enum InputMode {
 pub enum OverlayKind {
     None,
     Help,
+    Settings,
     CommitPicker,
     AiPicker,
     CommitConfirm,
@@ -333,6 +335,11 @@ pub struct App {
     pub status_message: String,
     pub should_quit: bool,
 
+    pub settings_cursor: usize,
+    pub settings_status: Option<String>,
+    pub settings_ai_dirty: bool,
+    pub config_path_override: Option<PathBuf>,
+
     pub bg_rx: Receiver<BgMessage>,
     bg_tx: mpsc::Sender<BgMessage>,
 }
@@ -362,6 +369,7 @@ impl App {
             None
         };
         let (bg_tx, bg_rx) = mpsc::channel();
+        let ui_locale = config.ui_language.clone();
         let selected_file_idx = (!rendered_diffs.is_empty()).then_some(0);
         let cached_external_prefixes = vcs.external_prefixes();
 
@@ -463,8 +471,13 @@ impl App {
             help_scroll_y: 0,
             pending_commits_force_refresh: false,
             pending_key: None,
-            status_message: String::from("Tab:switch pane  j/k:move  n/N:next/prev diff  ?:help"),
+            status_message: rust_i18n::t!("status.startup_hint", locale = ui_locale.as_str())
+                .into_owned(),
             should_quit: false,
+            settings_cursor: 0,
+            settings_status: None,
+            settings_ai_dirty: false,
+            config_path_override: None,
             bg_rx,
             bg_tx,
         };
@@ -491,6 +504,7 @@ impl App {
         } else {
             None
         };
+        let ui_locale = config.ui_language.clone();
         let (bg_tx, bg_rx) = mpsc::channel();
 
         let empty_bundle = DiffBundle {
@@ -600,14 +614,23 @@ impl App {
             help_scroll_y: 0,
             pending_commits_force_refresh: false,
             pending_key: None,
-            status_message: String::from("Loading diff..."),
+            status_message: rust_i18n::t!("status.loading_diff", locale = ui_locale.as_str())
+                .into_owned(),
             should_quit: false,
+            settings_cursor: 0,
+            settings_status: None,
+            settings_ai_dirty: false,
+            config_path_override: None,
             bg_rx,
             bg_tx,
         };
 
         app.reload_target(target)?;
         Ok(app)
+    }
+
+    pub fn locale(&self) -> &str {
+        self.config.ui_language.as_str()
     }
 
     pub fn reload_target(&mut self, target: DiffTarget) -> anyhow::Result<()> {
@@ -656,7 +679,12 @@ impl App {
         self.session = ReviewSessionState::default();
         self.tree_mode = TreeMode::FlatFiles;
         self.rebuild_tree_rows();
-        self.status_message = format!("Fetching {} & running Difftastic...", target);
+        self.status_message = rust_i18n::t!(
+            "status.fetching_diff",
+            locale = self.locale(),
+            target = target
+        )
+        .into_owned();
 
         let vcs = Arc::clone(&self.vcs);
         let difft_bin = self.config.difft_bin.clone();
@@ -746,7 +774,8 @@ impl App {
             self.ai_running = false;
             self.ai_deep_running = false;
             self.ai_started_at = None;
-            self.status_message = "No changes found for this target.".to_string();
+            self.status_message =
+                rust_i18n::t!("status.no_changes", locale = self.locale()).into_owned();
             return;
         }
 
@@ -761,12 +790,16 @@ impl App {
             {
                 self.ai_error = None;
                 self.status_message =
-                    "AI analysis disabled (press P or :ai to enable).".to_string();
+                    rust_i18n::t!("status.ai_disabled", locale = self.locale()).into_owned();
             } else {
-                self.ai_error = Some(format!(
-                    "No local AI CLI found for '{}'. Install claude / codex / gemini or configure custom_ai.",
-                    self.active_ai_provider_id
-                ));
+                self.ai_error = Some(
+                    rust_i18n::t!(
+                        "status.ai_missing_cli",
+                        locale = self.locale(),
+                        provider = self.active_ai_provider_id
+                    )
+                    .into_owned(),
+                );
             }
             return;
         };
@@ -788,20 +821,24 @@ impl App {
         self.ai_running = true;
         self.ai_deep_running = false;
         self.ai_started_at = Some(Instant::now());
-        self.ai_progress_stage = format!(
-            "准备分析 ({}, {} 个文件)...",
-            provider.id(),
-            self.bundle.changes.len()
-        );
+        self.ai_progress_stage = rust_i18n::t!(
+            "status.ai_preparing",
+            locale = self.locale(),
+            provider = provider.id(),
+            count = self.bundle.changes.len()
+        )
+        .into_owned();
         self.ai_stream_logs.clear();
         self.ai_stream_thinking.clear();
         self.ai_stream_text.clear();
         self.ai_error = None;
-        self.status_message = format!(
-            "快速分组 ({}, {} files)...",
-            provider.id(),
-            self.bundle.changes.len()
-        );
+        self.status_message = rust_i18n::t!(
+            "status.ai_grouping_short",
+            locale = self.locale(),
+            provider = provider.id(),
+            count = self.bundle.changes.len()
+        )
+        .into_owned();
 
         let bundle = self.bundle.clone();
         let diffs = self.rendered_diffs.clone();
@@ -820,25 +857,27 @@ impl App {
                     update,
                 });
             });
-            let res = ai::run_with_ai_hooks(cancel_flag, Some(progress_cb), || {
-                let fast_ref = fast_provider.as_deref().unwrap_or(provider.as_ref());
-                ai::analyze_diff_two_stage(
-                    fast_ref,
-                    provider.as_ref(),
-                    &bundle,
-                    &diffs,
-                    &cfg,
-                    bypass_cache,
-                    |stage1_review, sid| {
-                        let _ = tx_grp.send(BgMessage::AiGroupsReady {
-                            generation: current_gen,
-                            session_epoch: current_epoch,
-                            provider_id: prov_for_grp,
-                            review: stage1_review.clone(),
-                            session_id: sid.map(str::to_string),
-                        });
-                    },
-                )
+            let res = i18n::run_with_locale(&cfg.ui_language, || {
+                ai::run_with_ai_hooks(cancel_flag, Some(progress_cb), || {
+                    let fast_ref = fast_provider.as_deref().unwrap_or(provider.as_ref());
+                    ai::analyze_diff_two_stage(
+                        fast_ref,
+                        provider.as_ref(),
+                        &bundle,
+                        &diffs,
+                        &cfg,
+                        bypass_cache,
+                        |stage1_review, sid| {
+                            let _ = tx_grp.send(BgMessage::AiGroupsReady {
+                                generation: current_gen,
+                                session_epoch: current_epoch,
+                                provider_id: prov_for_grp,
+                                review: stage1_review.clone(),
+                                session_id: sid.map(str::to_string),
+                            });
+                        },
+                    )
+                })
             })
             .map_err(|e| format!("{:#}", e));
             let _ = tx.send(BgMessage::AiAnalysisDone {
@@ -908,10 +947,12 @@ impl App {
             &provider_id,
             None,
         );
-        self.status_message = format!(
-            "Cleared AI session for {}; running fresh analysis...",
-            provider_id
-        );
+        self.status_message = rust_i18n::t!(
+            "status.ai_session_cleared",
+            locale = self.locale(),
+            provider = provider_id
+        )
+        .into_owned();
         self.trigger_ai_analysis(true);
     }
 
@@ -973,11 +1014,13 @@ impl App {
                             {
                                 override_msg
                             } else {
-                                format!(
-                                    "Loaded {} ({} files) — j/k:move  n/N:hunk  Tab:switch pane  ?:help",
-                                    self.bundle.target,
-                                    self.bundle.changes.len()
+                                rust_i18n::t!(
+                                    "status.diff_loaded",
+                                    locale = self.locale(),
+                                    target = self.bundle.target,
+                                    count = self.bundle.changes.len()
                                 )
+                                .into_owned()
                             };
                             let bypass_cache = std::mem::take(&mut self.bypass_next_ai_cache);
                             self.trigger_ai_analysis(bypass_cache);
@@ -985,8 +1028,12 @@ impl App {
                         Err(err) => {
                             self.pending_status_override = None;
                             self.diff_error = Some(err.clone());
-                            self.status_message =
-                                format!("Failed to load diff: {}", truncate(&err, 80));
+                            self.status_message = rust_i18n::t!(
+                                "status.diff_load_failed",
+                                locale = self.locale(),
+                                err = truncate(&err, 80)
+                            )
+                            .into_owned();
                         }
                     }
                 }
@@ -1033,8 +1080,13 @@ impl App {
                                 .ai_started_at
                                 .map(|t| t.elapsed().as_secs_f32())
                                 .unwrap_or(0.0);
-                            self.status_message =
-                                format!("分组 ({:.0}s): {}", elapsed, truncate(&stage, 72));
+                            self.status_message = rust_i18n::t!(
+                                "status.ai_grouping_elapsed",
+                                locale = self.locale(),
+                                secs = format!("{:.0}", elapsed),
+                                stage = truncate(&stage, 72)
+                            )
+                            .into_owned();
                         }
                     }
                 }
@@ -1055,7 +1107,9 @@ impl App {
                     self.ai_stream_logs.clear();
                     self.ai_stream_thinking.clear();
                     self.ai_stream_text.clear();
-                    self.ai_progress_stage = "深入分析核心风险...".to_string();
+                    self.ai_progress_stage =
+                        rust_i18n::t!("status.ai_analyzing_risks", locale = self.locale())
+                            .into_owned();
                     self.persist_provider_session(&provider_id, session_epoch, session_id);
                     self.retain_review_active_paths(&mut review);
                     let group_cnt = review.groups.len();
@@ -1065,10 +1119,12 @@ impl App {
                     }
                     self.rebuild_tree_and_continuous();
                     self.sync_tree_to_diff_cursor();
-                    self.status_message = format!(
-                        "分组就绪 ({} 组)，后台分析核心风险...",
-                        group_cnt
-                    );
+                    self.status_message = rust_i18n::t!(
+                        "status.ai_groups_ready",
+                        locale = self.locale(),
+                        count = group_cnt
+                    )
+                    .into_owned();
                 }
                 BgMessage::AiAnalysisDone {
                     generation,
@@ -1107,23 +1163,32 @@ impl App {
                             }
                             self.rebuild_tree_and_continuous();
                             self.sync_tree_to_diff_cursor();
-                            self.status_message = format!(
-                                "就绪：{} 组，{} 条提示 — j/k:浏览  n/N:跳块  Tab:切窗",
-                                group_cnt, finding_cnt
-                            );
+                            self.status_message = rust_i18n::t!(
+                                "status.ai_ready",
+                                locale = self.locale(),
+                                groups = group_cnt,
+                                findings = finding_cnt
+                            )
+                            .into_owned();
                         }
                         Err(err) => {
                             if self.ai_stage1_completed_gen == generation && self.ai_review.is_some()
                             {
                                 self.ai_error = None;
-                                self.status_message = format!(
-                                    "分组已就绪；核心风险分析失败: {}",
-                                    truncate(&err, 60)
-                                );
+                                self.status_message = rust_i18n::t!(
+                                    "status.ai_groups_ready_deep_failed",
+                                    locale = self.locale(),
+                                    err = truncate(&err, 60)
+                                )
+                                .into_owned();
                             } else {
                                 self.ai_error = Some(err.clone());
-                                self.status_message =
-                                    format!("分析失败: {}", truncate(&err, 80));
+                                self.status_message = rust_i18n::t!(
+                                    "status.ai_failed",
+                                    locale = self.locale(),
+                                    err = truncate(&err, 80)
+                                )
+                                .into_owned();
                             }
                         }
                     }
@@ -1157,11 +1222,16 @@ impl App {
                             });
                             self.show_inspector = true;
                             self.status_message =
-                                "AI answer added to bottom info panel".to_string();
+                                rust_i18n::t!("status.ai_answer_added", locale = self.locale())
+                                    .into_owned();
                         }
                         Err(e) => {
-                            self.status_message =
-                                format!("AI question failed: {}", truncate(&e, 80));
+                            self.status_message = rust_i18n::t!(
+                                "status.ai_question_failed",
+                                locale = self.locale(),
+                                err = truncate(&e, 80)
+                            )
+                            .into_owned();
                         }
                     }
                 }
@@ -1179,7 +1249,12 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            self.status_message = format!("Failed to load commits: {}", e);
+                            self.status_message = rust_i18n::t!(
+                                "status.commits_load_failed",
+                                locale = self.locale(),
+                                err = e
+                            )
+                            .into_owned();
                         }
                     }
                     if self.pending_commits_force_refresh {
@@ -1222,8 +1297,14 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            self.commit_error =
-                                Some(format!("AI 生成提交日志失败: {}", truncate(&e, 90)));
+                            self.commit_error = Some(
+                                rust_i18n::t!(
+                                    "commit.gen_failed",
+                                    locale = self.locale(),
+                                    err = truncate(&e, 90)
+                                )
+                                .into_owned(),
+                            );
                         }
                     }
                 }
@@ -1237,10 +1318,15 @@ impl App {
                             self.rebuild_commit_groups_from_files();
                             let _ = self.reload_target_with_options(DiffTarget::Uncommitted, true);
                             self.spawn_commits_refresh(true);
-                            self.commit_error = Some(format!(
-                                "部分仓库已提交 ({})；失败项: {}",
-                                outcome.summary, err
-                            ));
+                            self.commit_error = Some(
+                                rust_i18n::t!(
+                                    "commit.partial",
+                                    locale = self.locale(),
+                                    summary = outcome.summary,
+                                    err = err
+                                )
+                                .into_owned(),
+                            );
                         } else {
                             self.commit_error = Some(err);
                         }
@@ -1248,11 +1334,16 @@ impl App {
                         self.overlay = OverlayKind::None;
                         self.commit_editing_msg = false;
                         self.commit_error = None;
-                        self.pending_status_override =
-                            Some(format!("提交成功: {}", truncate(&outcome.summary, 90)));
+                        let msg = rust_i18n::t!(
+                            "commit.succeeded",
+                            locale = self.locale(),
+                            summary = truncate(&outcome.summary, 90)
+                        )
+                        .into_owned();
+                        self.pending_status_override = Some(msg.clone());
                         let _ = self.reload_target_with_options(DiffTarget::Uncommitted, true);
                         self.spawn_commits_refresh(true);
-                        self.status_message = format!("提交成功: {}", truncate(&outcome.summary, 80));
+                        self.status_message = msg;
                     }
                 }
                 BgMessage::RevertDone(outcome) => {
@@ -1268,20 +1359,30 @@ impl App {
                                 self.revert_files_cursor = self.revert_files.len() - 1;
                             }
                             let _ = self.reload_target_with_options(DiffTarget::Uncommitted, true);
-                            self.revert_error = Some(format!(
-                                "部分已回退 ({})；失败项: {}",
-                                outcome.summary, err
-                            ));
+                            self.revert_error = Some(
+                                rust_i18n::t!(
+                                    "revert.partial",
+                                    locale = self.locale(),
+                                    summary = outcome.summary,
+                                    err = err
+                                )
+                                .into_owned(),
+                            );
                         } else {
                             self.revert_error = Some(err);
                         }
                     } else {
                         self.overlay = OverlayKind::None;
                         self.revert_error = None;
-                        self.pending_status_override =
-                            Some(format!("回退成功: {}", truncate(&outcome.summary, 90)));
+                        let msg = rust_i18n::t!(
+                            "revert.succeeded",
+                            locale = self.locale(),
+                            summary = truncate(&outcome.summary, 90)
+                        )
+                        .into_owned();
+                        self.pending_status_override = Some(msg.clone());
                         let _ = self.reload_target_with_options(DiffTarget::Uncommitted, true);
-                        self.status_message = format!("回退成功: {}", truncate(&outcome.summary, 80));
+                        self.status_message = msg;
                     }
                 }
             }
@@ -1798,11 +1899,19 @@ impl App {
                         };
                         self.overlay = OverlayKind::None;
                         if let Err(e) = self.reload_target(target) {
-                            self.status_message = format!("Failed to load target: {}", e);
+                            self.status_message = rust_i18n::t!(
+                                "status.target_load_failed",
+                                locale = self.locale(),
+                                err = e
+                            )
+                            .into_owned();
                         }
                     }
                     _ => {}
                 }
+            }
+            OverlayKind::Settings => {
+                self.handle_settings_key(key);
             }
             OverlayKind::AiPicker => {
                 let total = self.available_providers.len() + 1;
@@ -1837,7 +1946,9 @@ impl App {
                             self.ai_generation += 1;
                             self.ai_stage1_completed_gen = 0;
                             self.ai_error = None;
-                            self.status_message = "AI analysis turned off".to_string();
+                            self.status_message =
+                                rust_i18n::t!("status.ai_turned_off", locale = self.locale())
+                                    .into_owned();
                         }
                     }
                     _ => {}
@@ -1859,6 +1970,162 @@ impl App {
         }
     }
 
+    pub fn open_settings(&mut self) {
+        self.available_providers = ai::detect_available_providers(&self.config);
+        self.settings_cursor = 0;
+        self.settings_status = None;
+        self.settings_ai_dirty = false;
+        self.overlay = OverlayKind::Settings;
+    }
+
+    fn save_user_settings_with_status(&mut self) {
+        match self
+            .config
+            .save_user_settings(self.config_path_override.as_deref())
+        {
+            Ok(path) => {
+                let msg = rust_i18n::t!(
+                    "status.settings_saved",
+                    locale = self.locale(),
+                    path = path.display()
+                )
+                .into_owned();
+                self.settings_status = Some(msg.clone());
+                self.status_message = msg;
+            }
+            Err(e) => {
+                let msg = rust_i18n::t!(
+                    "status.settings_save_failed",
+                    locale = self.locale(),
+                    err = e
+                )
+                .into_owned();
+                self.settings_status = Some(msg.clone());
+                self.status_message = msg;
+            }
+        }
+    }
+
+    fn close_settings(&mut self) {
+        self.overlay = OverlayKind::None;
+        if self.settings_ai_dirty {
+            self.settings_ai_dirty = false;
+            self.trigger_ai_analysis(false);
+        }
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) {
+        const SETTINGS_ROWS: usize = 8;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_settings(),
+            KeyCode::Char('s') => self.save_user_settings_with_status(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.settings_cursor + 1 < SETTINGS_ROWS {
+                    self.settings_cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.settings_cursor = self.settings_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('h')
+            | KeyCode::Left
+            | KeyCode::Char('l')
+            | KeyCode::Right
+            | KeyCode::Char(' ')
+            | KeyCode::Enter => {
+                let forward = !matches!(key.code, KeyCode::Char('h') | KeyCode::Left);
+                self.settings_status = None;
+                match self.settings_cursor {
+                    0 => {
+                        let new_loc = i18n::next_locale(&self.config.ui_language, forward);
+                        self.config.ui_language = new_loc.clone();
+                        self.config.ui_language_explicit = true;
+                        let disp = i18n::display_name(&new_loc);
+                        self.status_message = rust_i18n::t!(
+                            "status.settings_ui_lang_hint",
+                            locale = new_loc.as_str(),
+                            lang = disp
+                        )
+                        .into_owned();
+                    }
+                    1 => {
+                        let next_lang = i18n::next_locale(&self.config.review_language, forward);
+                        self.config.review_language = next_lang;
+                        self.settings_ai_dirty = true;
+                    }
+                    2 => {
+                        if matches!(key.code, KeyCode::Enter) {
+                            self.overlay = OverlayKind::AiPicker;
+                            self.ai_picker_cursor = 0;
+                            return;
+                        }
+                        let mut choices = vec!["auto".to_string()];
+                        for p in &self.available_providers {
+                            if !choices.iter().any(|c| c.eq_ignore_ascii_case(&p.id)) {
+                                choices.push(p.id.clone());
+                            }
+                        }
+                        choices.push("none".to_string());
+                        let cur_idx = choices
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&self.active_ai_provider_id))
+                            .unwrap_or(0);
+                        let next_idx = if forward {
+                            (cur_idx + 1) % choices.len()
+                        } else if cur_idx == 0 {
+                            choices.len() - 1
+                        } else {
+                            cur_idx - 1
+                        };
+                        let new_id = choices[next_idx].clone();
+                        self.config.switch_provider(&new_id);
+                        self.active_ai_provider_id = new_id;
+                        self.settings_ai_dirty = true;
+                    }
+                    3 => {
+                        let next = if forward {
+                            self.display_mode.next()
+                        } else {
+                            match self.display_mode {
+                                DifftDisplayMode::SideBySide => DifftDisplayMode::SideBySideShowBoth,
+                                DifftDisplayMode::SideBySideShowBoth => DifftDisplayMode::Inline,
+                                DifftDisplayMode::Inline => DifftDisplayMode::SideBySide,
+                            }
+                        };
+                        self.display_mode = next;
+                        self.config.display_mode = next;
+                        self.re_render_all_for_mode_or_width();
+                    }
+                    4 => {
+                        let new_val = !self.config.ignore_comments;
+                        self.config.ignore_comments = new_val;
+                        match DifftEngine::new(&self.config.difft_bin, new_val) {
+                            Ok(engine) => {
+                                self.difft_engine = Arc::new(engine);
+                                self.re_render_all_for_mode_or_width();
+                            }
+                            Err(e) => {
+                                self.config.ignore_comments = !new_val;
+                                self.settings_status = Some(format!("{}", e));
+                            }
+                        }
+                    }
+                    5 => {
+                        self.config.cache_ai_results = !self.config.cache_ai_results;
+                    }
+                    6 => {
+                        self.config.cache_history = !self.config.cache_history;
+                    }
+                    7 => {
+                        self.config.reuse_session = !self.config.reuse_session;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn resolve_cached_externals(&mut self) -> Vec<String> {
         if !self.cached_external_prefixes.is_empty()
             || !matches!(self.vcs.kind(), crate::model::VcsKind::Svn)
@@ -1873,15 +2140,18 @@ impl App {
 
     pub fn open_commit_confirm(&mut self) {
         if self.bundle.target != DiffTarget::Uncommitted {
-            self.status_message = "仅支持对未提交改动执行提交（按 :wc 切回未提交视图）".to_string();
+            self.status_message =
+                rust_i18n::t!("commit.only_uncommitted", locale = self.locale()).into_owned();
             return;
         }
         if self.diff_loading {
-            self.status_message = "正在加载 Diff，请稍候...".to_string();
+            self.status_message =
+                rust_i18n::t!("commit.loading_diff", locale = self.locale()).into_owned();
             return;
         }
         if self.bundle.changes.is_empty() {
-            self.status_message = "当前没有可提交的未提交改动".to_string();
+            self.status_message =
+                rust_i18n::t!("commit.no_changes", locale = self.locale()).into_owned();
             return;
         }
 
@@ -1970,9 +2240,9 @@ impl App {
             .collect();
         if !remaining.is_empty() {
             let title = if self.commit_groups.is_empty() {
-                "全部未提交文件".to_string()
+                rust_i18n::t!("commit.group_all", locale = self.locale()).into_owned()
             } else {
-                "其他 / 未分组文件".to_string()
+                rust_i18n::t!("commit.group_other", locale = self.locale()).into_owned()
             };
             self.commit_groups.push(CommitGroupSection {
                 id: "ungrouped".to_string(),
@@ -2015,7 +2285,8 @@ impl App {
             .map(|f| f.path.clone())
             .collect();
         if selected_paths.is_empty() {
-            self.commit_error = Some("请至少勾选一个需要提交的文件".to_string());
+            self.commit_error =
+                Some(rust_i18n::t!("commit.err_select_file", locale = self.locale()).into_owned());
             self.commit_msg_needs_regen = false;
             if !self.commit_msg_dirty {
                 self.commit_message.clear();
@@ -2028,7 +2299,8 @@ impl App {
             let cache_key = self.build_commit_cache_key(&selected_paths, &fast_cfg);
             if let Some(cached) = self.commit_msg_cache.get(&cache_key).cloned() {
                 self.commit_msg_needs_regen = false;
-                self.commit_progress_stage = "命中本地缓存".to_string();
+                self.commit_progress_stage =
+                    rust_i18n::t!("commit.cache_hit", locale = self.locale()).into_owned();
                 self.commit_message = cached;
                 self.commit_msg_cursor = self.commit_message.len();
                 return;
@@ -2067,11 +2339,13 @@ impl App {
         }
         let has_selected = self.commit_files.iter().any(|f| f.included);
         if !has_selected {
-            self.commit_error = Some("请至少勾选一个需要提交的文件".to_string());
+            self.commit_error =
+                Some(rust_i18n::t!("commit.err_select_file", locale = self.locale()).into_owned());
             return;
         }
         if self.commit_message.trim().is_empty() {
-            self.commit_error = Some("提交日志不能为空".to_string());
+            self.commit_error =
+                Some(rust_i18n::t!("commit.err_empty_msg", locale = self.locale()).into_owned());
             return;
         }
         self.commit_error = None;
@@ -2097,7 +2371,8 @@ impl App {
             .map(|f| f.path.clone())
             .collect();
         if selected_paths.is_empty() {
-            self.commit_error = Some("请至少勾选一个需要提交的文件".to_string());
+            self.commit_error =
+                Some(rust_i18n::t!("commit.err_select_file", locale = self.locale()).into_owned());
             return;
         }
         let fast_cfg = self.config.fast_config();
@@ -2111,7 +2386,8 @@ impl App {
                 self.commit_msg_dirty = false;
                 self.commit_msg_needs_regen = false;
                 self.commit_error = None;
-                self.commit_progress_stage = "命中本地缓存".to_string();
+                self.commit_progress_stage =
+                    rust_i18n::t!("commit.cache_hit", locale = self.locale()).into_owned();
                 self.commit_stream_logs.clear();
                 self.commit_stream_thinking.clear();
                 self.commit_stream_text.clear();
@@ -2143,11 +2419,13 @@ impl App {
             .ai_model
             .as_deref()
             .unwrap_or_else(|| provider.id());
-        self.commit_progress_stage = format!(
-            "准备生成 ({}, {} 个文件)...",
-            model_label,
-            selected_paths.len()
-        );
+        self.commit_progress_stage = rust_i18n::t!(
+            "commit.preparing",
+            locale = self.locale(),
+            model = model_label,
+            count = selected_paths.len()
+        )
+        .into_owned();
         self.commit_stream_logs.clear();
         self.commit_stream_thinking.clear();
         self.commit_stream_text.clear();
@@ -2168,15 +2446,17 @@ impl App {
                     update,
                 });
             });
-            let res = ai::run_with_ai_hooks(cancel_flag, Some(progress_cb), || {
-                ai::generate_commit_message(
-                    provider.as_ref(),
-                    &bundle,
-                    &diffs,
-                    &selected_paths,
-                    ai_review.as_ref(),
-                    &fast_cfg,
-                )
+            let res = i18n::run_with_locale(&fast_cfg.ui_language, || {
+                ai::run_with_ai_hooks(cancel_flag, Some(progress_cb), || {
+                    ai::generate_commit_message(
+                        provider.as_ref(),
+                        &bundle,
+                        &diffs,
+                        &selected_paths,
+                        ai_review.as_ref(),
+                        &fast_cfg,
+                    )
+                })
             })
             .map_err(|e| format!("{:#}", e));
             let _ = tx.send(BgMessage::CommitMsgGenerated {
@@ -2210,12 +2490,15 @@ impl App {
             .filter(|f| f.included)
             .map(|f| f.path.clone())
             .collect();
+        let locale = self.locale().to_string();
         if paths.is_empty() {
-            self.commit_error = Some("请至少勾选一个需要提交的文件".to_string());
+            self.commit_error =
+                Some(rust_i18n::t!("commit.err_select_file", locale = locale.as_str()).into_owned());
             return;
         }
         if self.commit_message.trim().is_empty() {
-            self.commit_error = Some("提交日志不能为空".to_string());
+            self.commit_error =
+                Some(rust_i18n::t!("commit.err_empty_msg", locale = locale.as_str()).into_owned());
             return;
         }
 
@@ -2226,7 +2509,7 @@ impl App {
         let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
-            let outcome = vcs.commit_files_detailed(&paths, &msg);
+            let outcome = i18n::run_with_locale(&locale, || vcs.commit_files_detailed(&paths, &msg));
             let _ = tx.send(BgMessage::CommitDone(outcome));
         });
     }
@@ -2433,10 +2716,8 @@ impl App {
             }
             KeyCode::Char('y') | KeyCode::Enter => {
                 if self.commit_msg_generating {
-                    self.commit_hint_notice = Some(
-                        "AI 正在更新一句话日志，请稍候完成（或按 f 立即使用当前预览日志提交）"
-                            .to_string(),
-                    );
+                    self.commit_hint_notice =
+                        Some(rust_i18n::t!("commit.wait_hint", locale = self.locale()).into_owned());
                     return;
                 }
                 self.commit_hint_notice = None;
@@ -2449,15 +2730,17 @@ impl App {
     pub fn open_revert_confirm(&mut self) {
         if self.bundle.target != DiffTarget::Uncommitted {
             self.status_message =
-                "仅支持对未提交改动执行回退（按 :wc 切回未提交视图）".to_string();
+                rust_i18n::t!("revert.only_uncommitted", locale = self.locale()).into_owned();
             return;
         }
         if self.diff_loading {
-            self.status_message = "正在加载 Diff，请稍候...".to_string();
+            self.status_message =
+                rust_i18n::t!("revert.loading_diff", locale = self.locale()).into_owned();
             return;
         }
         if self.bundle.changes.is_empty() {
-            self.status_message = "当前没有可回退的未提交改动".to_string();
+            self.status_message =
+                rust_i18n::t!("revert.no_changes", locale = self.locale()).into_owned();
             return;
         }
 
@@ -2479,11 +2762,25 @@ impl App {
                             }
                         }
                     }
-                    (format!("分组「{}」", title), idxs)
+                    let label = rust_i18n::t!(
+                        "revert.target_group",
+                        locale = self.locale(),
+                        title = title
+                    )
+                    .into_owned();
+                    (label, idxs)
                 }
                 Some(TreeRow::FileItem {
                     path, change_idx, ..
-                }) => (format!("文件 {}", path), vec![change_idx]),
+                }) => {
+                    let label = rust_i18n::t!(
+                        "revert.target_file",
+                        locale = self.locale(),
+                        path = path
+                    )
+                    .into_owned();
+                    (label, vec![change_idx])
+                }
                 None => (String::new(), Vec::new()),
             },
             PaneFocus::Diff => {
@@ -2498,10 +2795,13 @@ impl App {
                     .flatten()
                     .or(self.selected_file_idx);
                 if let Some(cidx) = idx.filter(|&i| i < self.bundle.changes.len()) {
-                    (
-                        format!("文件 {}", self.bundle.changes[cidx].path),
-                        vec![cidx],
+                    let label = rust_i18n::t!(
+                        "revert.target_file",
+                        locale = self.locale(),
+                        path = self.bundle.changes[cidx].path
                     )
+                    .into_owned();
+                    (label, vec![cidx])
                 } else {
                     (String::new(), Vec::new())
                 }
@@ -2509,7 +2809,8 @@ impl App {
         };
 
         if indices.is_empty() {
-            self.status_message = "未定位到可回退的文件或分组".to_string();
+            self.status_message =
+                rust_i18n::t!("revert.no_target", locale = self.locale()).into_owned();
             return;
         }
 
@@ -2546,8 +2847,10 @@ impl App {
             .filter(|f| f.included)
             .map(|f| f.path.clone())
             .collect();
+        let locale = self.locale().to_string();
         if paths.is_empty() {
-            self.revert_error = Some("请至少保留一个需要回退的文件".to_string());
+            self.revert_error =
+                Some(rust_i18n::t!("revert.err_keep_file", locale = locale.as_str()).into_owned());
             return;
         }
         self.revert_executing = true;
@@ -2555,7 +2858,7 @@ impl App {
         let vcs = Arc::clone(&self.vcs);
         let tx = self.bg_tx.clone();
         thread::spawn(move || {
-            let outcome = vcs.revert_files_detailed(&paths);
+            let outcome = i18n::run_with_locale(&locale, || vcs.revert_files_detailed(&paths));
             let _ = tx.send(BgMessage::RevertDone(outcome));
         });
     }
@@ -2595,7 +2898,9 @@ impl App {
             }
             KeyCode::Char('y') | KeyCode::Enter => {
                 if !self.revert_files.iter().any(|f| f.included) {
-                    self.revert_error = Some("请至少保留一个需要回退的文件".to_string());
+                    self.revert_error = Some(
+                        rust_i18n::t!("revert.err_keep_file", locale = self.locale()).into_owned(),
+                    );
                     return;
                 }
                 self.revert_error = None;
@@ -2652,7 +2957,9 @@ impl App {
                                     created_at: Local::now().format("%H:%M:%S").to_string(),
                                 });
                                 self.show_inspector = true;
-                                self.status_message = "Added review note".to_string();
+                                self.status_message =
+                                    rust_i18n::t!("status.note_added", locale = self.locale())
+                                        .into_owned();
                             }
                         }
                     }
@@ -2733,7 +3040,13 @@ impl App {
                     return;
                 }
                 _ => {
-                    self.status_message = format!("Unknown key sequence: {}{:?}", prefix, key.code);
+                    self.status_message = rust_i18n::t!(
+                        "status.unknown_key_seq",
+                        locale = self.locale(),
+                        prefix = prefix,
+                        key = format!("{:?}", key.code)
+                    )
+                    .into_owned();
                     return;
                 }
             }
@@ -2789,7 +3102,8 @@ impl App {
             KeyCode::Char(',') => self.jump_to_search_match(false),
             KeyCode::Char('c') => {
                 if self.current_file().is_none() {
-                    self.status_message = "No file selected to annotate.".to_string();
+                    self.status_message =
+                        rust_i18n::t!("status.no_file_to_note", locale = self.locale()).into_owned();
                 } else {
                     self.input_mode = InputMode::AddNote;
                     self.input_buffer.clear();
@@ -2813,6 +3127,9 @@ impl App {
                 self.user_forced_flat_tree = false;
                 self.trigger_ai_analysis(true);
             }
+            KeyCode::Char('O') => {
+                self.open_settings();
+            }
             KeyCode::Char('P') => {
                 self.available_providers = ai::detect_available_providers(&self.config);
                 self.overlay = OverlayKind::AiPicker;
@@ -2824,14 +3141,24 @@ impl App {
             KeyCode::Char('R') => {
                 let target = self.bundle.target.clone();
                 if let Err(e) = self.reload_target_with_options(target, true) {
-                    self.status_message = format!("Refresh failed: {}", e);
+                    self.status_message = rust_i18n::t!(
+                        "status.refresh_failed",
+                        locale = self.locale(),
+                        err = e
+                    )
+                    .into_owned();
                 }
                 self.spawn_commits_refresh(true);
             }
             KeyCode::Char('d') => {
                 self.display_mode = self.display_mode.next();
                 self.re_render_all_for_mode_or_width();
-                self.status_message = format!("Difft mode: {}", self.display_mode.label());
+                self.status_message = rust_i18n::t!(
+                    "status.difft_mode",
+                    locale = self.locale(),
+                    mode = self.display_mode.label()
+                )
+                .into_owned();
             }
             KeyCode::Char('t') => {
                 self.tree_mode = match self.tree_mode {
@@ -2844,7 +3171,9 @@ impl App {
                         TreeMode::AiGrouped
                     }
                     TreeMode::FlatFiles => {
-                        self.status_message = "AI groups not ready yet".to_string();
+                        self.status_message =
+                            rust_i18n::t!("status.ai_groups_not_ready", locale = self.locale())
+                                .into_owned();
                         TreeMode::FlatFiles
                     }
                 };
@@ -2868,17 +3197,28 @@ impl App {
             }
             KeyCode::Char('e') => {
                 let path = self.bundle.repo_root.join("codeduck-review.md");
-                match export_review_markdown(
+                match export_review_markdown_with_locale(
                     &path,
                     &self.bundle,
                     self.ai_review.as_ref(),
                     &self.session,
+                    self.locale(),
                 ) {
                     Ok(()) => {
-                        self.status_message = format!("Exported review to {}", path.display());
+                        self.status_message = rust_i18n::t!(
+                            "status.exported_to",
+                            locale = self.locale(),
+                            path = path.display()
+                        )
+                        .into_owned();
                     }
                     Err(e) => {
-                        self.status_message = format!("Export failed: {}", e);
+                        self.status_message = rust_i18n::t!(
+                            "status.export_failed",
+                            locale = self.locale(),
+                            err = e
+                        )
+                        .into_owned();
                     }
                 }
             }
@@ -3247,15 +3587,22 @@ impl App {
                 if let Some(idx) = self.selected_file_idx {
                     self.jump_continuous_to_file(idx);
                 }
-                self.status_message = format!(
-                    "Added '{}' to {} (removed {} file(s))",
-                    pattern,
-                    updated.primary_file().display(),
-                    removed_paths.len()
-                );
+                self.status_message = rust_i18n::t!(
+                    "status.ignore_added",
+                    locale = self.locale(),
+                    pattern = pattern,
+                    file = updated.primary_file().display(),
+                    count = removed_paths.len()
+                )
+                .into_owned();
             }
             Err(e) => {
-                self.status_message = format!("Failed to update .codeduck: {}", e);
+                self.status_message = rust_i18n::t!(
+                    "status.ignore_failed",
+                    locale = self.locale(),
+                    err = e
+                )
+                .into_owned();
             }
         }
     }
@@ -3416,7 +3763,12 @@ impl App {
             .diff_cursor_y
             .saturating_sub((self.diff_pane_height / 4) as usize);
         self.sync_tree_to_diff_cursor();
-        self.status_message = format!("Finding: {}", finding_title);
+        self.status_message = rust_i18n::t!(
+            "status.finding_status",
+            locale = self.locale(),
+            title = finding_title
+        )
+        .into_owned();
     }
 
     fn recompute_search_matches(&mut self) {
@@ -3444,7 +3796,12 @@ impl App {
     fn jump_to_current_search_match(&mut self) {
         if self.search_matches.is_empty() {
             if !self.search_query.is_empty() {
-                self.status_message = format!("Pattern not found: {}", self.search_query);
+                self.status_message = rust_i18n::t!(
+                    "status.search_not_found",
+                    locale = self.locale(),
+                    query = self.search_query
+                )
+                .into_owned();
             }
             return;
         }
@@ -3453,18 +3810,25 @@ impl App {
         self.diff_cursor_y = line;
         self.diff_scroll_y = line.saturating_sub(3);
         self.sync_tree_to_diff_cursor();
-        self.status_message = format!(
-            "Match {}/{} for '{}'",
-            self.search_match_cursor + 1,
-            self.search_matches.len(),
-            self.search_query
-        );
+        self.status_message = rust_i18n::t!(
+            "status.search_match",
+            locale = self.locale(),
+            idx = self.search_match_cursor + 1,
+            total = self.search_matches.len(),
+            query = self.search_query
+        )
+        .into_owned();
     }
 
     fn jump_to_search_match(&mut self, forward: bool) {
         if self.search_matches.is_empty() {
             if !self.search_query.is_empty() {
-                self.status_message = format!("Pattern not found: {}", self.search_query);
+                self.status_message = rust_i18n::t!(
+                    "status.search_not_found",
+                    locale = self.locale(),
+                    query = self.search_query
+                )
+                .into_owned();
             }
             return;
         }
@@ -3511,7 +3875,7 @@ impl App {
     fn run_ai_followup(&mut self, question: String) {
         let Some(provider) = ai::resolve_provider(&self.active_ai_provider_id, &self.config) else {
             self.status_message =
-                "No active AI provider configured (press P to choose).".to_string();
+                rust_i18n::t!("status.ai_no_provider", locale = self.locale()).into_owned();
             return;
         };
         let bundle = self.bundle.clone();
@@ -3529,7 +3893,12 @@ impl App {
         let epoch = self.ai_session_epoch;
         let cancel_flag = Arc::clone(&self.ai_followup_cancel_flag);
         self.ai_followup_running = true;
-        self.status_message = format!("Asking {}...", provider.display_name());
+        self.status_message = rust_i18n::t!(
+            "status.ai_asking",
+            locale = self.locale(),
+            provider = provider.display_name()
+        )
+        .into_owned();
 
         thread::spawn(move || {
             let res = ai::run_with_cancel_flag(cancel_flag, || {
@@ -3561,14 +3930,18 @@ impl App {
             }
             "uncommitted" | "wc" => {
                 if let Err(e) = self.reload_target(DiffTarget::Uncommitted) {
-                    self.status_message = format!("Error: {}", e);
+                    self.status_message =
+                        rust_i18n::t!("status.error_prefix", locale = self.locale(), err = e)
+                            .into_owned();
                 }
             }
             "rev" | "commit" | "c" => {
                 if let Some(rev) = parts.get(1) {
                     let target = DiffTarget::parse(rev);
                     if let Err(e) = self.reload_target(target) {
-                        self.status_message = format!("Error: {}", e);
+                        self.status_message =
+                            rust_i18n::t!("status.error_prefix", locale = self.locale(), err = e)
+                                .into_owned();
                     }
                 } else {
                     self.open_commit_picker();
@@ -3577,6 +3950,72 @@ impl App {
             "commits" | "log" => self.open_commit_picker(),
             "ci" | "submit" => self.open_commit_confirm(),
             "revert" | "undo" => self.open_revert_confirm(),
+            "config" | "settings" | "options" => self.open_settings(),
+            "lang" | "language" => {
+                if let Some(arg) = parts.get(1) {
+                    if let Some(loc) = i18n::resolve_locale(arg) {
+                        let prev_review = self.config.review_language.clone();
+                        self.config.ui_language = loc.clone();
+                        self.config.ui_language_explicit = true;
+                        self.config.review_language = loc.clone();
+                        let disp = i18n::display_name(&loc);
+                        self.status_message = rust_i18n::t!(
+                            "status.lang_both_updated",
+                            locale = loc.as_str(),
+                            lang = disp
+                        )
+                        .into_owned();
+                        if prev_review != self.config.review_language {
+                            self.trigger_ai_analysis(false);
+                        }
+                    } else {
+                        self.config.review_language = (*arg).to_string();
+                        self.status_message = rust_i18n::t!(
+                            "status.lang_review_updated",
+                            locale = self.locale(),
+                            lang = arg
+                        )
+                        .into_owned();
+                        self.trigger_ai_analysis(false);
+                    }
+                } else {
+                    self.open_settings();
+                }
+            }
+            "ui-lang" => {
+                if let Some(arg) = parts.get(1) {
+                    if let Some(loc) = i18n::resolve_locale(arg) {
+                        self.config.ui_language = loc.clone();
+                        self.config.ui_language_explicit = true;
+                        let disp = i18n::display_name(&loc);
+                        self.status_message = rust_i18n::t!(
+                            "status.ui_lang_updated",
+                            locale = loc.as_str(),
+                            lang = disp
+                        )
+                        .into_owned();
+                    } else {
+                        let avail = i18n::available_summary();
+                        self.status_message = rust_i18n::t!(
+                            "status.ui_lang_unsupported",
+                            locale = self.locale(),
+                            lang = arg,
+                            available = avail
+                        )
+                        .into_owned();
+                    }
+                } else {
+                    let cur = self.config.ui_language.clone();
+                    let avail = i18n::available_summary();
+                    self.status_message = rust_i18n::t!(
+                        "status.ui_lang_current",
+                        locale = self.locale(),
+                        lang = cur,
+                        available = avail
+                    )
+                    .into_owned();
+                }
+            }
             "ai" => {
                 if let Some(p) = parts.get(1) {
                     self.ai_session_epoch += 1;
@@ -3605,7 +4044,12 @@ impl App {
                     self.trigger_ai_analysis(true);
                 } else {
                     let cur = self.config.ai_model.as_deref().unwrap_or("<default>");
-                    self.status_message = format!("Current model: {} (use :model <name|clear>)", cur);
+                    self.status_message = rust_i18n::t!(
+                        "status.model_current",
+                        locale = self.locale(),
+                        cur = cur
+                    )
+                    .into_owned();
                 }
             }
             "fast-model" => {
@@ -3616,8 +4060,12 @@ impl App {
                     self.trigger_ai_analysis(true);
                 } else {
                     let cur = self.config.ai_fast_model.as_deref().unwrap_or("<default>");
-                    self.status_message =
-                        format!("Current fast_model: {} (use :fast-model <name|clear>)", cur);
+                    self.status_message = rust_i18n::t!(
+                        "status.fast_model_current",
+                        locale = self.locale(),
+                        cur = cur
+                    )
+                    .into_owned();
                 }
             }
             "effort" => {
@@ -3634,15 +4082,24 @@ impl App {
                                 self.user_forced_flat_tree = false;
                                 self.trigger_ai_analysis(true);
                             }
-                            Err(err) => self.status_message = format!("Error: {}", err),
+                            Err(err) => {
+                                self.status_message = rust_i18n::t!(
+                                    "status.error_prefix",
+                                    locale = self.locale(),
+                                    err = err
+                                )
+                                .into_owned();
+                            }
                         },
                     }
                 } else {
                     let cur = self.config.ai_effort.as_deref().unwrap_or("<default>");
-                    self.status_message = format!(
-                        "Current effort: {} (use :effort low|medium|high|xhigh|max|clear)",
-                        cur
-                    );
+                    self.status_message = rust_i18n::t!(
+                        "status.effort_current",
+                        locale = self.locale(),
+                        cur = cur
+                    )
+                    .into_owned();
                 }
             }
             "fast-effort" => {
@@ -3661,15 +4118,24 @@ impl App {
                                 self.user_forced_flat_tree = false;
                                 self.trigger_ai_analysis(true);
                             }
-                            Err(err) => self.status_message = format!("Error: {}", err),
+                            Err(err) => {
+                                self.status_message = rust_i18n::t!(
+                                    "status.error_prefix",
+                                    locale = self.locale(),
+                                    err = err
+                                )
+                                .into_owned();
+                            }
                         },
                     }
                 } else {
                     let cur = self.config.ai_fast_effort.as_deref().unwrap_or("<default>");
-                    self.status_message = format!(
-                        "Current fast_effort: {} (use :fast-effort low|medium|high|xhigh|max|clear)",
-                        cur
-                    );
+                    self.status_message = rust_i18n::t!(
+                        "status.fast_effort_current",
+                        locale = self.locale(),
+                        cur = cur
+                    )
+                    .into_owned();
                 }
             }
             "ask" => {
@@ -3681,7 +4147,8 @@ impl App {
             "ignore" => {
                 let pat = parts[1..].join(" ");
                 if pat.trim().is_empty() {
-                    self.status_message = "Usage: :ignore <pattern> (e.g. :ignore *.meta)".to_string();
+                    self.status_message =
+                        rust_i18n::t!("status.ignore_usage", locale = self.locale()).into_owned();
                 } else {
                     self.add_ignore_pattern(pat.trim());
                 }
@@ -3694,14 +4161,29 @@ impl App {
                 } else {
                     self.bundle.repo_root.join(path)
                 };
-                match export_review_markdown(
+                match export_review_markdown_with_locale(
                     &out,
                     &self.bundle,
                     self.ai_review.as_ref(),
                     &self.session,
+                    self.locale(),
                 ) {
-                    Ok(()) => self.status_message = format!("Exported to {}", out.display()),
-                    Err(e) => self.status_message = format!("Export failed: {}", e),
+                    Ok(()) => {
+                        self.status_message = rust_i18n::t!(
+                            "status.exported_to",
+                            locale = self.locale(),
+                            path = out.display()
+                        )
+                        .into_owned();
+                    }
+                    Err(e) => {
+                        self.status_message = rust_i18n::t!(
+                            "status.export_failed",
+                            locale = self.locale(),
+                            err = e
+                        )
+                        .into_owned();
+                    }
                 }
             }
             "inline" => {
@@ -3722,12 +4204,22 @@ impl App {
             "refresh" | "r" => {
                 let t = self.bundle.target.clone();
                 if let Err(e) = self.reload_target_with_options(t, true) {
-                    self.status_message = format!("Refresh failed: {}", e);
+                    self.status_message = rust_i18n::t!(
+                        "status.refresh_failed",
+                        locale = self.locale(),
+                        err = e
+                    )
+                    .into_owned();
                 }
                 self.spawn_commits_refresh(true);
             }
             _ => {
-                self.status_message = format!("Unknown command: :{}", raw);
+                self.status_message = rust_i18n::t!(
+                    "status.unknown_command",
+                    locale = self.locale(),
+                    cmd = raw
+                )
+                .into_owned();
             }
         }
     }

@@ -1740,3 +1740,194 @@ fn test_revert_group_and_file_with_double_confirm_svn_and_git() {
     assert!(!git_dir.join("untracked.rs").exists());
     assert!(gapp.bundle.changes.is_empty());
 }
+
+#[test]
+fn test_localization_config_and_settings_modal() {
+    use codeduck::i18n;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // 1. Dynamic locale resolution from `locales/*.toml` ([meta].aliases)
+    let avail = i18n::available_locales();
+    assert!(avail.contains(&"en".to_string()));
+    assert!(avail.contains(&"zh-CN".to_string()));
+    assert_eq!(i18n::resolve_locale("en").as_deref(), Some("en"));
+    assert_eq!(i18n::resolve_locale("en-US").as_deref(), Some("en"));
+    assert_eq!(i18n::resolve_locale("zh-CN").as_deref(), Some("zh-CN"));
+    assert_eq!(i18n::resolve_locale("zh_hans").as_deref(), Some("zh-CN"));
+    assert_eq!(i18n::resolve_locale("简体中文").as_deref(), Some("zh-CN"));
+    assert_eq!(i18n::resolve_locale("unknown-xx"), None);
+
+    // 2. Automated parity check across all `locales/*.toml` files:
+    //    every locale must define the exact same keys and `%{var}` placeholders as `en.toml`.
+    fn collect_toml_leaves(
+        val: &toml::Value,
+        prefix: &str,
+        out: &mut BTreeMap<String, String>,
+    ) {
+        if let Some(tbl) = val.as_table() {
+            for (k, v) in tbl {
+                let next = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", prefix, k)
+                };
+                collect_toml_leaves(v, &next, out);
+            }
+        } else if let Some(s) = val.as_str() {
+            if prefix != "_version" {
+                out.insert(prefix.to_string(), s.to_string());
+            }
+        }
+    }
+    fn extract_placeholders(s: &str) -> BTreeSet<String> {
+        let mut vars = BTreeSet::new();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'%' && bytes[i + 1] == b'{' {
+                if let Some(end) = s[i + 2..].find('}') {
+                    vars.insert(s[i + 2..i + 2 + end].to_string());
+                    i += 2 + end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        vars
+    }
+
+    let locales_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+    let en_raw = fs::read_to_string(locales_dir.join("en.toml")).unwrap();
+    let en_val: toml::Value = toml::from_str(&en_raw).unwrap();
+    let mut en_keys = BTreeMap::new();
+    collect_toml_leaves(&en_val, "", &mut en_keys);
+    assert!(!en_keys.is_empty());
+
+    for entry in fs::read_dir(&locales_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let fname = path.file_name().unwrap().to_string_lossy().into_owned();
+        if fname == "en.toml" {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).unwrap();
+        let val: toml::Value = toml::from_str(&raw).unwrap();
+        let mut keys = BTreeMap::new();
+        collect_toml_leaves(&val, "", &mut keys);
+        let missing: Vec<_> = en_keys
+            .keys()
+            .filter(|k| !keys.contains_key(*k))
+            .cloned()
+            .collect();
+        let extra: Vec<_> = keys
+            .keys()
+            .filter(|k| !en_keys.contains_key(*k))
+            .cloned()
+            .collect();
+        assert!(missing.is_empty(), "{} missing keys: {:?}", fname, missing);
+        assert!(extra.is_empty(), "{} extra keys: {:?}", fname, extra);
+        for (k, en_str) in &en_keys {
+            if k == "meta.aliases" {
+                continue;
+            }
+            let loc_str = &keys[k];
+            assert_eq!(
+                extract_placeholders(en_str),
+                extract_placeholders(loc_str),
+                "Placeholder mismatch in {} for key `{}`",
+                fname,
+                k
+            );
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let cfg_path = tmp.path().join("configs.toml");
+    fs::write(
+        &cfg_path,
+        "# user custom comment\n[ui]\nlanguage = \"en\"\n\n[ai]\nlanguage = \"zh-CN\"\n\n[ignore]\npatterns = [\"*.meta\"]\n",
+    )
+    .unwrap();
+
+    // Explicit [ui].language takes precedence over [ai].language
+    let loaded = AppConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(loaded.ui_language, "en");
+    assert!(loaded.ui_language_explicit);
+    assert_eq!(loaded.review_language, "zh-CN");
+
+    // When [ui].language is omitted, [ai].language fallback configures UI locale cleanly
+    let fallback_cfg_path = tmp.path().join("fallback.toml");
+    fs::write(&fallback_cfg_path, "[ai]\nlanguage = \"zh-CN\"\n").unwrap();
+    let fb_loaded = AppConfig::load(Some(&fallback_cfg_path)).unwrap();
+    assert_eq!(fb_loaded.ui_language, "zh-CN");
+    assert!(!fb_loaded.ui_language_explicit);
+
+    // Setup tiny git repo to test interactive Settings modal ('O') + live language switch + save ('s')
+    let git_dir = tmp.path().join("git_loc_repo");
+    fs::create_dir_all(&git_dir).unwrap();
+    run("git", &["init"], &git_dir);
+    run("git", &["config", "user.email", "t@example.com"], &git_dir);
+    run("git", &["config", "user.name", "Tester"], &git_dir);
+    fs::write(git_dir.join("main.rs"), "fn main() {}\n").unwrap();
+    run("git", &["add", "main.rs"], &git_dir);
+    run("git", &["commit", "-m", "init"], &git_dir);
+    fs::write(git_dir.join("main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+
+    let backend = vcs::open_vcs(&git_dir, Some(VcsKind::Git)).unwrap();
+    let mut app_cfg = loaded;
+    app_cfg.ai_provider = "none".to_string();
+    let mut app = App::new(backend, app_cfg, DiffTarget::Uncommitted, 120).unwrap();
+    app.config_path_override = Some(cfg_path.clone());
+
+    let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+
+    // Render English default first
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let en_buf: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(en_buf.contains("File List") || en_buf.contains("Files:"));
+
+    // Press 'O' to open Settings modal -> row 0 is UI Language -> press Space to switch to zh-CN
+    app.handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::Settings);
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert_eq!(app.config.ui_language, "zh-CN");
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let zh_buf: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .filter(|s| *s != " ")
+        .collect();
+    assert!(zh_buf.contains("配置与语言设置"));
+    assert!(zh_buf.contains("简体中文"));
+
+    // Press 's' to save and verify existing comment & [ignore] patterns are preserved
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    let saved_raw = fs::read_to_string(&cfg_path).unwrap();
+    assert!(saved_raw.contains("# user custom comment"));
+    assert!(saved_raw.contains("*.meta"));
+    let reloaded = AppConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.ui_language, "zh-CN");
+
+    // Close Settings and verify ex-command ':ui-lang en' switches back immediately
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    for ch in "ui-lang en".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.config.ui_language, "en");
+}

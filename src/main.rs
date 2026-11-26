@@ -15,11 +15,12 @@ use ratatui::backend::CrosstermBackend;
 use codeduck::ai;
 use codeduck::config::AppConfig;
 use codeduck::difft::DifftEngine;
+use codeduck::i18n;
 use codeduck::ignore::IgnoreMatcher;
 use codeduck::model::{DiffTarget, DifftDisplayMode, VcsKind};
 use codeduck::ui;
 use codeduck::ui::app::App;
-use codeduck::ui::export::export_review_markdown;
+use codeduck::ui::export::export_review_markdown_with_locale;
 use codeduck::vcs;
 
 #[derive(Parser, Debug)]
@@ -65,9 +66,13 @@ struct Cli {
     #[arg(long)]
     fast_effort: Option<String>,
 
-    /// AI review output language (e.g. zh-CN, en)
+    /// AI review output language (e.g. en, zh-CN)
     #[arg(long)]
     lang: Option<String>,
+
+    /// UI display language (en, zh-CN)
+    #[arg(long)]
+    ui_lang: Option<String>,
 
     /// Difftastic display mode (side-by-side, side-by-side-show-both, inline)
     #[arg(long)]
@@ -127,7 +132,23 @@ fn main() -> Result<()> {
         };
     }
     if let Some(l) = cli.lang {
+        if !config.ui_language_explicit && cli.ui_lang.is_none() {
+            if let Some(loc) = i18n::resolve_locale(&l) {
+                config.ui_language = loc;
+            }
+        }
         config.review_language = l;
+    }
+    if let Some(ui_l) = cli.ui_lang {
+        let loc = i18n::resolve_locale(&ui_l).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported UI language `{}` (available: {})",
+                ui_l,
+                i18n::available_summary()
+            )
+        })?;
+        config.ui_language = loc;
+        config.ui_language_explicit = true;
     }
     if cli.no_cache {
         config.cache_ai_results = false;
@@ -205,13 +226,23 @@ fn main() -> Result<()> {
             None
         };
         let session = codeduck::model::ReviewSessionState::default();
-        export_review_markdown(&export_path, &bundle, ai_res.as_ref(), &session)?;
-        println!("Report written to {}", export_path.display());
+        export_review_markdown_with_locale(
+            &export_path,
+            &bundle,
+            ai_res.as_ref(),
+            &session,
+            &config.ui_language,
+        )?;
+        println!(
+            "{}",
+            i18n::format_written_report(&config.ui_language, &export_path.display().to_string())
+        );
         return Ok(());
     }
 
     let (term_w, _) = crossterm::terminal::size().unwrap_or((140, 40));
     let mut app = App::new_async(vcs_backend, config, target, term_w)?;
+    app.config_path_override = cli.config;
     if cli.new_session {
         app.bypass_next_ai_cache = true;
     }

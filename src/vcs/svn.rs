@@ -825,7 +825,16 @@ impl VcsBackend for SvnBackend {
             if outcome.summary.is_empty() {
                 bail!("{}", err);
             } else {
-                bail!("部分成功 ({}); 失败详情: {}", outcome.summary, err);
+                let locale = crate::i18n::current_thread_locale();
+                bail!(
+                    "{}",
+                    rust_i18n::t!(
+                        "vcs.partial_success",
+                        locale = locale.as_str(),
+                        summary = outcome.summary,
+                        err = err
+                    )
+                );
             }
         }
         Ok(outcome.summary)
@@ -865,6 +874,7 @@ impl VcsBackend for SvnBackend {
         let mut committed_paths = Vec::new();
         let mut failed_paths = Vec::new();
 
+        let locale = crate::i18n::current_thread_locale();
         for (prefix, entries) in groups {
             let work_dir = if prefix.is_empty() {
                 self.scope_dir.clone()
@@ -872,7 +882,7 @@ impl VcsBackend for SvnBackend {
                 self.scope_dir.join(&prefix)
             };
             let label = if prefix.is_empty() {
-                "主仓库".to_string()
+                rust_i18n::t!("vcs.main_repo", locale = locale.as_str()).into_owned()
             } else {
                 format!("external[{}]", prefix)
             };
@@ -897,7 +907,8 @@ impl VcsBackend for SvnBackend {
                     }
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     outputs.push(if stdout.is_empty() {
-                        format!("{} 提交完成", label)
+                        rust_i18n::t!("vcs.svn_committed", locale = locale.as_str(), label = label)
+                            .into_owned()
                     } else {
                         format!("[{}] {}", label, stdout)
                     });
@@ -907,13 +918,29 @@ impl VcsBackend for SvnBackend {
                         failed_paths.push(orig);
                     }
                     let err = String::from_utf8_lossy(&out.stderr);
-                    errors.push(format!("{} 失败: {}", label, err.trim()));
+                    errors.push(
+                        rust_i18n::t!(
+                            "vcs.svn_commit_failed",
+                            locale = locale.as_str(),
+                            label = label,
+                            err = err.trim()
+                        )
+                        .into_owned(),
+                    );
                 }
                 Err(e) => {
                     for (_, orig) in entries {
                         failed_paths.push(orig);
                     }
-                    errors.push(format!("{} 执行异常: {}", label, e));
+                    errors.push(
+                        rust_i18n::t!(
+                            "vcs.svn_exec_error",
+                            locale = locale.as_str(),
+                            label = label,
+                            err = e
+                        )
+                        .into_owned(),
+                    );
                 }
             }
         }
@@ -942,7 +969,16 @@ impl VcsBackend for SvnBackend {
             if outcome.summary.is_empty() {
                 bail!("{}", err);
             } else {
-                bail!("部分成功 ({}); 失败详情: {}", outcome.summary, err);
+                let locale = crate::i18n::current_thread_locale();
+                bail!(
+                    "{}",
+                    rust_i18n::t!(
+                        "vcs.partial_success",
+                        locale = locale.as_str(),
+                        summary = outcome.summary,
+                        err = err
+                    )
+                );
             }
         }
         Ok(outcome.summary)
@@ -980,6 +1016,7 @@ impl VcsBackend for SvnBackend {
         let mut reverted_paths = Vec::new();
         let mut failed_paths = Vec::new();
 
+        let locale = crate::i18n::current_thread_locale();
         for (prefix, entries) in groups {
             let work_dir = if prefix.is_empty() {
                 self.scope_dir.clone()
@@ -987,7 +1024,7 @@ impl VcsBackend for SvnBackend {
                 self.scope_dir.join(&prefix)
             };
             let label = if prefix.is_empty() {
-                "主仓库".to_string()
+                rust_i18n::t!("vcs.main_repo", locale = locale.as_str()).into_owned()
             } else {
                 format!("external[{}]", prefix)
             };
@@ -1006,7 +1043,8 @@ impl VcsBackend for SvnBackend {
                     }
                     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     outputs.push(if stdout.is_empty() {
-                        format!("{} 回退完成", label)
+                        rust_i18n::t!("vcs.svn_reverted", locale = locale.as_str(), label = label)
+                            .into_owned()
                     } else {
                         format!("[{}] {}", label, stdout)
                     });
@@ -1018,7 +1056,15 @@ impl VcsBackend for SvnBackend {
                         }
                     }
                     let err = String::from_utf8_lossy(&out.stderr);
-                    errors.push(format!("{} 回退失败: {}", label, err.trim()));
+                    errors.push(
+                        rust_i18n::t!(
+                            "vcs.svn_revert_failed",
+                            locale = locale.as_str(),
+                            label = label,
+                            err = err.trim()
+                        )
+                        .into_owned(),
+                    );
                 }
                 Err(e) => {
                     for (_, orig) in entries {
@@ -1026,7 +1072,15 @@ impl VcsBackend for SvnBackend {
                             failed_paths.push(orig);
                         }
                     }
-                    errors.push(format!("{} 执行异常: {}", label, e));
+                    errors.push(
+                        rust_i18n::t!(
+                            "vcs.svn_exec_error",
+                            locale = locale.as_str(),
+                            label = label,
+                            err = e
+                        )
+                        .into_owned(),
+                    );
                 }
             }
         }

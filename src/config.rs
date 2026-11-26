@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
+use crate::i18n;
 use crate::model::DifftDisplayMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +13,11 @@ pub struct CustomAiConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectUiConfig {
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -48,6 +54,8 @@ pub struct ProjectIgnoreConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectCodeduckConfig {
     #[serde(default)]
+    pub ui: ProjectUiConfig,
+    #[serde(default)]
     pub ai: ProjectAiConfig,
     #[serde(default)]
     pub diff: ProjectDiffConfig,
@@ -59,10 +67,17 @@ pub struct ProjectCodeduckConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// UI localization language code (e.g. "en", "zh-CN", or any file in `locales/`).
+    #[serde(default = "default_language")]
+    pub ui_language: String,
+    /// Tracks whether UI language was explicitly configured independently of `[ai].language`.
+    #[serde(skip)]
+    pub ui_language_explicit: bool,
     /// Preferred AI provider: "auto", "agy", "codex", "claude", "gemini", "none", or custom name.
     #[serde(default = "default_ai_provider")]
     pub ai_provider: String,
@@ -115,7 +130,7 @@ fn default_ai_provider() -> String {
 }
 
 fn default_language() -> String {
-    "zh-CN".to_string()
+    "en".to_string()
 }
 
 fn default_difft_bin() -> String {
@@ -133,6 +148,8 @@ fn default_ai_timeout() -> u64 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            ui_language: default_language(),
+            ui_language_explicit: false,
             ai_provider: default_ai_provider(),
             ai_model: None,
             ai_effort: None,
@@ -177,6 +194,8 @@ pub fn directory_chain(vcs_root: &Path, scope_dir: &Path) -> Vec<PathBuf> {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PartialFlatConfig {
+    ui_language: Option<String>,
+    language: Option<String>,
     ai_provider: Option<String>,
     ai_model: Option<String>,
     ai_effort: Option<String>,
@@ -328,8 +347,25 @@ impl AppConfig {
             if let Some(fe) = flat.ai_fast_effort {
                 self.ai_fast_effort = normalize_optional_setting(&fe);
             }
+            if let Some(ui_lang) = flat.ui_language {
+                if let Some(loc) = i18n::resolve_locale(&ui_lang) {
+                    self.ui_language = loc;
+                    self.ui_language_explicit = true;
+                }
+            }
+            if let Some(top_lang) = flat.language {
+                if let Some(loc) = i18n::resolve_locale(&top_lang) {
+                    self.ui_language = loc;
+                    self.ui_language_explicit = true;
+                }
+            }
             if let Some(lang) = flat.review_language {
                 if !lang.trim().is_empty() {
+                    if !self.ui_language_explicit {
+                        if let Some(loc) = i18n::resolve_locale(&lang) {
+                            self.ui_language = loc;
+                        }
+                    }
                     self.review_language = lang;
                 }
             }
@@ -407,8 +443,20 @@ impl AppConfig {
         if let Some(fe) = proj.ai.fast_effort {
             self.ai_fast_effort = normalize_optional_setting(&fe);
         }
+        let ui_lang_override = proj.ui.language.or(proj.language);
+        if let Some(ui_lang) = ui_lang_override {
+            if let Some(loc) = i18n::resolve_locale(&ui_lang) {
+                self.ui_language = loc;
+                self.ui_language_explicit = true;
+            }
+        }
         if let Some(lang) = proj.ai.language {
             if !lang.trim().is_empty() {
+                if !self.ui_language_explicit {
+                    if let Some(loc) = i18n::resolve_locale(&lang) {
+                        self.ui_language = loc;
+                    }
+                }
                 self.review_language = lang;
             }
         }
@@ -549,6 +597,74 @@ impl AppConfig {
             }
         }
     }
+
+    /// Persist user-selected preferences (UI language, AI review settings, diff view options)
+    /// into `~/.codeduck/configs.toml` (or `explicit_path`) while preserving existing comments
+    /// and unrelated sections such as `[ignore]` and `[[custom_ai]]`.
+    pub fn save_user_settings(&self, explicit_path: Option<&Path>) -> Result<PathBuf> {
+        let target = explicit_path
+            .map(PathBuf::from)
+            .or_else(Self::config_path)
+            .context("Could not determine codeduck config file path")?;
+
+        let mut doc = if target.is_file() {
+            let existing = std::fs::read_to_string(&target)
+                .with_context(|| format!("Failed to read {}", target.display()))?;
+            existing.parse::<DocumentMut>().with_context(|| {
+                format!("Failed to parse existing TOML in {}", target.display())
+            })?
+        } else {
+            let mut d = DocumentMut::new();
+            d.decor_mut()
+                .set_prefix("# codeduck user configuration (~/.codeduck/configs.toml)\n\n");
+            d
+        };
+
+        ensure_table(&mut doc, "ui")?
+            .insert("language", Item::Value(Value::from(self.ui_language.as_str())));
+
+        {
+            let ai_tbl = ensure_table(&mut doc, "ai")?;
+            ai_tbl.insert("provider", Item::Value(Value::from(self.ai_provider.as_str())));
+            ai_tbl.insert(
+                "language",
+                Item::Value(Value::from(self.review_language.as_str())),
+            );
+            ai_tbl.insert(
+                "cache_ai_results",
+                Item::Value(Value::from(self.cache_ai_results)),
+            );
+            ai_tbl.insert("reuse_session", Item::Value(Value::from(self.reuse_session)));
+        }
+
+        {
+            let diff_tbl = ensure_table(&mut doc, "diff")?;
+            diff_tbl.insert(
+                "display_mode",
+                Item::Value(Value::from(self.display_mode.as_cli_arg())),
+            );
+            diff_tbl.insert(
+                "ignore_comments",
+                Item::Value(Value::from(self.ignore_comments)),
+            );
+            diff_tbl.insert("cache_history", Item::Value(Value::from(self.cache_history)));
+        }
+
+        atomic_write_file(&target, &doc.to_string())?;
+        Ok(target)
+    }
+}
+
+fn ensure_table<'a>(
+    doc: &'a mut DocumentMut,
+    name: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike> {
+    if !doc.contains_key(name) {
+        doc.insert(name, Item::Table(Table::new()));
+    }
+    doc.get_mut(name)
+        .and_then(|item| item.as_table_like_mut())
+        .with_context(|| format!("Expected [{}] to be a TOML table in configs.toml", name))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

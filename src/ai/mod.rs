@@ -439,14 +439,19 @@ fn invoke_with_session_inner(
         None
     };
 
+    let locale = crate::i18n::current_thread_locale();
     let mut fell_back = false;
     if let Some(sid) = saved_sid {
         let short_sid: String = sid.chars().take(8).collect();
-        emit_progress(AiProgressUpdate::Stage(format!(
-            "复用会话 {} ({})...",
-            short_sid,
-            provider.id()
-        )));
+        emit_progress(AiProgressUpdate::Stage(
+            rust_i18n::t!(
+                "ai.reusing_session",
+                locale = locale.as_str(),
+                sid = short_sid,
+                provider = provider.id()
+            )
+            .into_owned(),
+        ));
         match provider.run_prompt_with_session(
             prompt,
             work_dir,
@@ -477,15 +482,23 @@ fn invoke_with_session_inner(
     }
 
     if fell_back {
-        emit_progress(AiProgressUpdate::Stage(format!(
-            "会话失效，重建 {} 会话...",
-            provider.id()
-        )));
+        emit_progress(AiProgressUpdate::Stage(
+            rust_i18n::t!(
+                "ai.session_expired",
+                locale = locale.as_str(),
+                provider = provider.id()
+            )
+            .into_owned(),
+        ));
     } else {
-        emit_progress(AiProgressUpdate::Stage(format!(
-            "新建 {} 会话...",
-            provider.id()
-        )));
+        emit_progress(AiProgressUpdate::Stage(
+            rust_i18n::t!(
+                "ai.starting_session",
+                locale = locale.as_str(),
+                provider = provider.id()
+            )
+            .into_owned(),
+        ));
     }
 
     provider.run_prompt_with_session(prompt, work_dir, json_mode, None, cfg.reuse_session)
@@ -525,8 +538,11 @@ pub fn analyze_diff_with_session(
         bundle,
         rendered_diffs,
     );
+    let locale = crate::i18n::current_thread_locale();
     if cfg.cache_ai_results && !bypass_cache {
-        emit_progress(AiProgressUpdate::Stage("检查缓存...".to_string()));
+        emit_progress(AiProgressUpdate::Stage(
+            rust_i18n::t!("ai.checking_cache", locale = locale.as_str()).into_owned(),
+        ));
         if let Some(cache_dir) = AppConfig::cache_dir() {
             let cache_file = cache_dir.join(format!("{}.json", hash));
             if cache_file.exists() {
@@ -534,7 +550,8 @@ pub fn analyze_diff_with_session(
                     if let Ok(cached) = serde_json::from_str::<AiReviewResult>(&raw) {
                         if has_meaningful_review_content(&cached) {
                             emit_progress(AiProgressUpdate::Stage(
-                                "命中缓存，直接加载".to_string(),
+                                rust_i18n::t!("ai.cache_hit", locale = locale.as_str())
+                                    .into_owned(),
                             ));
                             return Ok(AnalyzeDiffOutput {
                                 review: cached,
@@ -547,19 +564,27 @@ pub fn analyze_diff_with_session(
         }
     }
 
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "整理差异 ({} 个文件)...",
-        rendered_diffs.len()
-    )));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.preparing_diffs",
+            locale = locale.as_str(),
+            count = rendered_diffs.len()
+        )
+        .into_owned(),
+    ));
     let prompt = build_review_prompt(bundle, rendered_diffs, &cfg.review_language);
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "提交分析 ({:.1} KB -> {})...",
-        prompt.len() as f64 / 1024.0,
-        provider.id()
-    )));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.submitting_review",
+            locale = locale.as_str(),
+            kb = format!("{:.1}", prompt.len() as f64 / 1024.0),
+            provider = provider.id()
+        )
+        .into_owned(),
+    ));
     let out = invoke_with_session(provider, &prompt, &bundle.repo_root, true, cfg, false)?;
     emit_progress(AiProgressUpdate::Stage(
-        "解析返回结果...".to_string(),
+        rust_i18n::t!("ai.parsing_response", locale = locale.as_str()).into_owned(),
     ));
     let mut parsed = parse_ai_review_json(&out.text, provider.display_name(), rendered_diffs)
         .with_context(|| {
@@ -576,11 +601,15 @@ pub fn analyze_diff_with_session(
     }
 
     ensure_all_files_grouped(&mut parsed, rendered_diffs);
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "完成：{} 组，{} 条提示",
-        parsed.groups.len(),
-        parsed.findings.len()
-    )));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.done_summary",
+            locale = locale.as_str(),
+            groups = parsed.groups.len(),
+            findings = parsed.findings.len()
+        )
+        .into_owned(),
+    ));
 
     save_ai_review_cache(&hash, cfg.cache_ai_results, &parsed);
 
@@ -618,8 +647,11 @@ where
         bundle,
         rendered_diffs,
     );
+    let locale = crate::i18n::current_thread_locale();
     if cfg.cache_ai_results && !bypass_cache {
-        emit_progress(AiProgressUpdate::Stage("检查缓存...".to_string()));
+        emit_progress(AiProgressUpdate::Stage(
+            rust_i18n::t!("ai.checking_cache", locale = locale.as_str()).into_owned(),
+        ));
         if let Some(cache_dir) = AppConfig::cache_dir() {
             let cache_file = cache_dir.join(format!("{}.json", hash));
             if cache_file.exists() {
@@ -627,7 +659,8 @@ where
                     if let Ok(cached) = serde_json::from_str::<AiReviewResult>(&raw) {
                         if has_meaningful_review_content(&cached) {
                             emit_progress(AiProgressUpdate::Stage(
-                                "命中缓存，直接加载".to_string(),
+                                rust_i18n::t!("ai.cache_hit", locale = locale.as_str())
+                                    .into_owned(),
                             ));
                             return Ok(AnalyzeDiffOutput {
                                 review: cached,
@@ -641,20 +674,28 @@ where
     }
 
     // Stage 1: Stateless fast diff-only grouping + summary (no old session bloat)
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "整理差异 ({} 个文件)...",
-        rendered_diffs.len()
-    )));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.preparing_diffs",
+            locale = locale.as_str(),
+            count = rendered_diffs.len()
+        )
+        .into_owned(),
+    ));
     let group_prompt = build_grouping_prompt(bundle, rendered_diffs, &fast_cfg.review_language);
     let fast_label = fast_cfg
         .ai_model
         .as_deref()
         .unwrap_or_else(|| fast_provider.id());
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "快速分组 ({:.1} KB -> {})...",
-        group_prompt.len() as f64 / 1024.0,
-        fast_label
-    )));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.fast_grouping",
+            locale = locale.as_str(),
+            kb = format!("{:.1}", group_prompt.len() as f64 / 1024.0),
+            provider = fast_label
+        )
+        .into_owned(),
+    ));
     let out1 = invoke_with_session(
         fast_provider,
         &group_prompt,
@@ -663,7 +704,9 @@ where
         &fast_cfg,
         false,
     )?;
-    emit_progress(AiProgressUpdate::Stage("解析分组...".to_string()));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!("ai.parsing_groups", locale = locale.as_str()).into_owned(),
+    ));
     let mut stage1 =
         parse_ai_review_json(&out1.text, deep_provider.display_name(), rendered_diffs)
             .with_context(|| {
@@ -690,7 +733,9 @@ where
     // Stage 2: Fresh deep session for core findings + key file/hunk notes; persisted for followups
     let mut deep_cfg = cfg.clone();
     deep_cfg.ai_sessions.clear();
-    emit_progress(AiProgressUpdate::Stage("深入分析核心风险...".to_string()));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!("ai.analyzing_risks", locale = locale.as_str()).into_owned(),
+    ));
     let findings_prompt =
         build_findings_prompt(bundle, rendered_diffs, &cfg.review_language, &stage1);
     let out2 = invoke_with_session(
@@ -701,7 +746,9 @@ where
         &deep_cfg,
         true,
     )?;
-    emit_progress(AiProgressUpdate::Stage("合并风险分析结果...".to_string()));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!("ai.merging_findings", locale = locale.as_str()).into_owned(),
+    ));
     let stage2 = parse_ai_review_json(&out2.text, deep_provider.display_name(), rendered_diffs)
         .with_context(|| {
             format!(
@@ -721,11 +768,15 @@ where
         stage1.findings = stage2.findings;
     }
 
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "完成：{} 组，{} 条提示",
-        stage1.groups.len(),
-        stage1.findings.len()
-    )));
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.done_summary",
+            locale = locale.as_str(),
+            groups = stage1.groups.len(),
+            findings = stage1.findings.len()
+        )
+        .into_owned(),
+    ));
     save_ai_review_cache(&hash, cfg.cache_ai_results, &stage1);
 
     Ok(AnalyzeDiffOutput {
@@ -853,34 +904,45 @@ pub fn build_grouping_prompt(
     );
     append_diff_context(&mut prompt, bundle, rendered_diffs);
 
-    prompt.push_str(
+    let (title_hint, desc_hint) = if language.trim().to_ascii_lowercase().starts_with("zh") {
+        (
+            "简明重点标题 (<= 16字)",
+            "一句话核心目的 (<= 45字)",
+        )
+    } else {
+        (
+            "Concise focused title (<= 6 words)",
+            "One-sentence core purpose (<= 15 words)",
+        )
+    };
+    prompt.push_str(&format!(
         r#"
 --- REQUIRED OUTPUT FORMAT ---
 Return ONLY a single valid JSON object (no markdown commentary outside JSON):
-{
+{{
   "summary": "2-3 sentence summary of the overall change intent and impact",
   "overall_risk": "critical | high | medium | low | info",
   "review_strategy": "Recommended review order in 1 short sentence",
   "groups": [
-    {
+    {{
       "id": "g1",
-      "title": "简明重点标题 (<= 16字)",
-      "description": "一句话核心目的 (<= 45字)",
+      "title": "{title_hint}",
+      "description": "{desc_hint}",
       "category": "feature | bugfix | refactor | security | performance | test | config | docs | chore",
       "risk_level": "critical | high | medium | low | info",
       "review_order": 1,
       "files": ["exact/file/path.rs"],
       "key_points": ["Key thing to verify"]
-    }
+    }}
   ]
-}
+}}
 
 Rules:
 1. Every changed file MUST appear in at least one group in `groups` using its exact relative path.
 2. Order `groups` by `review_order` (1 = review first). Keep titles short and descriptions concise.
 3. Output valid JSON only.
-"#,
-    );
+"#
+    ));
     prompt
 }
 
@@ -991,37 +1053,48 @@ pub fn build_review_prompt(
 
     append_diff_context(&mut prompt, bundle, rendered_diffs);
 
-    prompt.push_str(
+    let (title_hint, desc_hint) = if language.trim().to_ascii_lowercase().starts_with("zh") {
+        (
+            "简明重点标题 (<= 16字，如: 世界地图动态配置)",
+            "一句话简短描述这一组改动的核心目的 (<= 45字)",
+        )
+    } else {
+        (
+            "Concise focused title (<= 6 words, e.g. Dynamic world map config)",
+            "One-sentence description of this group's core purpose (<= 15 words)",
+        )
+    };
+    prompt.push_str(&format!(
         r#"
 --- REQUIRED OUTPUT FORMAT ---
 Return ONLY a single valid JSON object (no markdown commentary outside JSON) with this exact structure:
-{
+{{
   "summary": "2-4 sentence executive summary of the overall change intent and impact",
   "overall_risk": "critical | high | medium | low | info",
   "review_strategy": "Recommended order and focus areas for the human reviewer",
   "groups": [
-    {
+    {{
       "id": "g1",
-      "title": "简明重点标题 (<= 16字，如: 世界地图动态配置)",
-      "description": "一句话简短描述这一组改动的核心目的 (<= 45字)",
+      "title": "{title_hint}",
+      "description": "{desc_hint}",
       "category": "feature | bugfix | refactor | security | performance | test | config | docs | chore",
       "risk_level": "critical | high | medium | low | info",
       "review_order": 1,
       "files": ["exact/file/path.rs"],
       "key_points": ["Key thing to verify while reviewing this group"]
-    }
+    }}
   ],
   "files": [
-    {
+    {{
       "path": "exact/file/path.rs",
       "category": "feature | bugfix | refactor | security | performance | test | config | docs | chore",
       "risk_level": "critical | high | medium | low | info",
       "summary": "One-sentence summary of changes in this file",
       "review_focus": ["Specific check for this file"]
-    }
+    }}
   ],
   "hunks": [
-    {
+    {{
       "file": "exact/file/path.rs",
       "chunk_index": 1,
       "start_line": 40,
@@ -1029,10 +1102,10 @@ Return ONLY a single valid JSON object (no markdown commentary outside JSON) wit
       "title": "Short title for this diff paragraph/hunk",
       "analysis": "Concise explanation of what this specific diff chunk does, intent, edge cases, and what to double-check",
       "risk_level": "critical | high | medium | low | info"
-    }
+    }}
   ],
   "findings": [
-    {
+    {{
       "id": "f1",
       "file": "exact/file/path.rs",
       "line": 42,
@@ -1040,9 +1113,9 @@ Return ONLY a single valid JSON object (no markdown commentary outside JSON) wit
       "title": "Short issue or observation title",
       "description": "Clear explanation of the bug, edge case, concurrency/security risk, or praise",
       "suggestion": "Concrete fix or verification step (optional)"
-    }
+    }}
   ]
-}
+}}
 
 Rules:
 1. Every changed file MUST appear in at least one group in `groups` using its exact relative path from the list above.
@@ -1050,8 +1123,8 @@ Rules:
 3. Include a `hunks` entry for each major `@@ Chunk N` in the diffs so the reviewer sees paragraph-level analysis while scrolling through code.
 4. Only cite lines and symbols visible in the provided diff; do not invent unshown code.
 5. Output valid JSON only.
-"#,
-    );
+"#
+    ));
 
     prompt
 }
@@ -1610,13 +1683,18 @@ pub fn generate_commit_message(
         prompt.push('\n');
     }
 
-    emit_progress(AiProgressUpdate::Stage(format!(
-        "生成提交说明 ({} 个文件)...",
-        selected_paths.len()
-    )));
+    let locale = crate::i18n::current_thread_locale();
+    emit_progress(AiProgressUpdate::Stage(
+        rust_i18n::t!(
+            "ai.generating_commit_msg",
+            locale = locale.as_str(),
+            count = selected_paths.len()
+        )
+        .into_owned(),
+    ));
     let out = invoke_with_session(provider, &prompt, &bundle.repo_root, false, cfg, false)?;
     emit_progress(AiProgressUpdate::Stage(
-        "整理提交说明...".to_string(),
+        rust_i18n::t!("ai.formatting_commit_msg", locale = locale.as_str()).into_owned(),
     ));
     let cleaned = normalize_single_sentence_commit_msg(&out.text);
     Ok(AiPromptOutput {

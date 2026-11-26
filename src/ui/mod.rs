@@ -12,10 +12,12 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::i18n;
 use crate::model::{RiskLevel, Severity};
 use crate::ui::app::{
     App, CommitModalFocus, InputMode, OverlayKind, PaneFocus, TreeMode, TreeRow,
 };
+use rust_i18n::t;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = frame.area();
@@ -35,6 +37,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.overlay {
         OverlayKind::None => {}
         OverlayKind::Help => draw_help_modal(frame, app, root),
+        OverlayKind::Settings => draw_settings_modal(frame, app, root),
         OverlayKind::CommitPicker => draw_commit_picker(frame, app, root),
         OverlayKind::AiPicker => draw_ai_picker(frame, app, root),
         OverlayKind::CommitConfirm => draw_commit_confirm(frame, app, root),
@@ -51,6 +54,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let total = app.bundle.changes.len();
 
     let (ai_badge, ai_deep_badge) = if app.ai_running {
@@ -59,7 +63,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
         (
             Span::styled(
-                format!(" {} 分组中 {}s ", spin, elapsed.as_secs()),
+                t!(
+                    "header.grouping",
+                    locale = locale,
+                    spin = spin,
+                    secs = elapsed.as_secs()
+                )
+                .into_owned(),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
@@ -77,7 +87,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             let elapsed = app.ai_started_at.map(|t| t.elapsed()).unwrap_or_default();
             let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
             Some(Span::styled(
-                format!(" {} 风险分析 {}s ", spin, elapsed.as_secs()),
+                t!(
+                    "header.risks",
+                    locale = locale,
+                    spin = spin,
+                    secs = elapsed.as_secs()
+                )
+                .into_owned(),
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ))
         } else {
@@ -96,7 +112,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.ai_error.is_some() {
         (
             Span::styled(
-                " 分析失败 (a重试/P切换) ",
+                t!("header.ai_failed", locale = locale).into_owned(),
                 Style::default().fg(Color::White).bg(Color::Red),
             ),
             None,
@@ -146,9 +162,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(commit_hint, Style::default().fg(Color::Gray)),
     ]);
 
+    let view_mode = match app.tree_mode {
+        TreeMode::AiGrouped => t!("header.view_groups", locale = locale),
+        TreeMode::FlatFiles => t!("header.view_files", locale = locale),
+    };
     let mut line2_spans = vec![
         Span::styled(
-            format!("Files: {}", total),
+            t!("header.files_count", locale = locale, count = total).into_owned(),
             Style::default().fg(Color::Green),
         ),
         Span::raw("  |  "),
@@ -158,13 +178,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  |  "),
         Span::styled(
-            format!(
-                "视图: {}",
-                match app.tree_mode {
-                    TreeMode::AiGrouped => "分组",
-                    TreeMode::FlatFiles => "文件",
-                }
-            ),
+            t!("header.view_label", locale = locale, mode = view_mode).into_owned(),
             Style::default().fg(Color::Blue),
         ),
         Span::raw("  |  "),
@@ -254,13 +268,14 @@ fn draw_workspace(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let focused = app.focus == PaneFocus::Tree;
     let border_style = pane_border_style(focused);
     let max_desc_cols = area.width.saturating_sub(7).max(10) as usize;
     let max_path_cols = area.width.saturating_sub(10).max(12) as usize;
     let title = match app.tree_mode {
-        TreeMode::AiGrouped => " 改动分组 (j/k:移动  l:Diff  S:提交) ",
-        TreeMode::FlatFiles => " 文件列表 (t:分组  S:提交) ",
+        TreeMode::AiGrouped => t!("tree.title_grouped", locale = locale).into_owned(),
+        TreeMode::FlatFiles => t!("tree.title_flat", locale = locale).into_owned(),
     };
 
     let items: Vec<ListItem> = app
@@ -391,27 +406,30 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner_h = area.height.saturating_sub(2);
     // Reserve 2 columns for leading cursor gutter ("▶ " / "  ") so full-width diffs are not clipped.
     app.ensure_diff_rendered_for_width(inner_w.saturating_sub(2), inner_h);
+    let locale = app.locale();
 
     let (title, text) = if app.diff_loading {
         (
-            format!(" Loading {}... ", app.bundle.target),
-            Text::raw(format!(
-                "Fetching {} changes from {} and running Difftastic...\n\nYou can press q or Ctrl-C anytime to cancel.",
-                app.bundle.target, app.bundle.vcs
-            )),
+            t!("diff.loading_title", locale = locale, target = app.bundle.target).into_owned(),
+            Text::raw(
+                t!(
+                    "diff.loading_body",
+                    locale = locale,
+                    target = app.bundle.target,
+                    vcs = app.bundle.vcs
+                )
+                .into_owned(),
+            ),
         )
     } else if let Some(err) = &app.diff_error {
         (
-            " Diff Load Error ".to_string(),
-            Text::raw(format!(
-                "Error loading diff:\n\n{}\n\nPress R to retry or C to pick another commit.",
-                err
-            )),
+            t!("diff.error_title", locale = locale).into_owned(),
+            Text::raw(t!("diff.error_body", locale = locale, err = err).into_owned()),
         )
     } else if app.continuous.lines.is_empty() {
         (
-            " Continuous Diff ".to_string(),
-            Text::raw("No changed files in this target.\n\nPress C to switch to another commit/revision, or R to refresh."),
+            t!("diff.empty_title", locale = locale).into_owned(),
+            Text::raw(t!("diff.empty_body", locale = locale).into_owned()),
         )
     } else {
         let active_path = app
@@ -427,10 +445,14 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             .flatten()
             .map(|i| i + 1)
             .unwrap_or(0);
-        let title = format!(
-            " {} | {}/{} (n/N跳块, hjkl移动) ",
-            active_path, active_hunk_num, hunk_total
-        );
+        let title = t!(
+            "diff.pane_title",
+            locale = locale,
+            path = active_path,
+            hunk = active_hunk_num,
+            total = hunk_total
+        )
+        .into_owned();
 
         // Render visible slice with cursor row highlight when Diff pane is focused
         let start = app.diff_scroll_y.min(app.continuous.lines.len().saturating_sub(1));
@@ -523,14 +545,16 @@ fn push_multiline(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, styl
 }
 
 fn append_qa_and_notes(lines: &mut Vec<Line<'static>>, app: &App, file_path: Option<&str>) {
+    let locale = app.locale();
     if let Some(fp) = file_path {
         let file_notes: Vec<_> = app.session.notes.iter().filter(|n| n.file == fp).collect();
         if !file_notes.is_empty() {
             lines.push(Line::raw(""));
             for n in file_notes {
+                let prefix = t!("inspector.note_prefix", locale = locale, time = n.created_at);
                 push_multiline(
                     lines,
-                    &format!("批注 [{}]: ", n.created_at),
+                    &prefix,
                     &n.text,
                     Style::default().fg(Color::Magenta),
                 );
@@ -539,7 +563,7 @@ fn append_qa_and_notes(lines: &mut Vec<Line<'static>>, app: &App, file_path: Opt
     }
     if app.ai_followup_running {
         lines.push(Line::from(Span::styled(
-            "正在查询...",
+            t!("inspector.querying_ai", locale = locale).into_owned(),
             Style::default().fg(Color::Yellow),
         )));
     } else if let Some(last_qa) = file_path
@@ -553,22 +577,45 @@ fn append_qa_and_notes(lines: &mut Vec<Line<'static>>, app: &App, file_path: Opt
             .map(|p| format!(" [{}]", p))
             .unwrap_or_default();
         lines.push(Line::from(Span::styled(
-            format!("问{}: {}", tag, last_qa.question),
+            t!(
+                "inspector.qa_question",
+                locale = locale,
+                tag = tag,
+                question = last_qa.question
+            )
+            .into_owned(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )));
-        push_multiline(lines, "答: ", &last_qa.answer, Style::default().fg(Color::Cyan));
+        push_multiline(
+            lines,
+            &t!("inspector.qa_answer_prefix", locale = locale),
+            &last_qa.answer,
+            Style::default().fg(Color::Cyan),
+        );
     }
 }
 
 fn draw_passive_info_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let (base_title, lines) = match app.focus {
         PaneFocus::Tree => build_tree_context_info(app),
         PaneFocus::Diff => build_diff_context_info(app),
     };
     let title = if app.inspector_scroll_y > 0 {
-        format!("{} (J/K滚动: +{}) ", base_title.trim_end(), app.inspector_scroll_y)
+        t!(
+            "inspector.scroll_active",
+            locale = locale,
+            base = base_title.trim_end(),
+            offset = app.inspector_scroll_y
+        )
+        .into_owned()
     } else {
-        format!("{} (J/K滚动) ", base_title.trim_end())
+        t!(
+            "inspector.scroll_hint",
+            locale = locale,
+            base = base_title.trim_end()
+        )
+        .into_owned()
     };
 
     let widget = Paragraph::new(lines)
@@ -585,7 +632,8 @@ fn draw_passive_info_pane(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
-    let title = " 分组详情 ".to_string();
+    let locale = app.locale();
+    let title = t!("inspector.group_details", locale = locale).into_owned();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if app.ai_running {
@@ -596,7 +644,7 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
 
     if let Some(err) = &app.ai_error {
         lines.push(Line::from(Span::styled(
-            format!("分析出错: {}", err),
+            t!("inspector.analysis_error", locale = locale, err = err).into_owned(),
             Style::default().fg(Color::Red),
         )));
         append_qa_and_notes(&mut lines, app, app.current_file().map(|f| f.path.as_str()));
@@ -621,14 +669,14 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         if !grp.description.is_empty() {
             push_multiline(
                 &mut lines,
-                "说明: ",
+                &t!("inspector.purpose_prefix", locale = locale),
                 &grp.description,
                 Style::default().fg(Color::Cyan),
             );
         }
         if !grp.key_points.is_empty() {
             lines.push(Line::from(Span::styled(
-                "核查点:",
+                t!("inspector.checkpoints_title", locale = locale).into_owned(),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             )));
             for kp in &grp.key_points {
@@ -660,20 +708,20 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         if let Some(ai) = &app.ai_review {
             push_multiline(
                 &mut lines,
-                "概述: ",
+                &t!("inspector.summary_prefix", locale = locale),
                 &ai.summary,
                 Style::default().fg(Color::White),
             );
             if !ai.review_strategy.is_empty() {
                 push_multiline(
                     &mut lines,
-                    "建议: ",
+                    &t!("inspector.strategy_prefix", locale = locale),
                     &ai.review_strategy,
                     Style::default().fg(Color::Yellow),
                 );
             }
         } else {
-            lines.push(Line::from("暂无分析结果（按 a 分析，P 切换工具）。"));
+            lines.push(Line::from(t!("inspector.empty_tree", locale = locale).into_owned()));
         }
     }
 
@@ -682,6 +730,7 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
 }
 
 fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
+    let locale = app.locale();
     let (fd, hunk, source_line, hunk_analysis, findings) = app.active_hunk_context();
     let loc_label = match (fd, source_line, hunk) {
         (Some(f), Some(ln), _) => format!("{} : L{}", f.path, ln),
@@ -689,9 +738,9 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
             format!("{} : L{}", f.path, h.start_line.unwrap())
         }
         (Some(f), _, _) => f.path.clone(),
-        (None, _, _) => "未定位文件".to_string(),
+        (None, _, _) => t!("inspector.no_file", locale = locale).into_owned(),
     };
-    let title = format!(" 代码说明 ({}) ", loc_label);
+    let title = t!("inspector.code_inspector", locale = locale, loc = loc_label).into_owned();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if app.ai_running
@@ -728,7 +777,12 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         if let Some(fa) = app.session.file_analysis_map.get(&f.path) {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("[文件 {}] ", fa.risk_level.label()),
+                    t!(
+                        "inspector.file_badge",
+                        locale = locale,
+                        risk = fa.risk_level.label()
+                    )
+                    .into_owned(),
                     Style::default()
                         .fg(risk_color(fa.risk_level))
                         .add_modifier(Modifier::BOLD),
@@ -768,7 +822,12 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
             ]));
             push_multiline(&mut lines, "  ", &f.description, Style::default());
             if let Some(sugg) = &f.suggestion {
-                push_multiline(&mut lines, "  建议: ", sugg, Style::default().fg(Color::Green));
+                push_multiline(
+                    &mut lines,
+                    &t!("inspector.suggestion_prefix", locale = locale),
+                    sugg,
+                    Style::default().fg(Color::Green),
+                );
             }
         }
     }
@@ -776,15 +835,14 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
     append_qa_and_notes(&mut lines, app, fd.map(|f| f.path.as_str()));
 
     if lines.is_empty() {
-        lines.push(Line::from(
-            "当前片段暂无说明（按 A 提问，a 重跑分析）。",
-        ));
+        lines.push(Line::from(t!("inspector.empty_diff", locale = locale).into_owned()));
     }
 
     (title, lines)
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let mode_label = match app.input_mode {
         InputMode::Normal => (" NORMAL ", Color::Green),
         InputMode::Command => (" COMMAND ", Color::Yellow),
@@ -807,7 +865,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" [{}]{} ", app.focus.label(), pending),
+            format!(" [{}]{} ", app.focus.label(locale), pending),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -819,13 +877,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let edited = || text_input::format_with_cursor(&app.input_buffer, app.input_cursor, avail_w);
     let cmd_line = match app.input_mode {
         InputMode::Normal => Line::from(Span::styled(
-            "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  S:提交  U:回退  R:刷新  d:视图  B/I:收展  ?:帮助  q:退出",
+            t!("footer.normal_hints", locale = locale).into_owned(),
             Style::default().fg(Color::DarkGray),
         )),
         InputMode::Command => Line::from(format!(":{}", edited())),
         InputMode::Search => Line::from(format!("/{}", edited())),
-        InputMode::AddNote => Line::from(format!("Note for current file > {}", edited())),
-        InputMode::AskAi => Line::from(format!("Ask AI about current file > {}", edited())),
+        InputMode::AddNote => Line::from(format!("{}{}", t!("footer.note_prompt", locale = locale), edited())),
+        InputMode::AskAi => Line::from(format!("{}{}", t!("footer.ask_prompt", locale = locale), edited())),
     };
 
     let footer = Paragraph::new(vec![status_line, cmd_line]);
@@ -833,81 +891,227 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let popup = centered_rect(78, 84, area);
     frame.render_widget(Clear, popup);
 
-    let help_text = vec![
+    let mut help_text = vec![
         Line::from(Span::styled(
-            "codeduck — 快捷键说明",
+            t!("help.title", locale = locale).into_owned(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "窗口与浏览",
+            t!("help.window_title", locale = locale).into_owned(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  Tab / Ctrl-w   切换焦点（左侧列表 / 右侧 Diff）"),
-        Line::from("  H / L          直接切到左侧列表 / 右侧 Diff"),
-        Line::from("  J / K          滚动底部详情面板（B/I 显隐侧栏/底栏）"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "移动与跳转",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  j / k          上下移动"),
-        Line::from("  h / l / 0      折叠展开分组 / 左右滚屏并在边缘切窗 / 回行首"),
-        Line::from("  n / N          下/上一个差异块（]c / [c 亦可）"),
-        Line::from("  ]f / [f        下/上一个文件"),
-        Line::from("  ]g / [g        下/上一个分组"),
-        Line::from("  ]i / [i        下/上一个风险提示"),
-        Line::from("  Ctrl-d / u     半页上下；Ctrl-f / b 整页；gg / G 顶 / 底"),
-        Line::from("  / 与 ; / ,     搜索与跳转下一/上一匹配"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "审阅、提交与命令",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  d / t          切换 Diff 模式 / 切换分组与文件列表"),
-        Line::from("  za / zM / zR   折叠当前组 / 全部折叠 / 全部展开"),
-        Line::from("  S              打开提交面板（按分组勾选文件并生成英文提交说明）"),
-        Line::from("  U              回退当前选中的分组或单个文件（支持二次确认，:revert 亦可）"),
-        Line::from("  c / e          添加批注 / 导出 Markdown (codeduck-review.md)"),
-        Line::from("  a / P / A      分析改动 / 切换工具 / 对当前文件提问"),
-        Line::from("  C / R          切换 Commit 或未提交改动 / 强刷"),
-        Line::from("  :ai / :model / :effort  切换工具、模型与推理强度"),
-        Line::from("  :fast-model / :fast-effort  设置 Stage 1 与提交说明的快速模型/强度"),
-        Line::from("  :new-session   重置对话会话并重新分析（:reset-session 亦可）"),
-        Line::from("  :ignore <pat>  添加忽略规则到 .codeduck"),
-        Line::from("  :rev 123 / :wc 查看 SVN r123（或 :rev 100:120），:wc 切回未提交改动"),
-        Line::from("  :ci / :ask / :export / :q  打开提交 / AI 追问 / 导出报告 / 退出"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "j/k 或 Ctrl-d/u 滚动；Esc / q / ? 关闭。",
-            Style::default().fg(Color::DarkGray),
         )),
     ];
+    for l in t!("help.window_body", locale = locale).lines() {
+        help_text.push(Line::from(l.to_string()));
+    }
+    help_text.push(Line::raw(""));
+    help_text.push(Line::from(Span::styled(
+        t!("help.nav_title", locale = locale).into_owned(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for l in t!("help.nav_body", locale = locale).lines() {
+        help_text.push(Line::from(l.to_string()));
+    }
+    help_text.push(Line::raw(""));
+    help_text.push(Line::from(Span::styled(
+        t!("help.ops_title", locale = locale).into_owned(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for l in t!("help.ops_body", locale = locale).lines() {
+        help_text.push(Line::from(l.to_string()));
+    }
+    help_text.push(Line::raw(""));
+    help_text.push(Line::from(Span::styled(
+        t!("help.close_hint", locale = locale).into_owned(),
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let widget = Paragraph::new(help_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" Help (j/k 滚动) "),
+                .title(t!("help.frame_title", locale = locale).into_owned()),
         )
         .scroll((app.help_scroll_y, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, popup);
 }
 
+fn draw_settings_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
+    let popup = centered_rect_sized(
+        (area.width * 72 / 100).max(66.min(area.width)),
+        17.min(area.height.saturating_sub(2)),
+        area,
+    );
+    frame.render_widget(Clear, popup);
+
+    let cfg_target = app
+        .config_path_override
+        .clone()
+        .or_else(crate::config::AppConfig::config_path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.codeduck/configs.toml".to_string());
+
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(t!("settings.title", locale = locale).into_owned());
+    let inner = outer_block.inner(popup);
+    frame.render_widget(outer_block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),    // Setting rows
+            Constraint::Length(1), // Status / config file path
+            Constraint::Length(1), // Action hints
+        ])
+        .split(inner);
+
+    let on_off = |b: bool| -> String {
+        if b {
+            t!("settings.on", locale = locale).into_owned()
+        } else {
+            t!("settings.off", locale = locale).into_owned()
+        }
+    };
+
+    let ui_lang_disp = i18n::display_name(&app.config.ui_language);
+    let review_lang_disp = if i18n::resolve_locale(&app.config.review_language).is_some() {
+        i18n::display_name(&app.config.review_language)
+    } else {
+        app.config.review_language.clone()
+    };
+
+    let rows_data: [(String, String); 8] = [
+        (
+            t!("settings.ui_language", locale = locale).into_owned(),
+            format!("< {} >", ui_lang_disp),
+        ),
+        (
+            t!("settings.ai_review_language", locale = locale).into_owned(),
+            format!("< {} >", review_lang_disp),
+        ),
+        (
+            t!("settings.ai_provider", locale = locale).into_owned(),
+            format!(
+                "< {} > ({})",
+                app.active_ai_provider_id,
+                t!("settings.enter_list", locale = locale)
+            ),
+        ),
+        (
+            t!("settings.display_mode", locale = locale).into_owned(),
+            format!("< {} >", app.display_mode.label()),
+        ),
+        (
+            t!("settings.ignore_comments", locale = locale).into_owned(),
+            on_off(app.config.ignore_comments),
+        ),
+        (
+            t!("settings.cache_ai", locale = locale).into_owned(),
+            on_off(app.config.cache_ai_results),
+        ),
+        (
+            t!("settings.cache_history", locale = locale).into_owned(),
+            on_off(app.config.cache_history),
+        ),
+        (
+            t!("settings.reuse_session", locale = locale).into_owned(),
+            on_off(app.config.reuse_session),
+        ),
+    ];
+
+    let label_col_w = 24usize;
+    let items: Vec<ListItem> = rows_data
+        .iter()
+        .enumerate()
+        .map(|(idx, (k, v))| {
+            let selected = idx == app.settings_cursor;
+            let k_pad = format!("{:<width$}", k, width = label_col_w);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "▶ " } else { "  " },
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    k_pad,
+                    Style::default()
+                        .fg(if selected { Color::White } else { Color::Gray })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    v.clone(),
+                    Style::default()
+                        .fg(if selected { Color::Cyan } else { Color::Green })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.settings_cursor.min(rows_data.len() - 1)));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(t!("settings.preferences", locale = locale).into_owned()),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(38, 52, 74))
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, sections[0], &mut state);
+
+    let status_line = if let Some(msg) = &app.settings_status {
+        Line::from(Span::styled(
+            msg.clone(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            t!("settings.config_file", locale = locale, path = cfg_target).into_owned(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    frame.render_widget(Paragraph::new(status_line), sections[1]);
+
+    let footer = Line::from(Span::styled(
+        t!("settings.actions", locale = locale).into_owned(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(footer), sections[2]);
+}
+
 fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let popup = centered_rect(76, 70, area);
     frame.render_widget(Clear, popup);
 
@@ -918,7 +1122,7 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("Uncommitted working copy changes"),
+        Span::raw(t!("commit_picker.wc_label", locale = locale).into_owned()),
     ]))];
 
     for ci in &app.commits_cache {
@@ -941,9 +1145,9 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.commit_picker_cursor));
     let title = if app.commits_loading {
-        " Select Target to Review (checking history... | r:refresh, Esc:cancel) "
+        t!("commit_picker.title_loading", locale = locale).into_owned()
     } else {
-        " Select Target to Review (Enter:load, r:refresh, Esc:cancel) "
+        t!("commit_picker.title_ready", locale = locale).into_owned()
     };
     let list = List::new(items)
         .block(
@@ -962,9 +1166,11 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let popup = centered_rect(60, 45, area);
     frame.render_widget(Clear, popup);
 
+    let active_tag = t!("ai_picker.active_tag", locale = locale);
     let mut items: Vec<ListItem> = app
         .available_providers
         .iter()
@@ -975,7 +1181,7 @@ fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(&app.active_ai_provider_id)
                 == p.id
             {
-                " (active)"
+                active_tag.as_ref()
             } else {
                 ""
             };
@@ -993,7 +1199,7 @@ fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     items.push(ListItem::new(Line::from(Span::styled(
-        "Off (disable AI analysis)",
+        t!("ai_picker.off_label", locale = locale).into_owned(),
         Style::default().fg(Color::Gray),
     ))));
 
@@ -1004,7 +1210,7 @@ fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" Select Local AI CLI Subscription "),
+                .title(t!("ai_picker.title", locale = locale).into_owned()),
         )
         .highlight_style(
             Style::default()
@@ -1036,11 +1242,12 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let popup = modal_step1_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
+    let locale = app.locale();
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Green))
-        .title(format!(" 提交 ({}) ", app.bundle.vcs));
+        .title(t!("commit.modal_title", locale = locale, vcs = app.bundle.vcs).into_owned());
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
@@ -1147,12 +1354,16 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(pane_border_style(files_focused))
-                .title(format!(
-                    " 文件 ({}/{}{}) — j/k:移动  Space:勾选  h/l:折展  a:全选 ",
-                    selected_cnt,
-                    app.commit_files.len(),
-                    ext_hint
-                )),
+                .title(
+                    t!(
+                        "commit.files_title",
+                        locale = locale,
+                        sel = selected_cnt,
+                        total = app.commit_files.len(),
+                        ext = ext_hint
+                    )
+                    .into_owned(),
+                ),
         )
         .highlight_style(
             Style::default()
@@ -1164,13 +1375,13 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     // 2. Commit message box (single sentence)
     let msg_focused = app.commit_modal_focus == CommitModalFocus::Message || app.commit_editing_msg;
     let msg_title = if app.commit_editing_msg {
-        " 提交说明 [编辑中 — Enter/Esc:完成  Ctrl-S:下一步] "
+        t!("commit.msg_editing", locale = locale).into_owned()
     } else if app.commit_msg_generating {
-        " 提交说明 [生成中...] "
+        t!("commit.msg_generating", locale = locale).into_owned()
     } else if app.commit_msg_needs_regen && !app.commit_msg_dirty {
-        " 提交说明 [待更新 · g:生成  e/i:编辑] "
+        t!("commit.msg_pending", locale = locale).into_owned()
     } else {
-        " 提交说明 [e/i:编辑  g:重生成] "
+        t!("commit.msg_ready", locale = locale).into_owned()
     };
 
     let msg_lines: Vec<Line<'static>> = if app.commit_editing_msg {
@@ -1192,6 +1403,7 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 .as_deref()
                 .unwrap_or(&app.active_ai_provider_id);
             append_stream_progress_lines(
+                locale,
                 &mut lines,
                 app.commit_msg_generating,
                 app.commit_started_at,
@@ -1226,12 +1438,12 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let mut footer_lines = Vec::new();
     if let Some(err) = &app.commit_error {
         footer_lines.push(Line::from(Span::styled(
-            format!("错误: {}", err),
+            t!("commit.footer_error", locale = locale, err = err).into_owned(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
     footer_lines.push(Line::from(Span::styled(
-        "[y/Enter] 下一步   [Space] 勾选   [e/i] 编辑   [g] 重生成   [Esc] 取消",
+        t!("commit.step1_actions", locale = locale).into_owned(),
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )));
     frame.render_widget(
@@ -1241,6 +1453,7 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let selected_files: Vec<_> = app.commit_files.iter().filter(|f| f.included).collect();
     let main_cnt = selected_files.iter().filter(|f| !f.is_external).count();
     let ext_cnt = selected_files.iter().filter(|f| f.is_external).count();
@@ -1249,6 +1462,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         std::collections::BTreeMap::new();
     let mut exts = app.cached_external_prefixes.clone();
     exts.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    let main_repo_label = t!("commit.main_repo", locale = locale);
     for f in &selected_files {
         let norm = f.path.trim_start_matches("./");
         if let Some(ext) = exts
@@ -1259,17 +1473,30 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 .entry(format!("external[{}]", ext))
                 .or_default() += 1;
         } else {
-            *repo_buckets.entry("主仓库".to_string()).or_default() += 1;
+            *repo_buckets.entry(main_repo_label.to_string()).or_default() += 1;
         }
     }
 
     let scope_detail = if ext_cnt > 0 {
-        format!("主仓库 {} · external {}", main_cnt, ext_cnt)
+        t!(
+            "commit.scope_with_ext",
+            locale = locale,
+            main = main_repo_label,
+            main_cnt = main_cnt,
+            ext_cnt = ext_cnt
+        )
+        .into_owned()
     } else {
-        "主仓库".to_string()
+        main_repo_label.to_string()
     };
     let mut top_lines = vec![Line::from(Span::styled(
-        format!("共 {} 个文件（{}）", selected_files.len(), scope_detail),
+        t!(
+            "commit.summary_files",
+            locale = locale,
+            count = selected_files.len(),
+            scope = scope_detail
+        )
+        .into_owned(),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -1281,7 +1508,13 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             .map(|(k, v)| format!("{}: {}", k, v))
             .collect();
         top_lines.push(Line::from(Span::styled(
-            format!("拆分为 {} 次提交: {}", repo_buckets.len(), bucket_desc.join("，")),
+            t!(
+                "commit.split_commits",
+                locale = locale,
+                count = repo_buckets.len(),
+                desc = bucket_desc.join(", ")
+            )
+            .into_owned(),
             Style::default().fg(Color::Magenta),
         )));
     }
@@ -1322,7 +1555,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Double)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Yellow))
-        .title(format!(" 二次确认 · 提交 ({}) ", app.bundle.vcs));
+        .title(t!("commit.confirm_title", locale = locale, vcs = app.bundle.vcs).into_owned());
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
@@ -1342,9 +1575,9 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let msg_title = if app.commit_msg_generating {
-        " 提交说明（生成中...） "
+        t!("commit.confirm_msg_generating", locale = locale).into_owned()
     } else {
-        " 提交说明 "
+        t!("commit.confirm_msg", locale = locale).into_owned()
     };
     let mut msg_lines = vec![Line::from(Span::styled(
         app.commit_message.trim().to_string(),
@@ -1358,6 +1591,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             .as_deref()
             .unwrap_or(&app.active_ai_provider_id);
         append_stream_progress_lines(
+            locale,
             &mut msg_lines,
             true,
             app.commit_started_at,
@@ -1387,19 +1621,19 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     if status_h > 0 {
         let status_widget = if app.commit_executing {
             Paragraph::new(Line::from(Span::styled(
-                "正在提交...",
+                t!("commit.committing", locale = locale).into_owned(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )))
         } else if let Some(err) = &app.commit_error {
             Paragraph::new(Line::from(Span::styled(
-                format!("提交失败: {}", err),
+                t!("commit.commit_failed", locale = locale, err = err).into_owned(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )))
         } else if let Some(hint) = &app.commit_hint_notice {
             Paragraph::new(Line::from(Span::styled(
-                format!("提示: {}", hint),
+                t!("commit.hint_prefix", locale = locale, hint = hint).into_owned(),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             )))
         } else {
@@ -1410,9 +1644,9 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
     let action_bar = Line::from(Span::styled(
         if app.commit_msg_generating {
-            "[y/Enter] 生成后提交   [f] 立即提交   [n/Esc] 返回"
+            t!("commit.step2_actions_wait", locale = locale).into_owned()
         } else {
-            "[y/Enter] 确认提交   [n/Esc] 返回"
+            t!("commit.step2_actions", locale = locale).into_owned()
         },
         Style::default()
             .fg(Color::Cyan)
@@ -1422,6 +1656,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let selected: Vec<_> = app.revert_files.iter().filter(|f| f.included).collect();
     let selected_cnt = selected.len();
     let multi_file = app.revert_files.len() > 1;
@@ -1434,32 +1669,30 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
     let effect = match (mod_cnt > 0, add_cnt > 0, app.bundle.vcs) {
         (true, true, crate::model::VcsKind::Git) => {
-            "恢复至 HEAD；[A] 新增文件将从磁盘删除".to_string()
+            t!("revert.effect_git_mod_add", locale = locale)
         }
         (true, true, crate::model::VcsKind::Svn) => {
-            "恢复至基准版本；[A] 将取消 add".to_string()
+            t!("revert.effect_svn_mod_add", locale = locale)
         }
-        (false, true, crate::model::VcsKind::Git) => {
-            "从磁盘删除新增/未跟踪 [A] 文件".to_string()
-        }
-        (false, true, crate::model::VcsKind::Svn) => {
-            "取消 [A] 的 svn add 标记（保留本地文件）".to_string()
-        }
-        (_, _, crate::model::VcsKind::Git) => "丢弃本地修改，恢复至 HEAD".to_string(),
-        (_, _, crate::model::VcsKind::Svn) => "丢弃本地修改，恢复至基准版本".to_string(),
+        (false, true, crate::model::VcsKind::Git) => t!("revert.effect_git_add", locale = locale),
+        (false, true, crate::model::VcsKind::Svn) => t!("revert.effect_svn_add", locale = locale),
+        (_, _, crate::model::VcsKind::Git) => t!("revert.effect_git_mod", locale = locale),
+        (_, _, crate::model::VcsKind::Svn) => t!("revert.effect_svn_mod", locale = locale),
     };
     let ext_note = if ext_cnt > 0 {
         format!(" · external {}", ext_cnt)
     } else {
         String::new()
     };
-    let summary_text = format!(
-        "已选 {}/{}{}  ·  {}",
-        selected_cnt,
-        app.revert_files.len(),
-        ext_note,
-        effect
-    );
+    let summary_text = t!(
+        "revert.step1_summary",
+        locale = locale,
+        sel = selected_cnt,
+        total = app.revert_files.len(),
+        ext = ext_note,
+        effect = effect
+    )
+    .into_owned();
 
     let desired_list_h = (app.revert_files.len() as u16 + 2).clamp(5, 22);
     let footer_h: u16 = if app.revert_error.is_some() { 2 } else { 1 };
@@ -1471,7 +1704,15 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Yellow))
-        .title(format!(" 回退 ({}) · {} ", app.bundle.vcs, app.revert_title));
+        .title(
+            t!(
+                "revert.modal_title",
+                locale = locale,
+                vcs = app.bundle.vcs,
+                target = app.revert_title
+            )
+            .into_owned(),
+        );
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
@@ -1535,13 +1776,15 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     let list_title = if multi_file {
-        format!(
-            " 文件 ({}/{}) — j/k:移动  Space:勾选  a:全选 ",
-            selected_cnt,
-            app.revert_files.len()
+        t!(
+            "revert.files_title_multi",
+            locale = locale,
+            sel = selected_cnt,
+            total = app.revert_files.len()
         )
+        .into_owned()
     } else {
-        " 文件 ".to_string()
+        t!("revert.files_title_single", locale = locale).into_owned()
     };
     let list = List::new(items)
         .block(
@@ -1560,14 +1803,14 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let mut footer = Vec::new();
     if let Some(err) = &app.revert_error {
         footer.push(Line::from(Span::styled(
-            format!("错误: {}", err),
+            t!("commit.footer_error", locale = locale, err = err).into_owned(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
     let action_hint = if multi_file {
-        "[y/Enter] 下一步   [Space] 勾选   [a] 全选   [Esc] 取消"
+        t!("revert.step1_actions_multi", locale = locale).into_owned()
     } else {
-        "[y/Enter] 下一步   [Esc] 取消"
+        t!("revert.step1_actions_single", locale = locale).into_owned()
     };
     footer.push(Line::from(Span::styled(
         action_hint,
@@ -1577,13 +1820,14 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
     let selected: Vec<_> = app.revert_files.iter().filter(|f| f.included).collect();
     let has_added = selected.iter().any(|f| f.badge == "A");
     let ext_cnt = selected.iter().filter(|f| f.is_external).count();
     let note = if has_added && matches!(app.bundle.vcs, crate::model::VcsKind::Git) {
-        "（不可撤销，新增/未跟踪文件将被删除）"
+        t!("revert.note_git_add", locale = locale)
     } else {
-        "（不可撤销）"
+        t!("revert.note_default", locale = locale)
     };
 
     let status_h: u16 = if app.revert_executing || app.revert_error.is_some() {
@@ -1601,12 +1845,21 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("确认永久丢弃 {} 个文件的未提交修改{}", selected.len(), note),
+            t!(
+                "revert.confirm_warning",
+                locale = locale,
+                count = selected.len(),
+                note = note
+            )
+            .into_owned(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("对象: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                t!("revert.target_label", locale = locale).into_owned(),
+                Style::default().fg(Color::Gray),
+            ),
             Span::styled(
                 app.revert_title.clone(),
                 Style::default()
@@ -1615,7 +1868,7 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 if ext_cnt > 0 {
-                    format!("  (含 external {})", ext_cnt)
+                    t!("revert.incl_ext", locale = locale, count = ext_cnt).into_owned()
                 } else {
                     String::new()
                 },
@@ -1633,7 +1886,7 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     }
     if selected.len() > 3 {
         lines.push(Line::from(Span::styled(
-            format!("  ... 等共 {} 个文件", selected.len()),
+            t!("revert.more_files", locale = locale, count = selected.len()).into_owned(),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1645,7 +1898,7 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Double)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Red))
-        .title(format!(" 二次确认 · 回退 ({}) ", app.bundle.vcs));
+        .title(t!("revert.confirm_title", locale = locale, vcs = app.bundle.vcs).into_owned());
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
@@ -1664,7 +1917,7 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         if app.revert_executing {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "正在回退...",
+                    t!("revert.reverting", locale = locale).into_owned(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -1674,7 +1927,7 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         } else if let Some(err) = &app.revert_error {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!("回退失败: {}", err),
+                    t!("revert.revert_failed", locale = locale, err = err).into_owned(),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )))
                 .wrap(Wrap { trim: false }),
@@ -1684,7 +1937,7 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let action_bar = Line::from(Span::styled(
-        "[y/Enter] 确认回退   [n/Esc] 返回",
+        t!("revert.step2_actions", locale = locale).into_owned(),
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(Paragraph::new(action_bar), sections[2]);
@@ -1751,6 +2004,7 @@ pub fn truncate_path_middle(path: &str, max_cols: usize) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn append_stream_progress_lines(
+    locale: &str,
     lines: &mut Vec<Line<'static>>,
     running: bool,
     started_at: Option<std::time::Instant>,
@@ -1769,7 +2023,14 @@ fn append_stream_progress_lines(
         let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{} 处理中 ({} · {:.1}s) ", spin, provider_id, elapsed.as_secs_f32()),
+                t!(
+                    "progress.running",
+                    locale = locale,
+                    spin = spin,
+                    provider = provider_id,
+                    secs = format!("{:.1}", elapsed.as_secs_f32())
+                )
+                .into_owned(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1805,7 +2066,7 @@ fn append_stream_progress_lines(
         .collect();
     if !thinking_lines.is_empty() && max_thinking > 0 {
         lines.push(Line::from(Span::styled(
-            "推理:",
+            t!("progress.thinking", locale = locale).into_owned(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )));
         let start = thinking_lines.len().saturating_sub(max_thinking);
@@ -1824,7 +2085,12 @@ fn append_stream_progress_lines(
         .collect();
     if !text_lines.is_empty() && max_text > 0 {
         lines.push(Line::from(Span::styled(
-            format!("输出 ({} 字):", text.chars().count()),
+            t!(
+                "progress.output_chars",
+                locale = locale,
+                count = text.chars().count()
+            )
+            .into_owned(),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         )));
         let start = text_lines.len().saturating_sub(max_text);
@@ -1838,12 +2104,14 @@ fn append_stream_progress_lines(
 }
 
 fn build_ai_progress_lines(app: &App) -> Vec<Line<'static>> {
+    let locale = app.locale();
     let prov = app
         .resolved_ai_provider_id
         .as_deref()
         .unwrap_or(&app.active_ai_provider_id);
     let mut lines: Vec<Line<'static>> = Vec::new();
     append_stream_progress_lines(
+        locale,
         &mut lines,
         true,
         app.ai_started_at,
@@ -1857,9 +2125,9 @@ fn build_ai_progress_lines(app: &App) -> Vec<Line<'static>> {
         4,
     );
     let stage_hint = if app.ai_deep_running && !app.ai_running {
-        "可先用 j/k 或 Tab 浏览 Diff 与分组，完成后自动刷新风险与代码说明。"
+        t!("progress.hint_deep", locale = locale).into_owned()
     } else {
-        "可先用 j/k 或 Tab 浏览 Diff，完成后自动刷新分组。"
+        t!("progress.hint_grouping", locale = locale).into_owned()
     };
     lines.push(Line::from(Span::styled(
         stage_hint,

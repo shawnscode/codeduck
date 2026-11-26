@@ -1,0 +1,306 @@
+_version = 1
+
+[meta]
+display_name = "简体中文 (zh-CN)"
+aliases = "zh,zh-cn,zh-hans,zh-sg,cn,chinese,中文,简体中文"
+
+[focus]
+tree = "左侧列表"
+diff = "右侧 Diff"
+
+[status]
+startup_hint = "Tab:切换窗口  j/k:移动  n/N:跳块  O:设置  ?:帮助"
+loading_diff = "正在加载 Diff..."
+fetching_diff = "正在拉取 %{target} 并运行 Difftastic..."
+diff_loaded = "已加载 %{target} (%{count} 个文件) — j/k:移动  n/N:跳块  Tab:切窗  O:设置  ?:帮助"
+diff_load_failed = "加载 Diff 失败: %{err}"
+no_changes = "当前目标下没有检测到改动。"
+ai_disabled = "已关闭 AI 分析（按 P 或 :ai 开启）。"
+ai_missing_cli = "未找到 '%{provider}' 对应的本地 AI CLI，请安装 claude / codex / gemini 或配置 custom_ai。"
+ai_preparing = "准备分析 (%{provider}, %{count} 个文件)..."
+ai_grouping_short = "快速分组 (%{provider}, %{count} 个文件)..."
+ai_grouping_elapsed = "分组 (%{secs}s): %{stage}"
+ai_analyzing_risks = "深入分析核心风险..."
+ai_groups_ready = "分组就绪 (%{count} 组)，后台分析核心风险..."
+ai_ready = "就绪：%{groups} 组，%{findings} 条提示 — j/k:浏览  n/N:跳块  Tab:切窗"
+ai_groups_ready_deep_failed = "分组已就绪；核心风险分析失败: %{err}"
+ai_failed = "分析失败: %{err}"
+ai_turned_off = "已关闭 AI 分析"
+ai_groups_not_ready = "AI 分组尚未就绪"
+ai_session_cleared = "已清除 %{provider} 的会话记录，正在重新分析..."
+ai_no_provider = "未配置可用 AI 工具（按 P 选择）。"
+ai_answer_added = "AI 回复已显示在底部面板"
+ai_question_failed = "AI 提问失败: %{err}"
+ai_asking = "正在向 %{provider} 提问..."
+commits_load_failed = "加载提交历史失败: %{err}"
+target_load_failed = "加载目标失败: %{err}"
+note_added = "已添加审阅批注"
+no_file_to_note = "未选中可添加批注的文件。"
+unknown_key_seq = "未知组合键: %{prefix}%{key}"
+refresh_failed = "刷新失败: %{err}"
+difft_mode = "Difft 视图: %{mode}"
+exported_to = "已导出审阅报告到 %{path}"
+export_failed = "导出失败: %{err}"
+ignore_added = "已添加 '%{pattern}' 到 %{file}（移除 %{count} 个文件）"
+ignore_failed = "更新 .codeduck 失败: %{err}"
+ignore_usage = "用法: :ignore <pattern>（例如 :ignore *.meta）"
+finding_status = "风险提示: %{title}"
+search_not_found = "未找到匹配: %{query}"
+search_match = "匹配 %{idx}/%{total}: '%{query}'"
+error_prefix = "错误: %{err}"
+unknown_command = "未知命令: :%{cmd}"
+model_current = "当前模型: %{cur}（用法 :model <name|clear>）"
+fast_model_current = "当前快速模型: %{cur}（用法 :fast-model <name|clear>）"
+effort_current = "当前推理强度: %{cur}（用法 :effort low|medium|high|xhigh|max|clear）"
+fast_effort_current = "当前快速推理强度: %{cur}（用法 :fast-effort low|medium|high|xhigh|max|clear）"
+lang_both_updated = "语言已切换为 %{lang}；按 O 再按 s 可持久化保存"
+lang_review_updated = "AI 审阅语言已设为 %{lang}"
+ui_lang_updated = "界面语言: %{lang}"
+ui_lang_unsupported = "不支持的界面语言 '%{lang}'（可选: %{available}）"
+ui_lang_current = "当前界面语言: %{lang}（可选: %{available}；用法 :ui-lang <code>）"
+settings_saved = "已保存配置到 %{path}"
+settings_save_failed = "保存配置失败: %{err}"
+settings_ui_lang_hint = "界面语言: %{lang}（按 s 保存到配置文件）"
+
+[header]
+grouping = " %{spin} 分组中 %{secs}s "
+risks = " %{spin} 风险分析 %{secs}s "
+ai_failed = " 分析失败 (a重试/P切换) "
+files_count = "文件: %{count}"
+view_label = "视图: %{mode}"
+view_groups = "分组"
+view_files = "文件"
+
+[tree]
+title_grouped = " 改动分组 (j/k:移动  l:Diff  S:提交) "
+title_flat = " 文件列表 (t:分组  S:提交) "
+
+[diff]
+loading_title = " 正在加载 %{target}... "
+loading_body = "正在从 %{vcs} 获取 %{target} 改动并运行 Difftastic...\n\n可随时按 q 或 Ctrl-C 退出。"
+error_title = " Diff 加载失败 "
+error_body = "加载 Diff 出错:\n\n%{err}\n\n按 R 重试，或按 C 选择其他提交。"
+empty_title = " 连续 Diff "
+empty_body = "当前目标下没有变更文件。\n\n按 C 切换其他提交/版本，或按 R 刷新。"
+pane_title = " %{path} | %{hunk}/%{total} (n/N跳块, hjkl移动) "
+
+[inspector]
+scroll_active = "%{base} (J/K滚动: +%{offset}) "
+scroll_hint = "%{base} (J/K滚动) "
+group_details = " 分组详情 "
+code_inspector = " 代码说明 (%{loc}) "
+no_file = "未定位文件"
+analysis_error = "分析出错: %{err}"
+purpose_prefix = "说明: "
+checkpoints_title = "核查点:"
+summary_prefix = "概述: "
+strategy_prefix = "建议: "
+empty_tree = "暂无分析结果（按 a 分析，P 切换工具）。"
+file_badge = "[文件 %{risk}] "
+suggestion_prefix = "  建议: "
+empty_diff = "当前片段暂无说明（按 A 提问，a 重跑分析）。"
+note_prefix = "批注 [%{time}]: "
+querying_ai = "正在查询..."
+qa_question = "问%{tag}: %{question}"
+qa_answer_prefix = "答: "
+
+[footer]
+normal_hints = "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  S:提交  U:回退  R:刷新  d:视图  O:设置  ?:帮助  q:退出"
+note_prompt = "当前文件批注 > "
+ask_prompt = "向 AI 提问 > "
+
+[help]
+frame_title = " Help (j/k 滚动) "
+title = "codeduck — 快捷键说明"
+window_title = "窗口与浏览"
+window_body = """
+  Tab / Ctrl-w   切换焦点（左侧列表 / 右侧 Diff）
+  H / L          直接切到左侧列表 / 右侧 Diff
+  J / K          滚动底部详情面板（B/I 显隐侧栏/底栏）"""
+nav_title = "移动与跳转"
+nav_body = """
+  j / k          上下移动
+  h / l / 0      折叠展开分组 / 左右滚屏并在边缘切窗 / 回行首
+  n / N          下/上一个差异块（]c / [c 亦可）
+  ]f / [f        下/上一个文件
+  ]g / [g        下/上一个分组
+  ]i / [i        下/上一个风险提示
+  Ctrl-d / u     半页上下；Ctrl-f / b 整页；gg / G 顶 / 底
+  / 与 ; / ,     搜索与跳转下一/上一匹配"""
+ops_title = "审阅、提交、配置与命令"
+ops_body = """
+  d / t          切换 Diff 模式 / 切换分组与文件列表
+  za / zM / zR   折叠当前组 / 全部折叠 / 全部展开
+  O              打开配置与语言选择面板（:config / :settings 亦可）
+  S              打开提交面板（按分组勾选文件并生成英文提交说明）
+  U              回退当前选中的分组或单个文件（支持二次确认，:revert 亦可）
+  c / e          添加批注 / 导出 Markdown (codeduck-review.md)
+  a / P / A      分析改动 / 切换工具 / 对当前文件提问
+  C / R          切换 Commit 或未提交改动 / 强刷
+  :lang [code]   切换界面与 AI 语言；:ui-lang 仅切换界面语言
+  :ai / :model / :effort  切换工具、模型与推理强度
+  :fast-model / :fast-effort  设置 Stage 1 与提交说明的快速模型/强度
+  :new-session   重置对话会话并重新分析（:reset-session 亦可）
+  :ignore <pat>  添加忽略规则到 .codeduck
+  :rev 123 / :wc 查看 SVN r123（或 :rev 100:120），:wc 切回未提交改动
+  :ci / :ask / :export / :q  打开提交 / AI 追问 / 导出报告 / 退出"""
+close_hint = "j/k 或 Ctrl-d/u 滚动；Esc / q / ? 关闭。"
+
+[settings]
+title = " 配置与语言设置 "
+preferences = " 配置项 "
+ui_language = "界面语言"
+ai_review_language = "AI 审阅语言"
+ai_provider = "AI 工具"
+enter_list = "Enter: 列表"
+display_mode = "Diff 视图模式"
+ignore_comments = "忽略代码注释"
+cache_ai = "缓存 AI 分析结果"
+cache_history = "缓存提交历史"
+reuse_session = "复用 AI 会话"
+on = "开启"
+off = "关闭"
+config_file = "配置文件: %{path}"
+actions = "[j/k] 移动   [Space/h/l/Enter] 切换   [s] 保存   [Esc] 关闭"
+
+[commit_picker]
+wc_label = "工作区未提交改动"
+title_loading = " 选择审阅目标 (加载历史中... | r:刷新, Esc:取消) "
+title_ready = " 选择审阅目标 (Enter:加载, r:刷新, Esc:取消) "
+
+[ai_picker]
+active_tag = " (当前)"
+off_label = "关闭（禁用 AI 分析）"
+title = " 选择本地 AI CLI 工具 "
+
+[commit]
+only_uncommitted = "仅支持对未提交改动执行提交（按 :wc 切回未提交视图）"
+loading_diff = "正在加载 Diff，请稍候..."
+no_changes = "当前没有可提交的未提交改动"
+group_all = "全部未提交文件"
+group_other = "其他 / 未分组文件"
+err_select_file = "请至少勾选一个需要提交的文件"
+err_empty_msg = "提交日志不能为空"
+cache_hit = "命中本地缓存"
+preparing = "准备生成 (%{model}, %{count} 个文件)..."
+gen_failed = "AI 生成提交日志失败: %{err}"
+partial = "部分仓库已提交 (%{summary})；失败项: %{err}"
+succeeded = "提交成功: %{summary}"
+wait_hint = "AI 正在更新一句话日志，请稍候完成（或按 f 立即使用当前预览日志提交）"
+modal_title = " 提交 (%{vcs}) "
+files_title = " 文件 (%{sel}/%{total}%{ext}) — j/k:移动  Space:勾选  h/l:折展  a:全选 "
+msg_editing = " 提交说明 [编辑中 — Enter/Esc:完成  Ctrl-S:下一步] "
+msg_generating = " 提交说明 [生成中...] "
+msg_pending = " 提交说明 [待更新 · g:生成  e/i:编辑] "
+msg_ready = " 提交说明 [e/i:编辑  g:重生成] "
+footer_error = "错误: %{err}"
+step1_actions = "[y/Enter] 下一步   [Space] 勾选   [e/i] 编辑   [g] 重生成   [Esc] 取消"
+confirm_title = " 二次确认 · 提交 (%{vcs}) "
+main_repo = "主仓库"
+scope_with_ext = "%{main} %{main_cnt} · external %{ext_cnt}"
+summary_files = "共 %{count} 个文件（%{scope}）"
+split_commits = "拆分为 %{count} 次提交: %{desc}"
+confirm_msg_generating = " 提交说明（生成中...） "
+confirm_msg = " 提交说明 "
+committing = "正在提交..."
+commit_failed = "提交失败: %{err}"
+hint_prefix = "提示: %{hint}"
+step2_actions_wait = "[y/Enter] 生成后提交   [f] 立即提交   [n/Esc] 返回"
+step2_actions = "[y/Enter] 确认提交   [n/Esc] 返回"
+
+[revert]
+only_uncommitted = "仅支持对未提交改动执行回退（按 :wc 切回未提交视图）"
+loading_diff = "正在加载 Diff，请稍候..."
+no_changes = "当前没有可回退的未提交改动"
+target_group = "分组「%{title}」"
+target_file = "文件 %{path}"
+no_target = "未定位到可回退的文件或分组"
+err_keep_file = "请至少保留一个需要回退的文件"
+partial = "部分已回退 (%{summary})；失败项: %{err}"
+succeeded = "回退成功: %{summary}"
+effect_git_mod_add = "恢复至 HEAD；[A] 新增文件将从磁盘删除"
+effect_svn_mod_add = "恢复至基准版本；[A] 将取消 add"
+effect_git_add = "从磁盘删除新增/未跟踪 [A] 文件"
+effect_svn_add = "取消 [A] 的 svn add 标记（保留本地文件）"
+effect_git_mod = "丢弃本地修改，恢复至 HEAD"
+effect_svn_mod = "丢弃本地修改，恢复至基准版本"
+step1_summary = "已选 %{sel}/%{total}%{ext}  ·  %{effect}"
+modal_title = " 回退 (%{vcs}) · %{target} "
+files_title_multi = " 文件 (%{sel}/%{total}) — j/k:移动  Space:勾选  a:全选 "
+files_title_single = " 文件 "
+step1_actions_multi = "[y/Enter] 下一步   [Space] 勾选   [a] 全选   [Esc] 取消"
+step1_actions_single = "[y/Enter] 下一步   [Esc] 取消"
+note_git_add = "（不可撤销，新增/未跟踪文件将被删除）"
+note_default = "（不可撤销）"
+confirm_title = " 二次确认 · 回退 (%{vcs}) "
+confirm_warning = "确认永久丢弃 %{count} 个文件的未提交修改%{note}"
+target_label = "对象: "
+incl_ext = "  (含 external %{count})"
+more_files = "  ... 等共 %{count} 个文件"
+reverting = "正在回退..."
+revert_failed = "回退失败: %{err}"
+step2_actions = "[y/Enter] 确认回退   [n/Esc] 返回"
+
+[progress]
+running = "%{spin} 处理中 (%{provider} · %{secs}s) "
+thinking = "推理:"
+output_chars = "输出 (%{count} 字):"
+hint_deep = "可先用 j/k 或 Tab 浏览 Diff 与分组，完成后自动刷新风险与代码说明。"
+hint_grouping = "可先用 j/k 或 Tab 浏览 Diff，完成后自动刷新分组。"
+
+[ai]
+reusing_session = "复用会话 %{sid} (%{provider})..."
+session_expired = "会话失效，重建 %{provider} 会话..."
+starting_session = "新建 %{provider} 会话..."
+checking_cache = "检查缓存..."
+cache_hit = "命中缓存，直接加载"
+preparing_diffs = "整理差异 (%{count} 个文件)..."
+submitting_review = "提交分析 (%{kb} KB -> %{provider})..."
+parsing_response = "解析返回结果..."
+done_summary = "完成：%{groups} 组，%{findings} 条提示"
+fast_grouping = "快速分组 (%{kb} KB -> %{provider})..."
+parsing_groups = "解析分组..."
+analyzing_risks = "深入分析核心风险..."
+merging_findings = "合并风险分析结果..."
+generating_commit_msg = "生成提交说明 (%{count} 个文件)..."
+formatting_commit_msg = "整理提交说明..."
+codex_connected = "Codex 会话已连接 (%{sid})"
+codex_step = "Codex 步骤: %{kind}"
+cli_connected = "连接 %{model} (%{cid})"
+waiting_response = "等待响应..."
+thinking = "思考中..."
+streaming_output = "输出中..."
+calling_tool = "调用 %{tool}"
+exec_step = "执行步骤: %{step} (%{state})"
+cli_done = "完成 %{dur}s (%{in_tok} in / %{out_tok} out)"
+gemini_oauth_expired = "Gemini CLI OAuth 授权已过期或未登录 (invalid_grant)，请先在终端直接运行 `gemini` 完成授权登录，或改用 `--ai agy` / `--ai codex`"
+
+[vcs]
+partial_success = "部分成功 (%{summary}); 失败详情: %{err}"
+main_repo = "主仓库"
+svn_committed = "%{label} 提交完成"
+svn_commit_failed = "%{label} 失败: %{err}"
+svn_exec_error = "%{label} 执行异常: %{err}"
+svn_reverted = "%{label} 回退完成"
+svn_revert_failed = "%{label} 回退失败: %{err}"
+git_reverted = "Git 已回退 %{count} 个改动文件"
+
+[export]
+report_title = "# 代码审阅报告 (codeduck)\n\n"
+generated = "生成时间"
+repository = "仓库路径"
+target = "审阅目标"
+files = "变更文件数"
+commit = "提交"
+message = "提交说明"
+ai_analysis = "AI 分析"
+overall_risk = "整体风险"
+summary = "概述"
+review_strategy = "审阅建议"
+semantic_groups = "### 语义审阅分组\n\n"
+key_points = "\n核心核查点:\n"
+ai_findings = "### AI 风险提示\n\n"
+suggestion = "建议"
+changed_files = "## 变更文件\n\n"
+reviewer_notes = "## 审阅批注\n\n"
+written_to = "报告已写入 %{path}"

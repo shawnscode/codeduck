@@ -587,6 +587,12 @@ impl VcsBackend for GitBackend {
             }
         }
 
-        Ok(format!("Git 已回退 {} 个改动文件", paths.len()))
+        let locale = crate::i18n::current_thread_locale();
+        Ok(rust_i18n::t!(
+            "vcs.git_reverted",
+            locale = locale.as_str(),
+            count = paths.len()
+        )
+        .into_owned())
     }
 }
