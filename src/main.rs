@@ -1,0 +1,260 @@
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::Result;
+use clap::Parser;
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+
+use codeduck::ai;
+use codeduck::config::AppConfig;
+use codeduck::difft::DifftEngine;
+use codeduck::ignore::IgnoreMatcher;
+use codeduck::model::{DiffTarget, DifftDisplayMode, VcsKind};
+use codeduck::ui;
+use codeduck::ui::app::App;
+use codeduck::ui::export::export_review_markdown;
+use codeduck::vcs;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "codeduck",
+    version,
+    about = "Vim-style terminal code review powered by Difftastic and local AI CLI subscriptions"
+)]
+struct Cli {
+    /// Repository or working copy path (defaults to current directory)
+    #[arg(short = 'C', long, default_value = ".")]
+    path: PathBuf,
+
+    /// Force VCS backend (auto, svn, git)
+    #[arg(long, default_value = "auto")]
+    vcs: String,
+
+    /// Review a specific commit/revision (e.g. 123 or r123 for SVN, commit SHA for Git)
+    #[arg(short = 'r', short_alias = 'c', long)]
+    rev: Option<String>,
+
+    /// Review a revision range (e.g. 100:120 for SVN, main..HEAD for Git)
+    #[arg(long)]
+    range: Option<String>,
+
+    /// Local AI CLI provider (auto, agy, codex, claude, gemini, none, or custom name)
+    #[arg(long, alias = "provider")]
+    ai: Option<String>,
+
+    /// Model override passed to the local AI CLI
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Reasoning/thinking effort level (low, medium, high, xhigh, max)
+    #[arg(long)]
+    effort: Option<String>,
+
+    /// AI review output language (e.g. zh-CN, en)
+    #[arg(long)]
+    lang: Option<String>,
+
+    /// Difftastic display mode (side-by-side, side-by-side-show-both, inline)
+    #[arg(long)]
+    display: Option<String>,
+
+    /// Path to global configs.toml (defaults to ~/.codeduck/configs.toml)
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Disable AI disk cache
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Start a fresh AI session instead of resuming saved session from .codeduck
+    #[arg(long)]
+    new_session: bool,
+
+    /// Run AI analysis non-interactively and write Markdown report to stdout or file, without TUI
+    #[arg(long)]
+    headless_export: Option<PathBuf>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let mut config = AppConfig::load(cli.config.as_deref())?;
+
+    DifftEngine::check_available(&config.difft_bin)?;
+
+    let preferred_vcs = match cli.vcs.to_ascii_lowercase().as_str() {
+        "svn" => Some(VcsKind::Svn),
+        "git" => Some(VcsKind::Git),
+        _ => None,
+    };
+    let vcs_backend = vcs::open_vcs(&cli.path, preferred_vcs)?;
+
+    // Merge project-level `.codeduck` TOML settings (global -> .codeduck -> CLI flags)
+    config.apply_project_overrides(vcs_backend.repo_root(), vcs_backend.scope_dir());
+
+    if let Some(ai_p) = cli.ai {
+        config.ai_provider = ai_p;
+    }
+    if let Some(m) = cli.model {
+        config.ai_model = Some(m);
+    }
+    if let Some(e) = cli.effort {
+        config.ai_effort = Some(e);
+    }
+    if let Some(l) = cli.lang {
+        config.review_language = l;
+    }
+    if cli.no_cache {
+        config.cache_ai_results = false;
+        config.cache_history = false;
+    }
+    if cli.new_session {
+        config.ai_sessions.clear();
+        if !config.ai_provider.eq_ignore_ascii_case("none")
+            && !config.ai_provider.eq_ignore_ascii_case("off")
+        {
+            if let Some(p) = ai::resolve_provider(&config.ai_provider, &config) {
+                let _ = codeduck::config::save_project_session(
+                    vcs_backend.repo_root(),
+                    vcs_backend.scope_dir(),
+                    p.id(),
+                    None,
+                );
+            } else if !config.ai_provider.eq_ignore_ascii_case("auto") {
+                let _ = codeduck::config::save_project_session(
+                    vcs_backend.repo_root(),
+                    vcs_backend.scope_dir(),
+                    &config.ai_provider,
+                    None,
+                );
+            }
+        }
+    }
+    if let Some(disp) = cli.display {
+        config.display_mode = match disp.as_str() {
+            "inline" => DifftDisplayMode::Inline,
+            "side-by-side-show-both" | "both" => DifftDisplayMode::SideBySideShowBoth,
+            _ => DifftDisplayMode::SideBySide,
+        };
+    }
+
+    let target = if let Some(range) = cli.range {
+        DiffTarget::parse(&range)
+    } else if let Some(rev) = cli.rev {
+        DiffTarget::Commit(rev)
+    } else {
+        DiffTarget::Uncommitted
+    };
+
+    if let Some(export_path) = cli.headless_export {
+        let matcher = IgnoreMatcher::load(vcs_backend.repo_root(), vcs_backend.scope_dir());
+        let bundle = vcs::collect_changes_cached(
+            vcs_backend.as_ref(),
+            &target,
+            Some(&matcher),
+            config.cache_history,
+            false,
+        )?;
+        let engine = DifftEngine::new(&config.difft_bin, config.ignore_comments)?;
+        let rendered = engine.render_changes_bounded(&bundle.changes, config.display_mode, 120)?;
+        let ai_res = if let Some(provider) = ai::resolve_provider(&config.ai_provider, &config) {
+            let out = ai::analyze_diff_with_session(
+                provider.as_ref(),
+                &bundle,
+                &rendered,
+                &config,
+                false,
+            )?;
+            if config.reuse_session {
+                if let Some(sid) = out.session_id.as_deref() {
+                    let _ = codeduck::config::save_project_session(
+                        vcs_backend.repo_root(),
+                        vcs_backend.scope_dir(),
+                        provider.id(),
+                        Some(sid),
+                    );
+                }
+            }
+            Some(out.review)
+        } else {
+            None
+        };
+        let session = codeduck::model::ReviewSessionState::default();
+        export_review_markdown(&export_path, &bundle, ai_res.as_ref(), &session)?;
+        println!("Report written to {}", export_path.display());
+        return Ok(());
+    }
+
+    let (term_w, _) = crossterm::terminal::size().unwrap_or((140, 40));
+    let mut app = App::new_async(vcs_backend, config, target, term_w)?;
+
+    install_terminal_panic_hook();
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    let _terminal_guard = TerminalRestoreGuard;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let run_result = run_tui_loop(&mut terminal, &mut app);
+    let _ = terminal.show_cursor();
+    drop(_terminal_guard);
+
+    run_result
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+struct TerminalRestoreGuard;
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+fn install_terminal_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+}
+
+fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    while !app.should_quit {
+        app.poll_background();
+        terminal.draw(|f| ui::draw(f, app))?;
+
+        if event::poll(Duration::from_millis(80))? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    app.handle_key(key);
+                }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
