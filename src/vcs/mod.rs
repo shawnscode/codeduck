@@ -20,6 +20,14 @@ pub struct CommitOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RevertOutcome {
+    pub reverted_paths: Vec<String>,
+    pub failed_paths: Vec<String>,
+    pub summary: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffBundle {
     pub vcs: VcsKind,
@@ -74,6 +82,23 @@ pub trait VcsBackend: Send + Sync {
             },
             Err(e) => CommitOutcome {
                 committed_paths: Vec::new(),
+                failed_paths: paths.to_vec(),
+                summary: String::new(),
+                error: Some(format!("{:#}", e)),
+            },
+        }
+    }
+    fn revert_files(&self, paths: &[String]) -> Result<String>;
+    fn revert_files_detailed(&self, paths: &[String]) -> RevertOutcome {
+        match self.revert_files(paths) {
+            Ok(summary) => RevertOutcome {
+                reverted_paths: paths.to_vec(),
+                failed_paths: Vec::new(),
+                summary,
+                error: None,
+            },
+            Err(e) => RevertOutcome {
+                reverted_paths: Vec::new(),
                 failed_paths: paths.to_vec(),
                 summary: String::new(),
                 error: Some(format!("{:#}", e)),

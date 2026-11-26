@@ -470,4 +470,123 @@ impl VcsBackend for GitBackend {
             .to_string();
         Ok(summary)
     }
+
+    fn revert_files(&self, paths: &[String]) -> Result<String> {
+        if paths.is_empty() {
+            bail!("No files selected to revert");
+        }
+
+        let has_head = self.has_head();
+        let mut rename_old_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Ok(bundle) = self.collect_uncommitted(None) {
+            for ch in bundle.changes {
+                if let Some(old_p) = ch.old_path {
+                    rename_old_map.insert(ch.path, old_p);
+                }
+            }
+        }
+
+        let mut head_restore_paths: Vec<String> = Vec::new();
+        let mut remove_new_paths: Vec<String> = Vec::new();
+
+        for p in paths {
+            let in_head = if has_head {
+                self.run_git(&["ls-tree", "-r", "--name-only", "HEAD", "--", p])
+                    .map(|out| !String::from_utf8_lossy(&out).trim().is_empty())
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if in_head {
+                if !head_restore_paths.contains(p) {
+                    head_restore_paths.push(p.clone());
+                }
+            } else {
+                if !remove_new_paths.contains(p) {
+                    remove_new_paths.push(p.clone());
+                }
+                if let Some(old_p) = rename_old_map.get(p) {
+                    if !head_restore_paths.contains(old_p) {
+                        head_restore_paths.push(old_p.clone());
+                    }
+                }
+            }
+        }
+
+        if !remove_new_paths.is_empty() {
+            if has_head {
+                let mut reset_cmd = Command::new("git");
+                reset_cmd
+                    .args(["-c", "core.quotepath=false", "reset", "-q", "HEAD", "--"])
+                    .current_dir(&self.repo_root);
+                for p in &remove_new_paths {
+                    reset_cmd.arg(p);
+                }
+                let _ = reset_cmd.output();
+            } else {
+                let mut rm_cmd = Command::new("git");
+                rm_cmd
+                    .args([
+                        "-c",
+                        "core.quotepath=false",
+                        "rm",
+                        "-f",
+                        "--cached",
+                        "--ignore-unmatch",
+                        "--",
+                    ])
+                    .current_dir(&self.repo_root);
+                for p in &remove_new_paths {
+                    rm_cmd.arg(p);
+                }
+                let _ = rm_cmd.output();
+            }
+
+            for p in &remove_new_paths {
+                let rel = Path::new(p);
+                if rel.is_absolute()
+                    || rel
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    bail!("Unsafe path to revert: {}", p);
+                }
+                let abs = self.repo_root.join(rel);
+                if abs.is_file() || abs.is_symlink() {
+                    std::fs::remove_file(&abs).with_context(|| {
+                        format!("Failed to remove added/untracked file {}", abs.display())
+                    })?;
+                }
+            }
+        }
+
+        if !head_restore_paths.is_empty() {
+            let mut restore_cmd = Command::new("git");
+            restore_cmd
+                .args([
+                    "-c",
+                    "core.quotepath=false",
+                    "restore",
+                    "--source=HEAD",
+                    "--staged",
+                    "--worktree",
+                    "--",
+                ])
+                .current_dir(&self.repo_root);
+            for p in &head_restore_paths {
+                restore_cmd.arg(p);
+            }
+            let out = restore_cmd
+                .output()
+                .context("Failed to execute `git restore`")?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                bail!("`git restore` failed: {}", err.trim());
+            }
+        }
+
+        Ok(format!("Git 已回退 {} 个改动文件", paths.len()))
+    }
 }

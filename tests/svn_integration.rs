@@ -1486,6 +1486,22 @@ args = ["-c", "echo pwned"]
     assert!(!app.show_sidebar);
     assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
 
+    // Show sidebar again, verify `l` moves Tree -> Diff, `l` scrolls right in Diff,
+    // first `h` scrolls back to 0, second `h` moves Diff -> Tree cleanly
+    app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE));
+    assert!(app.show_sidebar);
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Tree);
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert_eq!(app.diff_scroll_x, 4);
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert_eq!(app.diff_scroll_x, 0);
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Tree);
+
     // Same-line findings cycle with `]i`
     app.ai_review = Some(codeduck::model::AiReviewResult {
         provider_name: "mock".to_string(),
@@ -1552,4 +1568,175 @@ args = ["-c", "echo pwned"]
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(!app.ai_deep_running);
     assert!(app.ai_started_at.is_none());
+}
+
+#[test]
+fn test_revert_group_and_file_with_double_confirm_svn_and_git() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let tmp = TempDir::new().unwrap();
+
+    // --- Part 1: SVN Group Revert with Double Confirmation ---
+    let repo_dir = tmp.path().join("svn_rev_repo");
+    let wc_dir = tmp.path().join("svn_rev_wc");
+    fs::create_dir_all(&repo_dir).unwrap();
+    run("svnadmin", &["create", repo_dir.to_str().unwrap()], tmp.path());
+    let repo_url = format!("file://{}", repo_dir.display());
+    run("svn", &["checkout", &repo_url, wc_dir.to_str().unwrap()], tmp.path());
+
+    fs::write(wc_dir.join("g1_a.lua"), "return 1\n").unwrap();
+    fs::write(wc_dir.join("g1_b.lua"), "return 2\n").unwrap();
+    fs::write(wc_dir.join("g2_keep.lua"), "return 3\n").unwrap();
+    run("svn", &["add", "g1_a.lua", "g1_b.lua", "g2_keep.lua"], &wc_dir);
+    run("svn", &["commit", "-m", "r1"], &wc_dir);
+
+    fs::write(wc_dir.join("g1_a.lua"), "return 100\n").unwrap();
+    fs::write(wc_dir.join("g1_b.lua"), "return 200\n").unwrap();
+    fs::write(wc_dir.join("g2_keep.lua"), "return 300\n").unwrap();
+
+    let backend = vcs::open_vcs(&wc_dir, Some(VcsKind::Svn)).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "none".to_string();
+    let mut app = App::new(backend, cfg, DiffTarget::Uncommitted, 120).unwrap();
+    app.ai_review = Some(codeduck::model::AiReviewResult {
+        provider_name: "mock".to_string(),
+        summary: "groups".to_string(),
+        overall_risk: codeduck::model::RiskLevel::Low,
+        review_strategy: String::new(),
+        groups: vec![
+            codeduck::model::ReviewGroup {
+                id: "g1".to_string(),
+                title: "GroupOne".to_string(),
+                description: String::new(),
+                category: "logic".to_string(),
+                risk_level: codeduck::model::RiskLevel::Low,
+                review_order: 1,
+                files: vec!["g1_a.lua".to_string(), "g1_b.lua".to_string()],
+                key_points: vec![],
+            },
+            codeduck::model::ReviewGroup {
+                id: "g2".to_string(),
+                title: "GroupTwo".to_string(),
+                description: String::new(),
+                category: "logic".to_string(),
+                risk_level: codeduck::model::RiskLevel::Low,
+                review_order: 2,
+                files: vec!["g2_keep.lua".to_string()],
+                key_points: vec![],
+            },
+        ],
+        files: vec![],
+        hunks: vec![],
+        findings: vec![],
+    });
+    app.tree_mode = codeduck::ui::app::TreeMode::AiGrouped;
+    app.rebuild_tree_and_continuous();
+    app.tree_cursor = 0; // On GroupHeader "GroupOne"
+    app.focus = codeduck::ui::app::PaneFocus::Tree;
+
+    // Press `U` -> opens RevertConfirm (Step 1) with both files in GroupOne
+    app.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::RevertConfirm);
+    assert_eq!(app.revert_files.len(), 2);
+
+    // Draw Step 1 and Step 2 to ensure zero layout panics
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+
+    // Press `y` -> opens RevertDoubleConfirm (Step 2, does not revert yet)
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(
+        app.overlay,
+        codeduck::ui::app::OverlayKind::RevertDoubleConfirm
+    );
+    assert!(!app.revert_executing);
+    assert_eq!(fs::read_to_string(wc_dir.join("g1_a.lua")).unwrap(), "return 100\n");
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+
+    // Press `n` -> goes back to Step 1 without reverting
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::RevertConfirm);
+
+    // Confirm Step 1 -> Step 2 -> confirm Step 2
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    for _ in 0..40 {
+        app.poll_background();
+        if !app.revert_executing && !app.diff_loading {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+    assert_eq!(fs::read_to_string(wc_dir.join("g1_a.lua")).unwrap(), "return 1\n");
+    assert_eq!(fs::read_to_string(wc_dir.join("g1_b.lua")).unwrap(), "return 2\n");
+    // GroupTwo file untouched!
+    assert_eq!(fs::read_to_string(wc_dir.join("g2_keep.lua")).unwrap(), "return 300\n");
+    assert_eq!(app.bundle.changes.len(), 1);
+    assert_eq!(app.bundle.changes[0].path, "g2_keep.lua");
+
+    // --- Part 2: Git Single File Revert (Modified + Untracked) ---
+    let git_dir = tmp.path().join("git_revert_repo");
+    fs::create_dir_all(&git_dir).unwrap();
+    run("git", &["init"], &git_dir);
+    run("git", &["config", "user.email", "t@example.com"], &git_dir);
+    run("git", &["config", "user.name", "Tester"], &git_dir);
+    fs::write(git_dir.join("tracked.rs"), "fn ok() -> i32 { 1 }\n").unwrap();
+    run("git", &["add", "tracked.rs"], &git_dir);
+    run("git", &["commit", "-m", "init"], &git_dir);
+
+    fs::write(git_dir.join("tracked.rs"), "fn ok() -> i32 { 999 }\n").unwrap();
+    fs::write(git_dir.join("untracked.rs"), "// temp\n").unwrap();
+
+    let git_backend = vcs::open_vcs(&git_dir, Some(VcsKind::Git)).unwrap();
+    let mut gcfg = AppConfig::default();
+    gcfg.ai_provider = "none".to_string();
+    let mut gapp = App::new(git_backend, gcfg, DiffTarget::Uncommitted, 120).unwrap();
+    // Target tracked.rs specifically in Diff focus and revert via `U` -> `y` -> `y`
+    let tracked_idx = gapp.path_to_index["tracked.rs"];
+    gapp.selected_file_idx = Some(tracked_idx);
+    gapp.focus = codeduck::ui::app::PaneFocus::Diff;
+    let tracked_y = gapp
+        .continuous
+        .sections
+        .iter()
+        .find(|s| s.change_idx == tracked_idx)
+        .unwrap()
+        .start_y;
+    gapp.diff_cursor_y = tracked_y;
+    gapp.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE));
+    assert_eq!(gapp.revert_files.len(), 1);
+    assert_eq!(gapp.revert_files[0].path, "tracked.rs");
+    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    for _ in 0..40 {
+        gapp.poll_background();
+        if !gapp.revert_executing && !gapp.diff_loading {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(git_dir.join("tracked.rs")).unwrap(),
+        "fn ok() -> i32 { 1 }\n"
+    );
+    // Untracked file still present until reverted explicitly
+    assert!(git_dir.join("untracked.rs").exists());
+    assert_eq!(gapp.bundle.changes.len(), 1);
+    assert_eq!(gapp.bundle.changes[0].path, "untracked.rs");
+
+    // Now revert untracked.rs
+    gapp.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    for _ in 0..40 {
+        gapp.poll_background();
+        if !gapp.revert_executing && !gapp.diff_loading {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!git_dir.join("untracked.rs").exists());
+    assert!(gapp.bundle.changes.is_empty());
 }

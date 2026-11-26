@@ -68,6 +68,8 @@ pub enum OverlayKind {
     AiPicker,
     CommitConfirm,
     CommitDoubleConfirm,
+    RevertConfirm,
+    RevertDoubleConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +212,7 @@ pub enum BgMessage {
         result: Result<ai::AiPromptOutput, String>,
     },
     CommitDone(crate::vcs::CommitOutcome),
+    RevertDone(crate::vcs::RevertOutcome),
 }
 
 pub struct QaEntry {
@@ -305,6 +308,12 @@ pub struct App {
     pub commit_msg_cache: HashMap<String, String>,
     pub commit_error: Option<String>,
     pub commit_hint_notice: Option<String>,
+
+    pub revert_title: String,
+    pub revert_files: Vec<CommitFileEntry>,
+    pub revert_files_cursor: usize,
+    pub revert_executing: bool,
+    pub revert_error: Option<String>,
 
     pub session: ReviewSessionState,
     pub qa_history: Vec<QaEntry>,
@@ -436,6 +445,11 @@ impl App {
             commit_msg_cache: HashMap::new(),
             commit_error: None,
             commit_hint_notice: None,
+            revert_title: String::new(),
+            revert_files: Vec::new(),
+            revert_files_cursor: 0,
+            revert_executing: false,
+            revert_error: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
             ai_followup_running: false,
@@ -568,6 +582,11 @@ impl App {
             commit_msg_cache: HashMap::new(),
             commit_error: None,
             commit_hint_notice: None,
+            revert_title: String::new(),
+            revert_files: Vec::new(),
+            revert_files_cursor: 0,
+            revert_executing: false,
+            revert_error: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
             ai_followup_running: false,
@@ -1236,6 +1255,35 @@ impl App {
                         self.status_message = format!("提交成功: {}", truncate(&outcome.summary, 80));
                     }
                 }
+                BgMessage::RevertDone(outcome) => {
+                    self.revert_executing = false;
+                    if let Some(err) = outcome.error {
+                        if !outcome.reverted_paths.is_empty() {
+                            let reverted: HashSet<String> =
+                                outcome.reverted_paths.into_iter().collect();
+                            self.revert_files.retain(|f| !reverted.contains(&f.path));
+                            if self.revert_files_cursor >= self.revert_files.len()
+                                && !self.revert_files.is_empty()
+                            {
+                                self.revert_files_cursor = self.revert_files.len() - 1;
+                            }
+                            let _ = self.reload_target_with_options(DiffTarget::Uncommitted, true);
+                            self.revert_error = Some(format!(
+                                "部分已回退 ({})；失败项: {}",
+                                outcome.summary, err
+                            ));
+                        } else {
+                            self.revert_error = Some(err);
+                        }
+                    } else {
+                        self.overlay = OverlayKind::None;
+                        self.revert_error = None;
+                        self.pending_status_override =
+                            Some(format!("回退成功: {}", truncate(&outcome.summary, 90)));
+                        let _ = self.reload_target_with_options(DiffTarget::Uncommitted, true);
+                        self.status_message = format!("回退成功: {}", truncate(&outcome.summary, 80));
+                    }
+                }
             }
         }
     }
@@ -1801,7 +1849,25 @@ impl App {
             OverlayKind::CommitDoubleConfirm => {
                 self.handle_commit_double_confirm_key(key);
             }
+            OverlayKind::RevertConfirm => {
+                self.handle_revert_confirm_key(key);
+            }
+            OverlayKind::RevertDoubleConfirm => {
+                self.handle_revert_double_confirm_key(key);
+            }
             OverlayKind::None => {}
+        }
+    }
+
+    fn resolve_cached_externals(&mut self) -> Vec<String> {
+        if !self.cached_external_prefixes.is_empty()
+            || !matches!(self.vcs.kind(), crate::model::VcsKind::Svn)
+        {
+            self.cached_external_prefixes.clone()
+        } else {
+            let exts = self.vcs.external_prefixes();
+            self.cached_external_prefixes = exts.clone();
+            exts
         }
     }
 
@@ -1819,15 +1885,7 @@ impl App {
             return;
         }
 
-        let externals = if !self.cached_external_prefixes.is_empty()
-            || !matches!(self.vcs.kind(), crate::model::VcsKind::Svn)
-        {
-            self.cached_external_prefixes.clone()
-        } else {
-            let exts = self.vcs.external_prefixes();
-            self.cached_external_prefixes = exts.clone();
-            exts
-        };
+        let externals = self.resolve_cached_externals();
         self.commit_files = self
             .bundle
             .changes
@@ -2388,6 +2446,181 @@ impl App {
         }
     }
 
+    pub fn open_revert_confirm(&mut self) {
+        if self.bundle.target != DiffTarget::Uncommitted {
+            self.status_message =
+                "仅支持对未提交改动执行回退（按 :wc 切回未提交视图）".to_string();
+            return;
+        }
+        if self.diff_loading {
+            self.status_message = "正在加载 Diff，请稍候...".to_string();
+            return;
+        }
+        if self.bundle.changes.is_empty() {
+            self.status_message = "当前没有可回退的未提交改动".to_string();
+            return;
+        }
+
+        let (title, indices): (String, Vec<usize>) = match self.focus {
+            PaneFocus::Tree => match self.tree_rows.get(self.tree_cursor).cloned() {
+                Some(TreeRow::GroupHeader {
+                    group_id, title, ..
+                }) => {
+                    let mut idxs = Vec::new();
+                    let mut seen = HashSet::new();
+                    if let Some(ai) = &self.ai_review {
+                        if let Some(g) = ai.groups.iter().find(|g| g.id == group_id) {
+                            for p in &g.files {
+                                if let Some(&idx) = self.path_to_index.get(p) {
+                                    if seen.insert(idx) {
+                                        idxs.push(idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (format!("分组「{}」", title), idxs)
+                }
+                Some(TreeRow::FileItem {
+                    path, change_idx, ..
+                }) => (format!("文件 {}", path), vec![change_idx]),
+                None => (String::new(), Vec::new()),
+            },
+            PaneFocus::Diff => {
+                let y = self
+                    .diff_cursor_y
+                    .min(self.continuous.lines.len().saturating_sub(1));
+                let idx = self
+                    .continuous
+                    .line_to_file
+                    .get(y)
+                    .copied()
+                    .flatten()
+                    .or(self.selected_file_idx);
+                if let Some(cidx) = idx.filter(|&i| i < self.bundle.changes.len()) {
+                    (
+                        format!("文件 {}", self.bundle.changes[cidx].path),
+                        vec![cidx],
+                    )
+                } else {
+                    (String::new(), Vec::new())
+                }
+            }
+        };
+
+        if indices.is_empty() {
+            self.status_message = "未定位到可回退的文件或分组".to_string();
+            return;
+        }
+
+        let externals = self.resolve_cached_externals();
+        self.revert_title = title;
+        self.revert_files = indices
+            .into_iter()
+            .filter_map(|idx| self.bundle.changes.get(idx))
+            .map(|c| {
+                let is_ext = externals
+                    .iter()
+                    .any(|e| c.path == *e || c.path.starts_with(&format!("{}/", e)));
+                CommitFileEntry {
+                    path: c.path.clone(),
+                    badge: c.kind.short_badge().to_string(),
+                    is_external: is_ext,
+                    included: true,
+                }
+            })
+            .collect();
+        self.revert_files_cursor = 0;
+        self.revert_executing = false;
+        self.revert_error = None;
+        self.overlay = OverlayKind::RevertConfirm;
+    }
+
+    fn execute_revert_confirm(&mut self) {
+        if self.revert_executing {
+            return;
+        }
+        let paths: Vec<String> = self
+            .revert_files
+            .iter()
+            .filter(|f| f.included)
+            .map(|f| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.revert_error = Some("请至少保留一个需要回退的文件".to_string());
+            return;
+        }
+        self.revert_executing = true;
+        self.revert_error = None;
+        let vcs = Arc::clone(&self.vcs);
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || {
+            let outcome = vcs.revert_files_detailed(&paths);
+            let _ = tx.send(BgMessage::RevertDone(outcome));
+        });
+    }
+
+    fn handle_revert_confirm_key(&mut self, key: KeyEvent) {
+        if self.revert_executing {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                self.revert_error = None;
+                self.overlay = OverlayKind::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.revert_files_cursor + 1 < self.revert_files.len() {
+                    self.revert_files_cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.revert_files_cursor = self.revert_files_cursor.saturating_sub(1);
+            }
+            KeyCode::Char(' ') | KeyCode::Char('x') => {
+                if let Some(entry) = self.revert_files.get_mut(self.revert_files_cursor) {
+                    entry.included = !entry.included;
+                    self.revert_error = None;
+                }
+            }
+            KeyCode::Char('a') => {
+                if !self.revert_files.is_empty() {
+                    let all_included = self.revert_files.iter().all(|f| f.included);
+                    let target = !all_included;
+                    for f in &mut self.revert_files {
+                        f.included = target;
+                    }
+                    self.revert_error = None;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if !self.revert_files.iter().any(|f| f.included) {
+                    self.revert_error = Some("请至少保留一个需要回退的文件".to_string());
+                    return;
+                }
+                self.revert_error = None;
+                self.overlay = OverlayKind::RevertDoubleConfirm;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_revert_double_confirm_key(&mut self, key: KeyEvent) {
+        if self.revert_executing {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.revert_error = None;
+                self.overlay = OverlayKind::RevertConfirm;
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.execute_revert_confirm();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_input_mode_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -2630,6 +2863,9 @@ impl App {
             KeyCode::Char('S') => {
                 self.open_commit_confirm();
             }
+            KeyCode::Char('U') => {
+                self.open_revert_confirm();
+            }
             KeyCode::Char('e') => {
                 let path = self.bundle.repo_root.join("codeduck-review.md");
                 match export_review_markdown(
@@ -2719,7 +2955,12 @@ impl App {
     fn move_left(&mut self) {
         match self.focus {
             PaneFocus::Diff => {
-                self.diff_scroll_x = self.diff_scroll_x.saturating_sub(4);
+                if self.diff_scroll_x > 0 {
+                    self.diff_scroll_x = self.diff_scroll_x.saturating_sub(4);
+                } else if self.show_sidebar {
+                    self.inspector_scroll_y = 0;
+                    self.focus = PaneFocus::Tree;
+                }
             }
             PaneFocus::Tree => {
                 self.collapse_active_tree_group();
@@ -3335,6 +3576,7 @@ impl App {
             }
             "commits" | "log" => self.open_commit_picker(),
             "ci" | "submit" => self.open_commit_confirm(),
+            "revert" | "undo" => self.open_revert_confirm(),
             "ai" => {
                 if let Some(p) = parts.get(1) {
                     self.ai_session_epoch += 1;

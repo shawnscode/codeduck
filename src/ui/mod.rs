@@ -42,6 +42,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_commit_confirm(frame, app, root);
             draw_commit_double_confirm(frame, app, root);
         }
+        OverlayKind::RevertConfirm => draw_revert_confirm(frame, app, root),
+        OverlayKind::RevertDoubleConfirm => {
+            draw_revert_confirm(frame, app, root);
+            draw_revert_double_confirm(frame, app, root);
+        }
     }
 }
 
@@ -814,7 +819,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let edited = || text_input::format_with_cursor(&app.input_buffer, app.input_cursor, avail_w);
     let cmd_line = match app.input_mode {
         InputMode::Normal => Line::from(Span::styled(
-            "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  S:提交  R:刷新  d:视图  B/I:收展  ?:帮助  q:退出",
+            "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  S:提交  U:回退  R:刷新  d:视图  B/I:收展  ?:帮助  q:退出",
             Style::default().fg(Color::DarkGray),
         )),
         InputMode::Command => Line::from(format!(":{}", edited())),
@@ -856,7 +861,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("  j / k          上下移动"),
-        Line::from("  h / l / 0      折叠展开分组 / 左右滚动 Diff / 回行首"),
+        Line::from("  h / l / 0      折叠展开分组 / 左右滚屏并在边缘切窗 / 回行首"),
         Line::from("  n / N          下/上一个差异块（]c / [c 亦可）"),
         Line::from("  ]f / [f        下/上一个文件"),
         Line::from("  ]g / [g        下/上一个分组"),
@@ -873,6 +878,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("  d / t          切换 Diff 模式 / 切换分组与文件列表"),
         Line::from("  za / zM / zR   折叠当前组 / 全部折叠 / 全部展开"),
         Line::from("  S              打开提交面板（按分组勾选文件并生成英文提交说明）"),
+        Line::from("  U              回退当前选中的分组或单个文件（支持二次确认，:revert 亦可）"),
         Line::from("  c / e          添加批注 / 导出 Markdown (codeduck-review.md)"),
         Line::from("  a / P / A      分析改动 / 切换工具 / 对当前文件提问"),
         Line::from("  C / R          切换 Commit 或未提交改动 / 强刷"),
@@ -1394,6 +1400,205 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(action_bar), sections[2]);
+}
+
+fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(78, 72, area);
+    frame.render_widget(Clear, popup);
+
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(format!(" 回退未提交改动 ({}) — {} ", app.bundle.vcs, app.revert_title));
+    let inner = outer_block.inner(popup);
+    frame.render_widget(outer_block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Scope & safety notice
+            Constraint::Min(4),    // File checklist
+            Constraint::Length(2), // Error + action bar
+        ])
+        .split(inner);
+
+    let selected_cnt = app.revert_files.iter().filter(|f| f.included).count();
+    let has_added = app.revert_files.iter().any(|f| f.included && f.badge == "A");
+    let scope_note = if has_added {
+        format!(
+            "将回退 {} 中的 {} / {} 个文件；注意：Git 新增/未跟踪 [A] 文件将被移除，SVN [A] 将取消添加。",
+            app.revert_title,
+            selected_cnt,
+            app.revert_files.len()
+        )
+    } else {
+        format!(
+            "将回退 {} 中的 {} / {} 个文件，恢复为基准版本内容。",
+            app.revert_title,
+            selected_cnt,
+            app.revert_files.len()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                scope_note,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "回退会永久丢弃本地未提交更改，下一步将再次确认。",
+                Style::default().fg(Color::Gray),
+            )),
+        ])
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let items: Vec<ListItem> = app
+        .revert_files
+        .iter()
+        .map(|f| {
+            let check = if f.included { "[x]" } else { "[ ]" };
+            let mut spans = vec![
+                Span::styled(
+                    format!("{} ", check),
+                    Style::default().fg(if f.included {
+                        Color::Red
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    format!("[{}] ", f.badge),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(f.path.clone()),
+            ];
+            if f.is_external {
+                spans.push(Span::styled(
+                    " [external]",
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if !app.revert_files.is_empty() {
+        state.select(Some(
+            app.revert_files_cursor.min(app.revert_files.len() - 1),
+        ));
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(format!(
+                    " 待回退文件 ({}/{}) — j/k:移动  Space:勾选  a:全选 ",
+                    selected_cnt,
+                    app.revert_files.len()
+                )),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(58, 32, 36))
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, sections[1], &mut state);
+
+    let mut footer = Vec::new();
+    if let Some(err) = &app.revert_error {
+        footer.push(Line::from(Span::styled(
+            format!("错误: {}", err),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        footer.push(Line::from(Span::styled(
+            "按 Space 可增减本组待回退文件。",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    footer.push(Line::from(Span::styled(
+        "y / Enter: 下一步二次确认  |  Space: 勾选  |  n / Esc / q: 取消",
+        Style::default().fg(Color::Cyan),
+    )));
+    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), sections[2]);
+}
+
+fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(68, 52, area);
+    frame.render_widget(Clear, popup);
+
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(format!(" 二次确认回退 ({}) ", app.bundle.vcs));
+    let inner = outer_block.inner(popup);
+    frame.render_widget(outer_block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(4),    // File summary
+            Constraint::Length(2), // Status / error
+            Constraint::Length(1), // Action bar
+        ])
+        .split(inner);
+
+    let selected: Vec<_> = app.revert_files.iter().filter(|f| f.included).collect();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "警告：即将永久回退 {} 中的 {} 个文件（不可撤销）！",
+                app.revert_title,
+                selected.len()
+            ),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+    for f in selected.iter().take(12) {
+        let ext_tag = if f.is_external { " [external]" } else { "" };
+        lines.push(Line::from(format!("  • [{}] {}{}", f.badge, f.path, ext_tag)));
+    }
+    if selected.len() > 12 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... 其余 {} 个文件", selected.len() - 12),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sections[0]);
+
+    let status_line = if app.revert_executing {
+        Line::from(Span::styled(
+            "正在执行回退，请稍候...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if let Some(err) = &app.revert_error {
+        Line::from(Span::styled(
+            format!("回退失败: {}", err),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "确认不再保留上述改动后执行回退：",
+            Style::default().fg(Color::Gray),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(vec![status_line]).wrap(Wrap { trim: false }),
+        sections[1],
+    );
+
+    let action_bar = Line::from(Span::styled(
+        "y / Enter: 确认永久回退  |  n / Esc / q: 返回",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(Paragraph::new(action_bar), sections[2]);
 }

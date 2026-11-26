@@ -682,6 +682,33 @@ fn run_bounded<T: Sync, R: Send>(
         .collect()
 }
 
+impl SvnBackend {
+    fn group_paths_by_external(&self, paths: &[String]) -> BTreeMap<String, Vec<(String, String)>> {
+        // Group targets by external working copy prefix vs main working copy,
+        // because SVN commands cannot span separate repository UUIDs in a single invocation.
+        let mut externals = self.discover_externals(None);
+        externals.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+        let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for p in paths {
+            let norm = p.trim_start_matches("./").to_string();
+            if let Some(ext) = externals
+                .iter()
+                .find(|e| norm == **e || norm.starts_with(&format!("{}/", e)))
+            {
+                let rel_in_ext = norm
+                    .strip_prefix(&format!("{}/", ext))
+                    .unwrap_or(".")
+                    .to_string();
+                groups.entry(ext.clone()).or_default().push((rel_in_ext, p.clone()));
+            } else {
+                groups.entry(String::new()).or_default().push((norm, p.clone()));
+            }
+        }
+        groups
+    }
+}
+
 impl VcsBackend for SvnBackend {
     fn kind(&self) -> VcsKind {
         VcsKind::Svn
@@ -831,28 +858,7 @@ impl VcsBackend for SvnBackend {
         }
         let msg_path = msg_file.path().to_string_lossy().to_string();
 
-        // Group targets by external working copy prefix vs main working copy,
-        // because SVN cannot commit across separate repository UUIDs in a single command.
-        let mut externals = self.discover_externals(None);
-        externals.sort_by_key(|b| std::cmp::Reverse(b.len()));
-
-        // Map repo prefix -> Vec<(rel_path_in_repo, original_path_in_bundle)>
-        let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        for p in paths {
-            let norm = p.trim_start_matches("./").to_string();
-            if let Some(ext) = externals
-                .iter()
-                .find(|e| norm == **e || norm.starts_with(&format!("{}/", e)))
-            {
-                let rel_in_ext = norm
-                    .strip_prefix(&format!("{}/", ext))
-                    .unwrap_or(".")
-                    .to_string();
-                groups.entry(ext.clone()).or_default().push((rel_in_ext, p.clone()));
-            } else {
-                groups.entry(String::new()).or_default().push((norm, p.clone()));
-            }
-        }
+        let groups = self.group_paths_by_external(paths);
 
         let mut outputs = Vec::new();
         let mut errors = Vec::new();
@@ -924,6 +930,119 @@ impl VcsBackend for SvnBackend {
         };
         crate::vcs::CommitOutcome {
             committed_paths,
+            failed_paths,
+            summary,
+            error,
+        }
+    }
+
+    fn revert_files(&self, paths: &[String]) -> Result<String> {
+        let outcome = self.revert_files_detailed(paths);
+        if let Some(err) = outcome.error {
+            if outcome.summary.is_empty() {
+                bail!("{}", err);
+            } else {
+                bail!("部分成功 ({}); 失败详情: {}", outcome.summary, err);
+            }
+        }
+        Ok(outcome.summary)
+    }
+
+    fn revert_files_detailed(&self, paths: &[String]) -> crate::vcs::RevertOutcome {
+        let make_err = |err: String| crate::vcs::RevertOutcome {
+            reverted_paths: Vec::new(),
+            failed_paths: paths.to_vec(),
+            summary: String::new(),
+            error: Some(err),
+        };
+        if paths.is_empty() {
+            return make_err("No files selected to revert".to_string());
+        }
+
+        // Expand any paired old_path for renamed entries so `svn mv` restores cleanly.
+        let mut expanded_paths = paths.to_vec();
+        let selected_set: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+        if let Ok(bundle) = self.collect_uncommitted(None) {
+            for ch in bundle.changes {
+                if selected_set.contains(ch.path.as_str()) {
+                    if let Some(old_p) = ch.old_path {
+                        if !expanded_paths.contains(&old_p) {
+                            expanded_paths.push(old_p);
+                        }
+                    }
+                }
+            }
+        }
+
+        let groups = self.group_paths_by_external(&expanded_paths);
+        let mut outputs = Vec::new();
+        let mut errors = Vec::new();
+        let mut reverted_paths = Vec::new();
+        let mut failed_paths = Vec::new();
+
+        for (prefix, entries) in groups {
+            let work_dir = if prefix.is_empty() {
+                self.scope_dir.clone()
+            } else {
+                self.scope_dir.join(&prefix)
+            };
+            let label = if prefix.is_empty() {
+                "主仓库".to_string()
+            } else {
+                format!("external[{}]", prefix)
+            };
+            let mut cmd = Command::new("svn");
+            cmd.args(["revert", "--non-interactive", "--depth", "empty", "--"])
+                .current_dir(&work_dir);
+            for (gp, _) in &entries {
+                cmd.arg(Self::svn_peg_target(gp));
+            }
+            match cmd.output() {
+                Ok(out) if out.status.success() => {
+                    for (_, orig) in entries {
+                        if selected_set.contains(orig.as_str()) {
+                            reverted_paths.push(orig);
+                        }
+                    }
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    outputs.push(if stdout.is_empty() {
+                        format!("{} 回退完成", label)
+                    } else {
+                        format!("[{}] {}", label, stdout)
+                    });
+                }
+                Ok(out) => {
+                    for (_, orig) in entries {
+                        if selected_set.contains(orig.as_str()) {
+                            failed_paths.push(orig);
+                        }
+                    }
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    errors.push(format!("{} 回退失败: {}", label, err.trim()));
+                }
+                Err(e) => {
+                    for (_, orig) in entries {
+                        if selected_set.contains(orig.as_str()) {
+                            failed_paths.push(orig);
+                        }
+                    }
+                    errors.push(format!("{} 执行异常: {}", label, e));
+                }
+            }
+        }
+
+        let summary = if outputs.is_empty() {
+            String::new()
+        } else {
+            outputs.join(" | ")
+        };
+        let error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join(" ; "))
+        };
+        crate::vcs::RevertOutcome {
+            reverted_paths,
             failed_paths,
             summary,
             error,
