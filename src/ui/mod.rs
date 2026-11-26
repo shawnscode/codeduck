@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1303,7 +1303,6 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let msg_box_h: u16 = if app.commit_msg_generating { 8 } else { 4 };
     let status_h: u16 = if app.commit_executing
         || app.commit_error.is_some()
         || app.commit_hint_notice.is_some()
@@ -1312,15 +1311,18 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
-    let desired_h = (top_lines.len() as u16).clamp(3, 12) + msg_box_h + status_h + 1 + 2;
+    let top_line_cnt = top_lines.len().min(6) as u16;
+    let msg_box_h: u16 = if app.commit_msg_generating { 7 } else { 4 };
+    let desired_h = 2 + top_line_cnt + msg_box_h + status_h + 1;
     let popup = modal_step2_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Double)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Yellow))
-        .title(format!(" 确认提交 ({}) ", app.bundle.vcs));
+        .title(format!(" 二次确认 · 提交 ({}) ", app.bundle.vcs));
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
@@ -1430,16 +1432,12 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let add_cnt = selected.iter().filter(|f| f.badge == "A").count();
     let ext_cnt = selected.iter().filter(|f| f.is_external).count();
 
-    let base_label = match app.bundle.vcs {
-        crate::model::VcsKind::Git => "HEAD",
-        crate::model::VcsKind::Svn => "基准版本",
-    };
     let effect = match (mod_cnt > 0, add_cnt > 0, app.bundle.vcs) {
         (true, true, crate::model::VcsKind::Git) => {
-            format!("恢复至 {}；[A] 新增文件将从磁盘删除", base_label)
+            "恢复至 HEAD；[A] 新增文件将从磁盘删除".to_string()
         }
         (true, true, crate::model::VcsKind::Svn) => {
-            format!("恢复至 {}；[A] 将取消 add", base_label)
+            "恢复至基准版本；[A] 将取消 add".to_string()
         }
         (false, true, crate::model::VcsKind::Git) => {
             "从磁盘删除新增/未跟踪 [A] 文件".to_string()
@@ -1447,7 +1445,8 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
         (false, true, crate::model::VcsKind::Svn) => {
             "取消 [A] 的 svn add 标记（保留本地文件）".to_string()
         }
-        _ => format!("丢弃本地修改，恢复至 {}", base_label),
+        (_, _, crate::model::VcsKind::Git) => "丢弃本地修改，恢复至 HEAD".to_string(),
+        (_, _, crate::model::VcsKind::Svn) => "丢弃本地修改，恢复至基准版本".to_string(),
     };
     let ext_note = if ext_cnt > 0 {
         format!(" · external {}", ext_cnt)
@@ -1471,7 +1470,7 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(Color::Yellow))
         .title(format!(" 回退 ({}) · {} ", app.bundle.vcs, app.revert_title));
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
@@ -1580,6 +1579,7 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let selected: Vec<_> = app.revert_files.iter().filter(|f| f.included).collect();
     let has_added = selected.iter().any(|f| f.badge == "A");
+    let ext_cnt = selected.iter().filter(|f| f.is_external).count();
     let note = if has_added && matches!(app.bundle.vcs, crate::model::VcsKind::Git) {
         "（不可撤销，新增/未跟踪文件将被删除）"
     } else {
@@ -1591,63 +1591,74 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
-    let line_cnt = 2 + selected.len().min(12) as u16 + u16::from(selected.len() > 12);
-    let desired_h = 2 + (line_cnt + 2).max(5) + status_h + 1;
+    let preview_cnt = selected.len().min(3) as u16;
+    let has_more = u16::from(selected.len() > 3);
+    let scope_line_cnt = 1u16; // 1 warning + 1 blank + 1 scope + preview + (more)
+    let body_h = 2 + scope_line_cnt + preview_cnt + has_more;
+    let desired_h = 2 + body_h + status_h + 1 + 1;
     let popup = modal_step2_rect(area, desired_h);
-    let box_path_budget = (popup.width as usize).saturating_sub(24).max(20);
-    let mut lines = vec![Line::from(Span::styled(
-        format!(
-            "将永久丢弃 {} 个文件的未提交修改{}",
-            selected.len(),
-            note
-        ),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-    ))];
-    lines.push(Line::raw(""));
-    for f in selected.iter().take(12) {
+    let path_budget = (popup.width as usize).saturating_sub(20).max(16);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("确认永久丢弃 {} 个文件的未提交修改{}", selected.len(), note),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("对象: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                app.revert_title.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if ext_cnt > 0 {
+                    format!("  (含 external {})", ext_cnt)
+                } else {
+                    String::new()
+                },
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+    ];
+    for f in selected.iter().take(3) {
         let ext_tag = if f.is_external { " [external]" } else { "" };
         let shown_path = truncate_path_middle(
             &f.path,
-            box_path_budget.saturating_sub(ext_tag.len()).max(16),
+            path_budget.saturating_sub(ext_tag.len()).max(14),
         );
         lines.push(Line::from(format!("  • [{}] {}{}", f.badge, shown_path, ext_tag)));
     }
-    if selected.len() > 12 {
+    if selected.len() > 3 {
         lines.push(Line::from(Span::styled(
-            format!("  ... 其余 {} 个文件", selected.len() - 12),
+            format!("  ... 等共 {} 个文件", selected.len()),
             Style::default().fg(Color::DarkGray),
         )));
     }
+
     frame.render_widget(Clear, popup);
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Double)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Red))
-        .title(format!(" 确认回退 ({}) · {} ", app.bundle.vcs, app.revert_title));
+        .title(format!(" 二次确认 · 回退 ({}) ", app.bundle.vcs));
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),           // File list box
+            Constraint::Min(4),           // Concise summary + up to 3 sample files
             Constraint::Length(status_h), // Active status / error only
             Constraint::Length(1),        // Action bar
         ])
         .split(inner);
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .padding(Padding::horizontal(1))
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .wrap(Wrap { trim: false }),
-        sections[0],
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sections[0]);
 
     if status_h > 0 {
         if app.revert_executing {
@@ -1865,9 +1876,9 @@ fn modal_step1_rect(area: Rect, desired_h: u16) -> Rect {
 }
 
 fn modal_step2_rect(area: Rect, desired_h: u16) -> Rect {
-    let target_w = (area.width * 68 / 100).max(60.min(area.width));
-    let min_h = (area.height * 44 / 100).min(area.height).max(12.min(area.height));
-    let max_h = (area.height * 72 / 100).max(min_h);
+    let target_w = (area.width * 54 / 100).max(52.min(area.width));
+    let min_h = 10.min(area.height);
+    let max_h = (area.height * 46 / 100).max(min_h);
     centered_rect_sized(target_w, desired_h.clamp(min_h, max_h), area)
 }
 
