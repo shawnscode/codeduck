@@ -19,6 +19,8 @@ pub struct ProjectAiConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub fast_model: Option<String>,
+    pub fast_effort: Option<String>,
     pub language: Option<String>,
     pub timeout_secs: Option<u64>,
     pub cache_ai_results: Option<bool>,
@@ -70,6 +72,12 @@ pub struct AppConfig {
     /// Optional reasoning/thinking effort override (low, medium, high, xhigh, max).
     #[serde(default)]
     pub ai_effort: Option<String>,
+    /// Fast model used for Stage 1 grouping and commit message generation.
+    #[serde(default)]
+    pub ai_fast_model: Option<String>,
+    /// Fast reasoning/thinking effort used for Stage 1 grouping and commit message generation.
+    #[serde(default)]
+    pub ai_fast_effort: Option<String>,
     /// Output language for AI review summaries & findings.
     #[serde(default = "default_language")]
     pub review_language: String,
@@ -128,6 +136,8 @@ impl Default for AppConfig {
             ai_provider: default_ai_provider(),
             ai_model: None,
             ai_effort: None,
+            ai_fast_model: None,
+            ai_fast_effort: None,
             review_language: default_language(),
             difft_bin: default_difft_bin(),
             display_mode: DifftDisplayMode::SideBySide,
@@ -170,6 +180,8 @@ struct PartialFlatConfig {
     ai_provider: Option<String>,
     ai_model: Option<String>,
     ai_effort: Option<String>,
+    ai_fast_model: Option<String>,
+    ai_fast_effort: Option<String>,
     review_language: Option<String>,
     difft_bin: Option<String>,
     display_mode: Option<DifftDisplayMode>,
@@ -213,6 +225,24 @@ impl AppConfig {
         Self::codeduck_home_dir().map(|d| d.join("sessions.toml"))
     }
 
+    /// Derive a lightweight, stateless config for fast tasks (Stage 1 grouping & commit messages).
+    /// Applies `ai_fast_model`/`ai_fast_effort` and disables `reuse_session` so bloated sessions
+    /// never slow down diff-only passes.
+    pub fn fast_config(&self) -> Self {
+        let mut fast = self.clone();
+        if let Some(fm) = &self.ai_fast_model {
+            fast.ai_model = Some(fm.clone());
+        }
+        if let Some(fe) = &self.ai_fast_effort {
+            fast.ai_effort = Some(fe.clone());
+        } else if self.ai_fast_model.is_some() {
+            fast.ai_effort = Some("low".to_string());
+        }
+        fast.reuse_session = false;
+        fast.ai_sessions.clear();
+        fast
+    }
+
     fn merge_toml_str(&mut self, raw: &str, path_hint: &Path) -> Result<()> {
         // 1. Apply any legacy flat keys (`ai_provider = ...`, etc.) if present.
         if let Ok(flat) = toml::from_str::<PartialFlatConfig>(raw) {
@@ -229,6 +259,16 @@ impl AppConfig {
             if let Some(e) = flat.ai_effort {
                 if !e.trim().is_empty() {
                     self.ai_effort = Some(e);
+                }
+            }
+            if let Some(fm) = flat.ai_fast_model {
+                if !fm.trim().is_empty() {
+                    self.ai_fast_model = Some(fm);
+                }
+            }
+            if let Some(fe) = flat.ai_fast_effort {
+                if !fe.trim().is_empty() {
+                    self.ai_fast_effort = Some(fe);
                 }
             }
             if let Some(lang) = flat.review_language {
@@ -287,6 +327,16 @@ impl AppConfig {
         if let Some(e) = proj.ai.effort.or(proj.effort) {
             if !e.trim().is_empty() {
                 self.ai_effort = Some(e);
+            }
+        }
+        if let Some(fm) = proj.ai.fast_model {
+            if !fm.trim().is_empty() {
+                self.ai_fast_model = Some(fm);
+            }
+        }
+        if let Some(fe) = proj.ai.fast_effort {
+            if !fe.trim().is_empty() {
+                self.ai_fast_effort = Some(fe);
             }
         }
         if let Some(lang) = proj.ai.language {

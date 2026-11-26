@@ -218,12 +218,7 @@ EOF
     assert_eq!(app.focus, PaneFocus::Tree);
     assert_eq!(app.active_group_in_tree().unwrap().id, "g1");
 
-    // Vim actions: toggle selection with x, switch to Diff pane, n/N jump across hunks, cycle difft mode, export report
-    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    assert!(!app.session.selected_files.is_empty());
-    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    assert!(app.session.selected_files.is_empty());
-
+    // Vim actions: switch to Diff pane, n/N jump across hunks, cycle difft mode, export report
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(app.focus, PaneFocus::Diff);
 
@@ -394,16 +389,17 @@ patterns = [
     let paths: Vec<_> = app.bundle.changes.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(paths, vec!["src/app.rs", "src/keep.meta"]);
 
-    // Press 'x' on selected file (src/app.rs) -> marks it selected [x]
-    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    assert!(app.session.selected_files.contains("src/app.rs"));
-    assert!(!app.session.selected_files.contains("src/keep.meta"));
-
-    // Pressing 'S' opens CommitConfirm with only the x-selected file checked
+    // Pressing 'S' opens CommitConfirm with all non-ignored files checked by default
     app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
     assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
+    assert_eq!(app.commit_files.len(), 2);
     assert!(app.commit_files[0].included);
-    assert!(!app.commit_files[1].included);
+    assert!(app.commit_files[1].included);
+    // Toggling inside CommitConfirm unchecks the first file
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(!app.commit_files[0].included);
+    assert!(app.commit_files[1].included);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     // ':ignore /src/app.rs' ex-command appends to TOML [ignore].patterns & preserves [ai]
@@ -574,10 +570,32 @@ echo "- 调整 a.lua 逻辑为返回 10"
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     assert!(app.commit_files[0].included);
     assert!(!app.commit_files[1].included);
-    // Fallback updates immediately to a single-sentence English summary of the selected group without file counts
+    // Fallback updates immediately to a single-sentence English summary without file counts
     assert!(!app.commit_message.contains('\n'));
     assert!(!app.commit_message.contains("个文件"));
     assert!(app.commit_message.is_ascii());
+    // Wait briefly past the 350ms debounce and verify auto-regeneration starts automatically without pressing 'g'
+    std::thread::sleep(std::time::Duration::from_millis(380));
+    app.poll_background();
+    assert!(app.commit_msg_generating || !app.commit_msg_needs_regen);
+    for _ in 0..30 {
+        app.poll_background();
+        if !app.commit_msg_generating {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    // Toggle GroupHeader(1) back on then off to verify instant in-memory commit_msg_cache hits
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    std::thread::sleep(std::time::Duration::from_millis(380));
+    app.poll_background();
+    assert!(!app.commit_msg_generating);
+    assert_eq!(app.commit_message, "更新 a.lua 返回值");
+    assert!(!app.commit_msg_cache.is_empty());
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    std::thread::sleep(std::time::Duration::from_millis(380));
+    app.poll_background();
+    assert!(!app.commit_msg_generating);
 
     // Step 1 'y' opens double confirmation (does NOT commit yet)
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
@@ -890,7 +908,7 @@ patterns = ["*.meta"]
                     session_id: Some("ts-sess-1".to_string()),
                 })
             } else {
-                assert_eq!(session_id, Some("ts-sess-1"));
+                assert_eq!(session_id, None);
                 Ok(ai::AiPromptOutput {
                     text: r#"{
                         "overall_risk": "high",
@@ -911,12 +929,23 @@ patterns = ["*.meta"]
     let mut cfg_ts = AppConfig::default();
     cfg_ts.cache_ai_results = false;
     cfg_ts.reuse_session = true;
+    cfg_ts.ai_fast_model = Some("gemini-4-hydrogen-low".to_string());
+    cfg_ts.ai_fast_effort = None;
+    cfg_ts
+        .ai_sessions
+        .insert("two-stage-mock".to_string(), "ts-stale".to_string());
+    let fast_cfg = cfg_ts.fast_config();
+    assert_eq!(fast_cfg.ai_model.as_deref(), Some("gemini-4-hydrogen-low"));
+    assert_eq!(fast_cfg.ai_effort.as_deref(), Some("low"));
+    assert!(!fast_cfg.reuse_session);
+    assert!(fast_cfg.ai_sessions.is_empty());
+
     let mut early_groups: Option<Vec<String>> = None;
     let mut early_findings_empty = false;
-    let ts_out = ai::analyze_diff_two_stage(&two_prov, &bundle, &rendered, &cfg_ts, true, |s1, sid| {
+    let ts_out = ai::analyze_diff_two_stage(&two_prov, &two_prov, &bundle, &rendered, &cfg_ts, true, |s1, sid| {
         early_groups = Some(s1.groups.iter().map(|g| g.title.clone()).collect());
         early_findings_empty = s1.findings.is_empty();
-        assert_eq!(sid, Some("ts-sess-1"));
+        assert_eq!(sid, None);
     })
     .unwrap();
     assert_eq!(early_groups, Some(vec!["Fast Group".to_string()]));

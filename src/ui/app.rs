@@ -115,7 +115,6 @@ pub enum TreeRow {
         path: String,
         change_idx: usize,
         badge: String,
-        selected: bool,
         finding_count: usize,
         in_group: bool,
     },
@@ -207,8 +206,7 @@ pub enum BgMessage {
     },
     CommitMsgGenerated {
         generation: u64,
-        session_epoch: u64,
-        provider_id: String,
+        cache_key: String,
         result: Result<ai::AiPromptOutput, String>,
     },
     CommitDone(crate::vcs::CommitOutcome),
@@ -298,6 +296,9 @@ pub struct App {
     pub commit_stream_text: String,
     pub commit_executing: bool,
     pub commit_generation: u64,
+    pub commit_cancel_flag: Arc<AtomicBool>,
+    pub pending_commit_regen_at: Option<Instant>,
+    pub commit_msg_cache: HashMap<String, String>,
     pub commit_error: Option<String>,
 
     pub session: ReviewSessionState,
@@ -420,6 +421,9 @@ impl App {
             commit_stream_text: String::new(),
             commit_executing: false,
             commit_generation: 0,
+            commit_cancel_flag: Arc::new(AtomicBool::new(false)),
+            pending_commit_regen_at: None,
+            commit_msg_cache: HashMap::new(),
             commit_error: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
@@ -543,6 +547,9 @@ impl App {
             commit_stream_text: String::new(),
             commit_executing: false,
             commit_generation: 0,
+            commit_cancel_flag: Arc::new(AtomicBool::new(false)),
+            pending_commit_regen_at: None,
+            commit_msg_cache: HashMap::new(),
             commit_error: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
@@ -593,6 +600,8 @@ impl App {
         self.ai_followup_running = false;
         self.ai_deep_running = false;
         self.commit_msg_generating = false;
+        self.pending_commit_regen_at = None;
+        self.commit_msg_cache.clear();
         self.commit_started_at = None;
         self.commit_progress_stage.clear();
         self.commit_stream_logs.clear();
@@ -668,6 +677,12 @@ impl App {
     fn cancel_active_ai_tasks(&mut self) {
         self.ai_cancel_flag.store(true, Ordering::Relaxed);
         self.ai_cancel_flag = Arc::new(AtomicBool::new(false));
+        self.cancel_commit_msg_task();
+    }
+
+    fn cancel_commit_msg_task(&mut self) {
+        self.commit_cancel_flag.store(true, Ordering::Relaxed);
+        self.commit_cancel_flag = Arc::new(AtomicBool::new(false));
     }
 
     pub fn trigger_ai_analysis(&mut self, bypass_cache: bool) {
@@ -729,6 +744,8 @@ impl App {
         let bundle = self.bundle.clone();
         let diffs = self.rendered_diffs.clone();
         let cfg = self.config.clone();
+        let fast_cfg = cfg.fast_config();
+        let fast_provider = ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg);
         let tx = self.bg_tx.clone();
         let tx_prog = tx.clone();
         let tx_grp = tx.clone();
@@ -742,7 +759,9 @@ impl App {
                 });
             });
             let res = ai::run_with_ai_hooks(cancel_flag, Some(progress_cb), || {
+                let fast_ref = fast_provider.as_deref().unwrap_or(provider.as_ref());
                 ai::analyze_diff_two_stage(
+                    fast_ref,
                     provider.as_ref(),
                     &bundle,
                     &diffs,
@@ -819,6 +838,8 @@ impl App {
         self.ai_followup_running = false;
         self.ai_deep_running = false;
         self.commit_msg_generating = false;
+        self.pending_commit_regen_at = None;
+        self.commit_msg_cache.clear();
         self.commit_started_at = None;
         self.commit_progress_stage.clear();
         self.commit_stream_logs.clear();
@@ -845,6 +866,19 @@ impl App {
                 self.pending_rerender_at = None;
                 if !self.bundle.changes.is_empty() && !self.diff_loading {
                     self.re_render_all_for_mode_or_width();
+                }
+            }
+        }
+        if let Some(deadline) = self.pending_commit_regen_at {
+            if Instant::now() >= deadline {
+                self.pending_commit_regen_at = None;
+                if matches!(
+                    self.overlay,
+                    OverlayKind::CommitConfirm | OverlayKind::CommitDoubleConfirm
+                ) && !self.commit_editing_msg
+                    && !self.commit_msg_dirty
+                {
+                    self.regenerate_commit_message();
                 }
             }
         }
@@ -1094,8 +1128,7 @@ impl App {
                 }
                 BgMessage::CommitMsgGenerated {
                     generation,
-                    session_epoch,
-                    provider_id,
+                    cache_key,
                     result,
                 } => {
                     if generation != self.commit_generation {
@@ -1105,13 +1138,11 @@ impl App {
                     self.commit_started_at = None;
                     match result {
                         Ok(out) => {
-                            self.persist_provider_session(
-                                &provider_id,
-                                session_epoch,
-                                out.session_id,
-                            );
-                            if !out.text.trim().is_empty() && !self.commit_msg_dirty {
-                                self.commit_message = out.text;
+                            if !out.text.trim().is_empty() {
+                                self.commit_msg_cache.insert(cache_key, out.text.clone());
+                                if !self.commit_msg_dirty {
+                                    self.commit_message = out.text;
+                                }
                             }
                         }
                         Err(e) => {
@@ -1279,7 +1310,6 @@ impl App {
                                 path: path.clone(),
                                 change_idx: idx,
                                 badge,
-                                selected: self.session.selected_files.contains(path),
                                 finding_count: finding_counts.get(path.as_str()).copied().unwrap_or(0),
                                 in_group: true,
                             });
@@ -1300,7 +1330,6 @@ impl App {
                 path: ch.path.clone(),
                 change_idx: idx,
                 badge: ch.kind.short_badge().to_string(),
-                selected: self.session.selected_files.contains(&ch.path),
                 finding_count: finding_counts.get(ch.path.as_str()).copied().unwrap_or(0),
                 in_group: false,
             });
@@ -1713,7 +1742,6 @@ impl App {
             self.cached_external_prefixes = exts.clone();
             exts
         };
-        let has_explicit_selection = !self.session.selected_files.is_empty();
         self.commit_files = self
             .bundle
             .changes
@@ -1722,16 +1750,11 @@ impl App {
                 let is_ext = externals
                     .iter()
                     .any(|e| c.path == *e || c.path.starts_with(&format!("{}/", e)));
-                let included = if has_explicit_selection {
-                    self.session.selected_files.contains(&c.path)
-                } else {
-                    true
-                };
                 CommitFileEntry {
                     path: c.path.clone(),
                     badge: c.kind.short_badge().to_string(),
                     is_external: is_ext,
-                    included,
+                    included: true,
                 }
             })
             .collect();
@@ -1757,7 +1780,7 @@ impl App {
             self.ai_review.as_ref(),
         );
         self.overlay = OverlayKind::CommitConfirm;
-        self.regenerate_commit_message();
+        self.regenerate_commit_message_with_cache(false);
     }
 
     pub fn rebuild_commit_groups_from_files(&mut self) {
@@ -1830,7 +1853,9 @@ impl App {
 
     fn on_commit_selection_changed(&mut self) {
         self.commit_generation += 1;
+        self.cancel_commit_msg_task();
         self.commit_msg_generating = false;
+        self.pending_commit_regen_at = None;
         let selected_paths: Vec<String> = self
             .commit_files
             .iter()
@@ -1852,6 +1877,8 @@ impl App {
                 &selected_paths,
                 self.ai_review.as_ref(),
             );
+            // Debounce slightly so rapid Space toggles coalesce into one AI regeneration
+            self.pending_commit_regen_at = Some(Instant::now() + Duration::from_millis(350));
         }
     }
 
@@ -1869,6 +1896,7 @@ impl App {
             return;
         }
         self.commit_error = None;
+        self.pending_commit_regen_at = None;
         if self.commit_msg_needs_regen && !self.commit_msg_dirty {
             self.regenerate_commit_message();
         }
@@ -1876,6 +1904,11 @@ impl App {
     }
 
     pub fn regenerate_commit_message(&mut self) {
+        self.regenerate_commit_message_with_cache(false);
+    }
+
+    pub fn regenerate_commit_message_with_cache(&mut self, bypass_cache: bool) {
+        self.pending_commit_regen_at = None;
         let selected_paths: Vec<String> = self
             .commit_files
             .iter()
@@ -1886,7 +1919,27 @@ impl App {
             self.commit_error = Some("请至少勾选一个需要提交的文件".to_string());
             return;
         }
-        let Some(provider) = ai::resolve_provider(&self.active_ai_provider_id, &self.config) else {
+        let fast_cfg = self.config.fast_config();
+        let cache_key = self.build_commit_cache_key(&selected_paths, &fast_cfg);
+        if !bypass_cache {
+            if let Some(cached) = self.commit_msg_cache.get(&cache_key).cloned() {
+                self.commit_generation += 1;
+                self.cancel_commit_msg_task();
+                self.commit_msg_generating = false;
+                self.commit_started_at = None;
+                self.commit_msg_dirty = false;
+                self.commit_msg_needs_regen = false;
+                self.commit_error = None;
+                self.commit_progress_stage = "命中本地缓存".to_string();
+                self.commit_stream_logs.clear();
+                self.commit_stream_thinking.clear();
+                self.commit_stream_text.clear();
+                self.commit_message = cached;
+                return;
+            }
+        }
+
+        let Some(provider) = ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg) else {
             self.commit_msg_generating = false;
             self.commit_message = ai::build_fallback_commit_message(
                 &self.bundle,
@@ -1898,13 +1951,17 @@ impl App {
 
         self.commit_generation += 1;
         let current_gen = self.commit_generation;
-        let current_epoch = self.ai_session_epoch;
-        let cancel_flag = Arc::clone(&self.ai_cancel_flag);
+        self.cancel_commit_msg_task();
+        let cancel_flag = Arc::clone(&self.commit_cancel_flag);
         self.commit_msg_generating = true;
         self.commit_started_at = Some(Instant::now());
+        let model_label = fast_cfg
+            .ai_model
+            .as_deref()
+            .unwrap_or_else(|| provider.id());
         self.commit_progress_stage = format!(
             "准备生成 ({}, {} 个文件)...",
-            provider.id(),
+            model_label,
             selected_paths.len()
         );
         self.commit_stream_logs.clear();
@@ -1917,12 +1974,6 @@ impl App {
         let bundle = self.bundle.clone();
         let diffs = self.rendered_diffs.clone();
         let ai_review = self.ai_review.clone();
-        let mut cfg = self.config.clone();
-        if self.ai_deep_running {
-            // Avoid blocking commit message generation behind background Stage 2 session lock
-            cfg.reuse_session = false;
-        }
-        let provider_id = provider.id().to_string();
         let tx = self.bg_tx.clone();
         let tx_prog = tx.clone();
 
@@ -1940,17 +1991,29 @@ impl App {
                     &diffs,
                     &selected_paths,
                     ai_review.as_ref(),
-                    &cfg,
+                    &fast_cfg,
                 )
             })
             .map_err(|e| format!("{:#}", e));
             let _ = tx.send(BgMessage::CommitMsgGenerated {
                 generation: current_gen,
-                session_epoch: current_epoch,
-                provider_id,
+                cache_key,
                 result: res,
             });
         });
+    }
+
+    fn build_commit_cache_key(&self, selected_paths: &[String], fast_cfg: &AppConfig) -> String {
+        let mut sorted = selected_paths.to_vec();
+        sorted.sort();
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.diff_generation,
+            self.active_ai_provider_id,
+            fast_cfg.ai_model.as_deref().unwrap_or(""),
+            fast_cfg.ai_effort.as_deref().unwrap_or(""),
+            sorted.join("\n")
+        )
     }
 
     pub fn execute_commit_confirm(&mut self) {
@@ -2020,6 +2083,9 @@ impl App {
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
+                self.pending_commit_regen_at = None;
+                self.commit_msg_generating = false;
+                self.cancel_commit_msg_task();
                 self.overlay = OverlayKind::None;
             }
             KeyCode::Tab => {
@@ -2124,7 +2190,7 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.commit_msg_dirty = false;
-                self.regenerate_commit_message();
+                self.regenerate_commit_message_with_cache(true);
             }
             KeyCode::Char('y') => {
                 self.open_commit_double_confirm();
@@ -2399,9 +2465,6 @@ impl App {
             }
             KeyCode::Char('I') => {
                 self.show_inspector = !self.show_inspector;
-            }
-            KeyCode::Char('x') => {
-                self.toggle_current_selected();
             }
             KeyCode::Char('S') => {
                 self.open_commit_confirm();
@@ -2705,74 +2768,6 @@ impl App {
         }
     }
 
-    pub fn toggle_current_selected(&mut self) {
-        if self.focus == PaneFocus::Tree {
-            if let Some(TreeRow::GroupHeader { group_id, .. }) =
-                self.tree_rows.get(self.tree_cursor).cloned()
-            {
-                if let Some(ai) = &self.ai_review {
-                    if let Some(grp) = ai.groups.iter().find(|g| g.id == group_id) {
-                        let valid_paths: Vec<String> = grp
-                            .files
-                            .iter()
-                            .filter(|p| self.path_to_index.contains_key(*p))
-                            .cloned()
-                            .collect();
-                        if !valid_paths.is_empty() {
-                            let all_selected = valid_paths
-                                .iter()
-                                .all(|p| self.session.selected_files.contains(p));
-                            if all_selected {
-                                for p in &valid_paths {
-                                    self.session.selected_files.remove(p);
-                                }
-                            } else {
-                                for p in &valid_paths {
-                                    self.session.selected_files.insert(p.clone());
-                                }
-                            }
-                            self.rebuild_tree_rows();
-                            self.status_message = format!(
-                                "Selected: {}/{} files",
-                                self.session.selected_files.len(),
-                                self.bundle.changes.len()
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-            if let Some(TreeRow::FileItem { path, .. }) =
-                self.tree_rows.get(self.tree_cursor).cloned()
-            {
-                if !self.session.selected_files.remove(&path) {
-                    self.session.selected_files.insert(path);
-                }
-                self.rebuild_tree_rows();
-                self.status_message = format!(
-                    "Selected: {}/{} files",
-                    self.session.selected_files.len(),
-                    self.bundle.changes.len()
-                );
-                return;
-            }
-        }
-
-        if let Some(idx) = self.selected_file_idx {
-            if let Some(ch) = self.bundle.changes.get(idx) {
-                if !self.session.selected_files.remove(&ch.path) {
-                    self.session.selected_files.insert(ch.path.clone());
-                }
-                self.rebuild_tree_rows();
-                self.status_message = format!(
-                    "Selected: {}/{} files",
-                    self.session.selected_files.len(),
-                    self.bundle.changes.len()
-                );
-            }
-        }
-    }
-
     pub fn add_ignore_pattern(&mut self, pattern: &str) {
         let matcher = IgnoreMatcher::load(self.vcs.repo_root(), self.vcs.scope_dir());
         match matcher.append_pattern(pattern) {
@@ -2813,7 +2808,6 @@ impl App {
                 self.path_to_index = new_path_map;
 
                 for p in &removed_paths {
-                    self.session.selected_files.remove(p);
                     self.session.file_analysis_map.remove(p);
                 }
                 if let Some(ai) = &mut self.ai_review {

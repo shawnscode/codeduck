@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -437,7 +437,6 @@ pub struct UserNote {
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewSessionState {
-    pub selected_files: HashSet<String>,
     pub notes: Vec<UserNote>,
     pub file_analysis_map: HashMap<String, FileAnalysis>,
 }

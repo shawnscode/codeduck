@@ -56,8 +56,7 @@ cargo run -- -r 123 --headless-export review-r123.md
 | `d` | 切换 Difftastic 视图：`side-by-side` / `inline` / `side-by-side-show-both` |
 | `t` | 在「AI 重点分组视图」与「平铺文件列表」间切换 |
 | `za` / `zM` / `zR` | 折叠/展开当前组 / 全部折叠 / 全部展开 |
-| `x` | 选中 / 取消选中当前文件或整组（按 `S` 提交时自动仅预选已选中的文件） |
-| `S` | 审阅未提交改动完成后，按分类组勾选文件并生成一句话英文提交日志，进入二次提交确认弹窗（`:ci` / `:submit` 亦可） |
+| `S` | 打开提交面板，按分类组勾选文件并自动生成英文提交日志，进入二次提交确认弹窗（`:ci` / `:submit` 亦可） |
 | `/` 与 `;` / `,` | 在连续 Diff 中搜索并跳转下一 / 上一匹配 |
 | `c` | 为当前文件添加个人 Review 批注 |
 | `A` | 针对当前文件 Diff 向本地 AI 追问 |
@@ -82,11 +81,13 @@ cargo run -- -r 123 --headless-export review-r123.md
 ```toml
 [ai]
 provider = "agy"                    # auto | agy | codex | claude | gemini | none | 自定义名称
-model = "gemini-4-hydrogen-high"    # 可选：指定模型（如 agy models 输出的模型名）
-effort = "medium"                   # 可选：思考强度 (low | medium | high | xhigh | max)
+model = "gemini-4-hydrogen-medium"  # 主模型：用于风险发现与追问（可通过 `agy models` 查看）
+effort = "medium"                   # 主模型思考强度 (low | medium | high | xhigh | max)
+fast_model = "gemini-4-hydrogen-low" # 快速模型：用于快速分组与生成英文提交说明
+fast_effort = "low"                 # 快速模型思考强度
 language = "zh-CN"
 timeout_secs = 90
-reuse_session = true                # 跨重启复用对话 session（默认开启，统一保存到 ~/.codeduck/sessions.toml；--new-session 或 :new-session 重置）
+reuse_session = true                # 深度审查与追问复用会话；分组与提交说明默认无状态快速运行
 
 [diff]
 display_mode = "side-by-side"       # side-by-side | inline | side-by-side-show-both

@@ -19,11 +19,7 @@ pub fn export_review_markdown(
     md.push_str(&format!("- **VCS**: {}\n", bundle.vcs));
     md.push_str(&format!("- **Repository**: `{}`\n", bundle.repo_root.display()));
     md.push_str(&format!("- **Target**: {}\n", bundle.target));
-    md.push_str(&format!(
-        "- **Files**: {} ({} selected)\n",
-        bundle.changes.len(),
-        session.selected_files.len()
-    ));
+    md.push_str(&format!("- **Files**: {}\n", bundle.changes.len()));
 
     if let Some(ci) = &bundle.commit_info {
         md.push_str(&format!(
@@ -56,12 +52,7 @@ pub fn export_review_markdown(
                     md.push_str(&format!("{}\n\n", g.description));
                 }
                 for f in &g.files {
-                    let checked = if session.selected_files.contains(f) {
-                        "x"
-                    } else {
-                        " "
-                    };
-                    md.push_str(&format!("- [{}] `{}`\n", checked, f));
+                    md.push_str(&format!("- `{}`\n", f));
                 }
                 if !g.key_points.is_empty() {
                     md.push_str("\nKey verification points:\n");
@@ -95,19 +86,9 @@ pub fn export_review_markdown(
         }
     }
 
-    md.push_str("## Changed Files Checklist\n\n");
+    md.push_str("## Changed Files\n\n");
     for c in &bundle.changes {
-        let checked = if session.selected_files.contains(&c.path) {
-            "x"
-        } else {
-            " "
-        };
-        md.push_str(&format!(
-            "- [{}] `[{}]` `{}`\n",
-            checked,
-            c.kind.short_badge(),
-            c.path
-        ));
+        md.push_str(&format!("- `[{}]` `{}`\n", c.kind.short_badge(), c.path));
     }
     md.push('\n');
 

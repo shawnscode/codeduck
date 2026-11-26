@@ -46,7 +46,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let selected = app.session.selected_files.len();
     let total = app.bundle.changes.len();
 
     let (ai_badge, ai_deep_badge) = if app.ai_running {
@@ -144,7 +143,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut line2_spans = vec![
         Span::styled(
-            format!("Selected: {}/{}", selected, total),
+            format!("Files: {}", total),
             Style::default().fg(Color::Green),
         ),
         Span::raw("  |  "),
@@ -170,13 +169,30 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         line2_spans.push(Span::raw(" "));
         line2_spans.push(deep);
     }
-    if let Some(m) = &app.config.ai_model {
+    let shown_model = if app.ai_running {
+        app.config
+            .ai_fast_model
+            .as_deref()
+            .or(app.config.ai_model.as_deref())
+    } else {
+        app.config.ai_model.as_deref()
+    };
+    if let Some(m) = shown_model {
         line2_spans.push(Span::styled(
             format!("  model:{}", m),
             Style::default().fg(Color::Magenta),
         ));
     }
-    if let Some(e) = &app.config.ai_effort {
+    let shown_effort = if app.ai_running {
+        app.config
+            .ai_fast_effort
+            .as_deref()
+            .or_else(|| app.config.ai_fast_model.as_ref().map(|_| "low"))
+            .or(app.config.ai_effort.as_deref())
+    } else {
+        app.config.ai_effort.as_deref()
+    };
+    if let Some(e) = shown_effort {
         line2_spans.push(Span::styled(
             format!("  effort:{}", e),
             Style::default().fg(Color::Yellow),
@@ -232,29 +248,17 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == PaneFocus::Tree;
     let border_style = pane_border_style(focused);
     let max_desc_cols = area.width.saturating_sub(7).max(10) as usize;
-    let max_path_cols = area.width.saturating_sub(14).max(12) as usize;
+    let max_path_cols = area.width.saturating_sub(10).max(12) as usize;
     let title = match app.tree_mode {
-        TreeMode::AiGrouped => " 改动分组 (j/k:移动  x:选中  l:Diff) ",
-        TreeMode::FlatFiles => " 文件列表 (t:分组  x:选中  S:提交) ",
+        TreeMode::AiGrouped => " 改动分组 (j/k:移动  l:Diff  S:提交) ",
+        TreeMode::FlatFiles => " 文件列表 (t:分组  S:提交) ",
     };
-
-    let group_files_map: std::collections::HashMap<&str, &[String]> = app
-        .ai_review
-        .as_ref()
-        .map(|ai| {
-            ai.groups
-                .iter()
-                .map(|g| (g.id.as_str(), g.files.as_slice()))
-                .collect()
-        })
-        .unwrap_or_default();
 
     let items: Vec<ListItem> = app
         .tree_rows
         .iter()
         .map(|row| match row {
             TreeRow::GroupHeader {
-                group_id,
                 title,
                 description,
                 category,
@@ -265,28 +269,7 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                 ..
             } => {
                 let arrow = if *expanded { "▼" } else { "▶" };
-                let valid_files: Vec<&str> = group_files_map
-                    .get(group_id.as_str())
-                    .map(|fs| {
-                        fs.iter()
-                            .map(String::as_str)
-                            .filter(|p| app.path_to_index.contains_key(*p))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let sel_cnt = valid_files
-                    .iter()
-                    .filter(|p| app.session.selected_files.contains(**p))
-                    .count();
-                let (sel_badge, sel_color) = if !valid_files.is_empty() && sel_cnt == valid_files.len() {
-                    ("[x] ", Color::Cyan)
-                } else if sel_cnt > 0 {
-                    ("[~] ", Color::Yellow)
-                } else {
-                    ("[ ] ", Color::DarkGray)
-                };
                 let line1 = Line::from(vec![
-                    Span::styled(sel_badge, Style::default().fg(sel_color).add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!("{} {}. ", arrow, order),
                         Style::default()
@@ -305,7 +288,7 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled(
-                        format!(" ({}/{})", sel_cnt, file_count),
+                        format!(" ({})", file_count),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);
@@ -324,17 +307,11 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
             TreeRow::FileItem {
                 path,
                 badge,
-                selected,
                 finding_count,
                 in_group,
                 ..
             } => {
                 let indent = if *in_group { "  " } else { "" };
-                let (check, check_color) = if *selected {
-                    ("x", Color::Cyan)
-                } else {
-                    (" ", Color::DarkGray)
-                };
                 let badge_color = match badge.as_str() {
                     "A" => Color::Green,
                     "D" => Color::Red,
@@ -344,14 +321,6 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                 let shown_path = truncate_path_middle(path, max_path_cols);
                 let mut spans = vec![
                     Span::raw(indent),
-                    Span::styled(
-                        format!("[{}] ", check),
-                        Style::default().fg(check_color).add_modifier(if *selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                    ),
                     Span::styled(
                         format!("[{}] ", badge),
                         Style::default()
@@ -841,7 +810,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let edited = || text_input::format_with_cursor(&app.input_buffer, app.input_cursor, avail_w);
     let cmd_line = match app.input_mode {
         InputMode::Normal => Line::from(Span::styled(
-            "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  x:选中  S:提交  R:刷新  d:视图  B/I:收展  ?:帮助  q:退出",
+            "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  S:提交  R:刷新  d:视图  B/I:收展  ?:帮助  q:退出",
             Style::default().fg(Color::DarkGray),
         )),
         InputMode::Command => Line::from(format!(":{}", edited())),
@@ -899,8 +868,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from("  d / t          切换 Diff 模式 / 切换分组与文件列表"),
         Line::from("  za / zM / zR   折叠当前组 / 全部折叠 / 全部展开"),
-        Line::from("  x              选中 / 取消选中文件或分组（S 提交时自动带入）"),
-        Line::from("  S              选择改动、生成英文提交说明并提交"),
+        Line::from("  S              打开提交面板（按分组勾选文件并生成英文提交说明）"),
         Line::from("  c / e          添加批注 / 导出 Markdown (codeduck-review.md)"),
         Line::from("  a / P / A      分析改动 / 切换工具 / 对当前文件提问"),
         Line::from("  C / R          切换 Commit 或未提交改动 / 强刷"),
@@ -1165,7 +1133,7 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.commit_msg_generating {
         " 提交说明 [生成中...] "
     } else if app.commit_msg_needs_regen && !app.commit_msg_dirty {
-        " 提交说明 [已随勾选同步 · g:重新生成  e/i:编辑] "
+        " 提交说明 [选区已变更，即将自动重生成 · g:立即生成  e/i:编辑] "
     } else {
         " 提交说明 [e/i:编辑  g:重新生成] "
     };

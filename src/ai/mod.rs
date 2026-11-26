@@ -516,10 +516,12 @@ pub fn analyze_diff_with_session(
 }
 
 /// Two-stage review optimized for TUI responsiveness:
-/// Stage 1 runs a fast diff-only pass for `groups + summary` and triggers `on_groups_ready`.
-/// Stage 2 runs a deeper pass for core `findings` + key file/hunk notes and saves the merged cache.
+/// Stage 1 runs a fast stateless diff-only pass (`fast_provider` + `fast_config()`) for
+/// `groups + summary` and triggers `on_groups_ready`.
+/// Stage 2 runs a fresh deep session for core `findings` + key file/hunk notes and caches the result.
 pub fn analyze_diff_two_stage<F>(
-    provider: &dyn AiProvider,
+    fast_provider: &dyn AiProvider,
+    deep_provider: &dyn AiProvider,
     bundle: &DiffBundle,
     rendered_diffs: &[FileDiffRendered],
     cfg: &AppConfig,
@@ -530,7 +532,7 @@ where
     F: FnOnce(&AiReviewResult, Option<&str>),
 {
     let hash = compute_diff_hash(
-        provider.id(),
+        deep_provider.id(),
         cfg.ai_model.as_deref(),
         cfg.ai_effort.as_deref(),
         &cfg.review_language,
@@ -549,7 +551,7 @@ where
                         ));
                         return Ok(AnalyzeDiffOutput {
                             review: cached,
-                            session_id: cfg.ai_sessions.get(provider.id()).cloned(),
+                            session_id: cfg.ai_sessions.get(deep_provider.id()).cloned(),
                         });
                     }
                 }
@@ -557,54 +559,68 @@ where
         }
     }
 
-    // Stage 1: Fast diff-only grouping + summary
+    // Stage 1: Stateless fast diff-only grouping + summary (no old session bloat)
+    let fast_cfg = cfg.fast_config();
     emit_progress(AiProgressUpdate::Stage(format!(
         "整理差异 ({} 个文件)...",
         rendered_diffs.len()
     )));
-    let group_prompt = build_grouping_prompt(bundle, rendered_diffs, &cfg.review_language);
+    let group_prompt = build_grouping_prompt(bundle, rendered_diffs, &fast_cfg.review_language);
+    let fast_label = fast_cfg
+        .ai_model
+        .as_deref()
+        .unwrap_or_else(|| fast_provider.id());
     emit_progress(AiProgressUpdate::Stage(format!(
         "快速分组 ({:.1} KB -> {})...",
         group_prompt.len() as f64 / 1024.0,
-        provider.id()
+        fast_label
     )));
-    let out1 = invoke_with_session(provider, &group_prompt, &bundle.repo_root, true, cfg, false)?;
+    let out1 = invoke_with_session(
+        fast_provider,
+        &group_prompt,
+        &bundle.repo_root,
+        true,
+        &fast_cfg,
+        false,
+    )?;
     emit_progress(AiProgressUpdate::Stage("解析分组...".to_string()));
-    let mut stage1 = parse_ai_review_json(&out1.text, provider.display_name(), rendered_diffs)
-        .with_context(|| {
-            format!(
-                "Failed to parse Stage 1 grouping JSON from {}",
-                provider.display_name()
-            )
-        })?;
+    let mut stage1 =
+        parse_ai_review_json(&out1.text, deep_provider.display_name(), rendered_diffs)
+            .with_context(|| {
+                format!(
+                    "Failed to parse Stage 1 grouping JSON from {}",
+                    fast_provider.display_name()
+                )
+            })?;
     ensure_all_files_grouped(&mut stage1, rendered_diffs);
 
-    on_groups_ready(&stage1, out1.session_id.as_deref());
+    // Do not overwrite persisted deep/followup session with Stage 1's stateless call
+    on_groups_ready(&stage1, None);
 
     if is_current_task_cancelled() {
         return Err(anyhow!("AI request cancelled"));
     }
 
-    // Stage 2: Deeper core findings + key file/hunk notes
+    // Stage 2: Fresh deep session for core findings + key file/hunk notes; persisted for followups
     let mut deep_cfg = cfg.clone();
-    if deep_cfg.reuse_session {
-        if let Some(sid) = &out1.session_id {
-            deep_cfg
-                .ai_sessions
-                .insert(provider.id().to_string(), sid.clone());
-        }
-    }
+    deep_cfg.ai_sessions.clear();
     emit_progress(AiProgressUpdate::Stage("深入分析核心风险...".to_string()));
     let findings_prompt =
         build_findings_prompt(bundle, rendered_diffs, &cfg.review_language, &stage1);
-    let out2 =
-        invoke_with_session(provider, &findings_prompt, &bundle.repo_root, true, &deep_cfg, true)?;
+    let out2 = invoke_with_session(
+        deep_provider,
+        &findings_prompt,
+        &bundle.repo_root,
+        true,
+        &deep_cfg,
+        true,
+    )?;
     emit_progress(AiProgressUpdate::Stage("合并风险分析结果...".to_string()));
-    let stage2 = parse_ai_review_json(&out2.text, provider.display_name(), rendered_diffs)
+    let stage2 = parse_ai_review_json(&out2.text, deep_provider.display_name(), rendered_diffs)
         .with_context(|| {
             format!(
                 "Failed to parse Stage 2 findings JSON from {}",
-                provider.display_name()
+                deep_provider.display_name()
             )
         })?;
 
@@ -628,7 +644,7 @@ where
 
     Ok(AnalyzeDiffOutput {
         review: stage1,
-        session_id: out2.session_id.or(out1.session_id),
+        session_id: out2.session_id,
     })
 }
 
