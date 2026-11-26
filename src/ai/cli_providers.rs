@@ -8,15 +8,34 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 use crate::ai::{AiProgressUpdate, AiPromptOutput, AiProvider, emit_progress};
+use crate::config::{validate_cli_value, validate_effort};
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = path.metadata() {
+            return (meta.permissions().mode() & 0o111) != 0;
+        }
+        return false;
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 pub fn binary_exists(bin: &str) -> bool {
     if bin.contains('/') {
-        return Path::new(bin).is_file();
+        return is_executable_file(Path::new(bin));
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(bin);
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return true;
             }
         }
@@ -46,6 +65,32 @@ pub fn has_auth_hint(provider_id: &str) -> bool {
 enum CliStreamEvent {
     StdoutLine(String),
     StderrLine(String),
+}
+
+fn read_lossy_lines<R: std::io::Read, F: FnMut(String)>(pipe: Option<R>, mut on_line: F) -> String {
+    let mut all = String::new();
+    let Some(r) = pipe else {
+        return all;
+    };
+    let mut reader = BufReader::new(r);
+    let mut buf = Vec::with_capacity(1024);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                all.push_str(&line);
+                all.push('\n');
+                on_line(line);
+            }
+            Err(_) => break,
+        }
+    }
+    all
 }
 
 fn run_with_stdin(
@@ -91,40 +136,16 @@ where
 
     let tx_out = tx.clone();
     let out_handle = std::thread::spawn(move || {
-        let mut all_out = String::new();
-        if let Some(r) = stdout_pipe {
-            let reader = BufReader::new(r);
-            for line_res in reader.lines() {
-                match line_res {
-                    Ok(line) => {
-                        all_out.push_str(&line);
-                        all_out.push('\n');
-                        let _ = tx_out.send(CliStreamEvent::StdoutLine(line));
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        all_out
+        read_lossy_lines(stdout_pipe, |line| {
+            let _ = tx_out.send(CliStreamEvent::StdoutLine(line));
+        })
     });
 
     let tx_err = tx;
     let err_handle = std::thread::spawn(move || {
-        let mut all_err = String::new();
-        if let Some(r) = stderr_pipe {
-            let reader = BufReader::new(r);
-            for line_res in reader.lines() {
-                match line_res {
-                    Ok(line) => {
-                        all_err.push_str(&line);
-                        all_err.push('\n');
-                        let _ = tx_err.send(CliStreamEvent::StderrLine(line));
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        all_err
+        read_lossy_lines(stderr_pipe, |line| {
+            let _ = tx_err.send(CliStreamEvent::StderrLine(line));
+        })
     });
 
     let mut drain_events = |stderr_hook: bool| {
@@ -223,15 +244,16 @@ impl AiProvider for ClaudeCliProvider {
         if !persist_session && session_id.is_none() {
             args.push("--no-session-persistence");
         }
+        let validated_effort = self.effort.as_deref().map(validate_effort).transpose()?;
         if let Some(sid) = session_id {
             args.push("--resume");
-            args.push(sid);
+            args.push(validate_cli_value("session_id", sid)?);
         }
         if let Some(m) = &self.model {
             args.push("--model");
-            args.push(m);
+            args.push(validate_cli_value("model", m)?);
         }
-        if let Some(e) = &self.effort {
+        if let Some(ref e) = validated_effort {
             args.push("--effort");
             args.push(e);
         }
@@ -291,17 +313,22 @@ impl AiProvider for CodexCliProvider {
         let out_file = NamedTempFile::new().context("Failed to create temp file for codex output")?;
         let out_path = out_file.path().to_string_lossy().to_string();
 
-        let effort_cfg = self.effort.as_deref().map(|e| {
-            let mapped = if e.eq_ignore_ascii_case("max") {
-                "xhigh"
-            } else {
-                e
-            };
-            format!("model_reasoning_effort=\"{}\"", mapped)
-        });
+        let effort_cfg = if let Some(e) = self.effort.as_deref() {
+            let valid = validate_effort(e)?;
+            let mapped = if valid == "max" { "xhigh" } else { valid.as_str() };
+            Some(format!("model_reasoning_effort=\"{}\"", mapped))
+        } else {
+            None
+        };
+        let validated_model = self
+            .model
+            .as_deref()
+            .map(|m| validate_cli_value("model", m))
+            .transpose()?;
 
         let mut args: Vec<&str> = vec!["exec"];
         if let Some(sid) = session_id {
+            let valid_sid = validate_cli_value("session_id", sid)?;
             args.extend([
                 "resume",
                 "--skip-git-repo-check",
@@ -317,11 +344,11 @@ impl AiProvider for CodexCliProvider {
                 args.push("-c");
                 args.push(cfg_val);
             }
-            if let Some(m) = &self.model {
+            if let Some(m) = validated_model {
                 args.push("-m");
                 args.push(m);
             }
-            args.push(sid);
+            args.push(valid_sid);
             args.push("-");
         } else {
             args.extend([
@@ -333,16 +360,17 @@ impl AiProvider for CodexCliProvider {
                 "-o",
                 &out_path,
             ]);
-            if persist_session {
+            if persist_session || crate::ai::has_progress_hook() {
                 args.push("--json");
-            } else {
+            }
+            if !persist_session {
                 args.push("--ephemeral");
             }
             if let Some(ref cfg_val) = effort_cfg {
                 args.push("-c");
                 args.push(cfg_val);
             }
-            if let Some(m) = &self.model {
+            if let Some(m) = validated_model {
                 args.push("-m");
                 args.push(m);
             }
@@ -482,9 +510,10 @@ impl AiProvider for AgyCliProvider {
     ) -> Result<AiPromptOutput> {
         let want_json_envelope =
             json_mode || persist_session || session_id.is_some() || crate::ai::has_progress_hook();
-        // Sanitize NUL bytes and enforce a safe byte cap to stay below OS ARG_MAX limits.
+        // Sanitize NUL bytes and enforce a safe byte cap to stay below OS ARG_MAX limits
+        // while preserving any trailing `--- REQUIRED OUTPUT FORMAT ---` instructions.
         let clean_prompt: String = prompt.chars().filter(|&c| c != '\0').collect();
-        let bounded_prompt = crate::ai::truncate_utf8_bytes(&clean_prompt, 96_000);
+        let bounded_prompt = crate::ai::bound_prompt_preserving_tail(&clean_prompt, 96_000);
         let prompt_arg = format!("-p={}", bounded_prompt);
         let mut args = vec![
             "--mode",
@@ -493,15 +522,16 @@ impl AiProvider for AgyCliProvider {
             "--output-format",
             if want_json_envelope { "stream-json" } else { "text" },
         ];
+        let validated_effort = self.effort.as_deref().map(validate_effort).transpose()?;
         if let Some(sid) = session_id {
             args.push("--resume");
-            args.push(sid);
+            args.push(validate_cli_value("session_id", sid)?);
         }
         if let Some(m) = &self.model {
             args.push("--model");
-            args.push(m);
+            args.push(validate_cli_value("model", m)?);
         }
-        if let Some(e) = &self.effort {
+        if let Some(ref e) = validated_effort {
             args.push("--effort");
             args.push(e);
         }
@@ -742,11 +772,11 @@ impl AiProvider for GeminiCliProvider {
         ];
         if let Some(sid) = session_id {
             args.push("--resume");
-            args.push(sid);
+            args.push(validate_cli_value("session_id", sid)?);
         }
         if let Some(m) = &self.model {
             args.push("-m");
-            args.push(m);
+            args.push(validate_cli_value("model", m)?);
         }
 
         let raw = run_with_stdin("gemini", &args, prompt, work_dir, self.timeout_secs)?;

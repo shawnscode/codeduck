@@ -180,17 +180,26 @@ pub fn compute_diff_hash(
     provider_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    fast_model: Option<&str>,
+    fast_effort: Option<&str>,
+    mode_tag: &str,
     language: &str,
     bundle: &DiffBundle,
     rendered_diffs: &[FileDiffRendered],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"schema:v2\n");
+    hasher.update(b"schema:v3\n");
+    hasher.update(mode_tag.as_bytes());
+    hasher.update(b"|");
     hasher.update(provider_id.as_bytes());
     hasher.update(b"|");
     hasher.update(model.unwrap_or("").as_bytes());
     hasher.update(b"|");
     hasher.update(effort.unwrap_or("").as_bytes());
+    hasher.update(b"|");
+    hasher.update(fast_model.unwrap_or("").as_bytes());
+    hasher.update(b"|");
+    hasher.update(fast_effort.unwrap_or("").as_bytes());
     hasher.update(b"\n");
     hasher.update(language.as_bytes());
     hasher.update(b"\n");
@@ -202,6 +211,31 @@ pub fn compute_diff_hash(
         hasher.update(ci.author.as_bytes());
         hasher.update(b"|");
         hasher.update(ci.message.as_bytes());
+        hasher.update(b"\n");
+    }
+    // Hash full raw change payloads so edits beyond snippet truncation lines invalidate disk cache
+    for c in &bundle.changes {
+        hasher.update(c.path.as_bytes());
+        hasher.update(b"|");
+        hasher.update(c.old_path.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"|");
+        hasher.update(c.kind.short_badge().as_bytes());
+        hasher.update(b"|");
+        hasher.update(if c.is_binary { b"1" } else { b"0" });
+        hasher.update(b"|");
+        if let Some(old_bytes) = &c.old_content {
+            hasher.update((old_bytes.len() as u64).to_le_bytes());
+            hasher.update(old_bytes);
+        }
+        hasher.update(b"|");
+        if let Some(new_bytes) = &c.new_content {
+            hasher.update((new_bytes.len() as u64).to_le_bytes());
+            hasher.update(new_bytes);
+        }
+        hasher.update(b"|");
+        if let Some(props) = &c.prop_changes {
+            hasher.update(props.as_bytes());
+        }
         hasher.update(b"\n");
     }
     for d in rendered_diffs {
@@ -222,6 +256,24 @@ pub(crate) fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
         idx -= 1;
     }
     &s[..idx]
+}
+
+/// Cap a prompt cleanly to `max_bytes` while preserving any trailing `--- REQUIRED OUTPUT FORMAT ---` section.
+pub(crate) fn bound_prompt_preserving_tail(prompt: &str, max_bytes: usize) -> String {
+    if prompt.len() <= max_bytes {
+        return prompt.to_string();
+    }
+    const TAIL_MARKER: &str = "\n--- REQUIRED OUTPUT FORMAT ---";
+    if let Some(pos) = prompt.rfind(TAIL_MARKER) {
+        let tail = &prompt[pos..];
+        let notice = "\n... [diff context truncated to fit prompt budget] ...\n";
+        if tail.len() + notice.len() + 256 <= max_bytes {
+            let head_budget = max_bytes - tail.len() - notice.len();
+            let head = truncate_utf8_bytes(&prompt[..pos], head_budget);
+            return format!("{}{}{}", head, notice, tail);
+        }
+    }
+    truncate_utf8_bytes(prompt, max_bytes).to_string()
 }
 
 static PROVIDER_SESSION_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -326,8 +378,16 @@ fn is_non_recoverable_cli_error(err: &anyhow::Error) -> bool {
         "authentication",
         "forbidden",
         "rate limit",
-        "401",
-        "403",
+        "http 401",
+        "http 403",
+        "status 401",
+        "status: 401",
+        "status 403",
+        "status: 403",
+        "error 401",
+        "error 403",
+        "401 unauthorized",
+        "403 forbidden",
         "e2big",
         "argument list too long",
     ]
@@ -336,8 +396,8 @@ fn is_non_recoverable_cli_error(err: &anyhow::Error) -> bool {
 }
 
 /// Run prompt reusing an existing session if enabled, with automatic fallback to a fresh
-/// session ONLY when resuming a stale/deleted session fails. Serialized per provider ID to
-/// prevent concurrent `--resume` lock contention.
+/// session ONLY when resuming a stale/deleted session fails. Serialized per provider ID ONLY
+/// when `reuse_session` is true so stateless calls never block behind stateful background runs.
 fn invoke_with_session(
     provider: &dyn AiProvider,
     prompt: &str,
@@ -362,8 +422,12 @@ fn invoke_with_session_inner(
         return Err(anyhow!("AI request cancelled"));
     }
 
-    let lock = provider_session_lock(provider.id());
-    let _session_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let session_lock = cfg
+        .reuse_session
+        .then(|| provider_session_lock(provider.id()));
+    let _session_guard = session_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()));
 
     if is_current_task_cancelled() {
         return Err(anyhow!("AI request cancelled"));
@@ -454,6 +518,9 @@ pub fn analyze_diff_with_session(
         provider.id(),
         cfg.ai_model.as_deref(),
         cfg.ai_effort.as_deref(),
+        None,
+        None,
+        "single",
         &cfg.review_language,
         bundle,
         rendered_diffs,
@@ -465,13 +532,15 @@ pub fn analyze_diff_with_session(
             if cache_file.exists() {
                 if let Ok(raw) = std::fs::read_to_string(&cache_file) {
                     if let Ok(cached) = serde_json::from_str::<AiReviewResult>(&raw) {
-                        emit_progress(AiProgressUpdate::Stage(
-                            "命中缓存，直接加载".to_string(),
-                        ));
-                        return Ok(AnalyzeDiffOutput {
-                            review: cached,
-                            session_id: cfg.ai_sessions.get(provider.id()).cloned(),
-                        });
+                        if has_meaningful_review_content(&cached) {
+                            emit_progress(AiProgressUpdate::Stage(
+                                "命中缓存，直接加载".to_string(),
+                            ));
+                            return Ok(AnalyzeDiffOutput {
+                                review: cached,
+                                session_id: cfg.ai_sessions.get(provider.id()).cloned(),
+                            });
+                        }
                     }
                 }
             }
@@ -499,6 +568,12 @@ pub fn analyze_diff_with_session(
                 provider.display_name()
             )
         })?;
+    if !has_meaningful_review_content(&parsed) {
+        anyhow::bail!(
+            "AI provider {} returned an empty review JSON object",
+            provider.display_name()
+        );
+    }
 
     ensure_all_files_grouped(&mut parsed, rendered_diffs);
     emit_progress(AiProgressUpdate::Stage(format!(
@@ -531,10 +606,14 @@ pub fn analyze_diff_two_stage<F>(
 where
     F: FnOnce(&AiReviewResult, Option<&str>),
 {
+    let fast_cfg = cfg.fast_config();
     let hash = compute_diff_hash(
         deep_provider.id(),
         cfg.ai_model.as_deref(),
         cfg.ai_effort.as_deref(),
+        fast_cfg.ai_model.as_deref(),
+        fast_cfg.ai_effort.as_deref(),
+        &format!("two_stage:{}", fast_provider.id()),
         &cfg.review_language,
         bundle,
         rendered_diffs,
@@ -546,13 +625,15 @@ where
             if cache_file.exists() {
                 if let Ok(raw) = std::fs::read_to_string(&cache_file) {
                     if let Ok(cached) = serde_json::from_str::<AiReviewResult>(&raw) {
-                        emit_progress(AiProgressUpdate::Stage(
-                            "命中缓存，直接加载".to_string(),
-                        ));
-                        return Ok(AnalyzeDiffOutput {
-                            review: cached,
-                            session_id: cfg.ai_sessions.get(deep_provider.id()).cloned(),
-                        });
+                        if has_meaningful_review_content(&cached) {
+                            emit_progress(AiProgressUpdate::Stage(
+                                "命中缓存，直接加载".to_string(),
+                            ));
+                            return Ok(AnalyzeDiffOutput {
+                                review: cached,
+                                session_id: cfg.ai_sessions.get(deep_provider.id()).cloned(),
+                            });
+                        }
                     }
                 }
             }
@@ -560,7 +641,6 @@ where
     }
 
     // Stage 1: Stateless fast diff-only grouping + summary (no old session bloat)
-    let fast_cfg = cfg.fast_config();
     emit_progress(AiProgressUpdate::Stage(format!(
         "整理差异 ({} 个文件)...",
         rendered_diffs.len()
@@ -592,6 +672,12 @@ where
                     fast_provider.display_name()
                 )
             })?;
+    if stage1.summary.trim().is_empty() && stage1.groups.is_empty() {
+        anyhow::bail!(
+            "Stage 1 provider {} returned empty summary and groups",
+            fast_provider.display_name()
+        );
+    }
     ensure_all_files_grouped(&mut stage1, rendered_diffs);
 
     // Do not overwrite persisted deep/followup session with Stage 1's stateless call
@@ -699,9 +785,10 @@ fn append_diff_context(
     rendered_diffs: &[FileDiffRendered],
 ) {
     if let Some(ci) = &bundle.commit_info {
+        let msg = truncate_utf8_bytes(&ci.message, 4_000);
         prompt.push_str(&format!(
             "Commit Revision: {}\nAuthor: {}\nDate: {}\nCommit Message:\n{}\n\n",
-            ci.revision, ci.author, ci.date, ci.message
+            ci.revision, ci.author, ci.date, msg
         ));
     }
 
@@ -722,16 +809,17 @@ fn append_diff_context(
     }
 
     prompt.push_str("\n--- STRUCTURAL DIFFS (generated by Difftastic) ---\n");
-    const MAX_PROMPT_DIFF_BYTES: usize = 70_000;
+    const MAX_PROMPT_DIFF_BYTES: usize = 64_000;
     let mut used_bytes = 0usize;
 
-    for d in rendered_diffs {
+    for (idx, d) in rendered_diffs.iter().enumerate() {
         if used_bytes >= MAX_PROMPT_DIFF_BYTES {
+            let omitted = rendered_diffs.len().saturating_sub(idx);
             prompt.push_str(&format!(
-                "\n=== File: {} (diff body omitted due to prompt size budget) ===\n",
-                d.path
+                "\n... ({} remaining file diffs omitted due to prompt size budget) ...\n",
+                omitted
             ));
-            continue;
+            break;
         }
         let remaining = MAX_PROMPT_DIFF_BYTES.saturating_sub(used_bytes);
         let max_slice = remaining.min(12_000);
@@ -815,8 +903,23 @@ pub fn build_findings_prompt(
 
     if !grouping.groups.is_empty() {
         prompt.push_str("\nStage 1 Groups (already displayed to user; do NOT repeat `groups`):\n");
-        for g in &grouping.groups {
-            prompt.push_str(&format!("- {}: {} ({})\n", g.id, g.title, g.files.join(", ")));
+        const MAX_STAGE1_GROUP_BYTES: usize = 8_000;
+        let mut group_bytes = 0usize;
+        for (idx, g) in grouping.groups.iter().enumerate() {
+            let line = format!("- {}: {} ({})\n", g.id, g.title, g.files.join(", "));
+            let bounded_line = truncate_utf8_bytes(&line, 1_000);
+            if group_bytes + bounded_line.len() > MAX_STAGE1_GROUP_BYTES {
+                prompt.push_str(&format!(
+                    "- ... ({} more Stage 1 groups omitted)\n",
+                    grouping.groups.len().saturating_sub(idx)
+                ));
+                break;
+            }
+            group_bytes += bounded_line.len();
+            prompt.push_str(bounded_line);
+            if !bounded_line.ends_with('\n') {
+                prompt.push('\n');
+            }
         }
         prompt.push('\n');
     }
@@ -1123,13 +1226,87 @@ pub fn extract_json_block(raw: &str) -> Option<&str> {
     }
 }
 
+fn has_meaningful_review_content(review: &AiReviewResult) -> bool {
+    !review.summary.trim().is_empty()
+        || !review.groups.is_empty()
+        || !review.files.is_empty()
+        || !review.hunks.is_empty()
+        || !review.findings.is_empty()
+}
+
+fn is_review_json_object(val: &serde_json::Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    const EXPECTED_KEYS: [&str; 7] = [
+        "summary",
+        "overall_risk",
+        "review_strategy",
+        "groups",
+        "files",
+        "hunks",
+        "findings",
+    ];
+    EXPECTED_KEYS.iter().any(|k| obj.contains_key(*k))
+}
+
+fn find_review_json_object(s: &str) -> Option<&str> {
+    for (start, ch) in s.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        for (rel_idx, c) in s[start..].char_indices() {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let candidate = &s[start..start + rel_idx + c.len_utf8()];
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+                            if is_review_json_object(&val) {
+                                return Some(candidate);
+                            }
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_ai_review_json(
     raw_output: &str,
     provider_name: &str,
     _rendered_diffs: &[FileDiffRendered],
 ) -> Result<AiReviewResult> {
-    let json_slice = extract_json_block(raw_output)
-        .context("No JSON object found in AI provider response")?;
+    let json_slice = match extract_json_block(raw_output) {
+        Some(slice)
+            if serde_json::from_str::<serde_json::Value>(slice)
+                .map(|v| is_review_json_object(&v))
+                .unwrap_or(false) =>
+        {
+            slice
+        }
+        _ => find_review_json_object(raw_output)
+            .context("No valid review JSON object found in AI provider response")?,
+    };
 
     let raw: RawAiReview = serde_json::from_str(json_slice)
         .context("Invalid JSON schema in AI provider response")?;
@@ -1427,9 +1604,9 @@ pub fn generate_commit_message(
         if !selected.contains(d.path.as_str()) || budget == 0 {
             continue;
         }
-        let chunk: String = d.ai_summary_diff.chars().take(budget.min(4_000)).collect();
+        let chunk = truncate_utf8_bytes(&d.ai_summary_diff, budget.min(4_000));
         budget = budget.saturating_sub(chunk.len());
-        prompt.push_str(&chunk);
+        prompt.push_str(chunk);
         prompt.push('\n');
     }
 

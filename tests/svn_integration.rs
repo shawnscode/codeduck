@@ -331,7 +331,7 @@ fn test_uncommitted_scoped_to_current_subdirectory() {
 }
 
 #[test]
-fn test_codeduck_ignore_file_and_x_shortcut() {
+fn test_codeduck_ignore_file() {
     let tmp = TempDir::new().unwrap();
     let repo_dir = tmp.path().join("repo");
     let wc_dir = tmp.path().join("wc");
@@ -1355,4 +1355,201 @@ patterns = ["!keep.meta"]
         assert_eq!(AppConfig::config_path().unwrap(), home.join("configs.toml"));
         assert_eq!(AppConfig::cache_dir().unwrap(), home.join("cache"));
     }
+}
+
+#[test]
+fn test_security_and_state_machine_regressions() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Security boundary: project `.codeduck` cannot override `difft_bin` or inject `custom_ai`,
+    //    switching providers clears cross-provider model/fast_model, and empty strings clear overrides.
+    let home_dir = tmp.path().join("home_cfg");
+    fs::create_dir_all(&home_dir).unwrap();
+    let global_cfg = home_dir.join("configs.toml");
+    fs::write(
+        &global_cfg,
+        r#"
+[ai]
+provider = "agy"
+model = "gemini-4-hydrogen-medium"
+fast_model = "gemini-4-hydrogen-low"
+effort = "medium"
+
+[diff]
+difft_bin = "difft"
+"#,
+    )
+    .unwrap();
+
+    let untrusted_proj = tmp.path().join("untrusted_proj");
+    fs::create_dir_all(&untrusted_proj).unwrap();
+    fs::write(
+        untrusted_proj.join(".codeduck"),
+        r#"
+[ai]
+provider = "codex"
+fast_model = "none"
+
+[diff]
+difft_bin = "/tmp/evil_bin"
+
+[[custom_ai]]
+name = "evil"
+command = "sh"
+args = ["-c", "echo pwned"]
+"#,
+    )
+    .unwrap();
+
+    let mut sec_cfg = AppConfig::load(Some(&global_cfg)).unwrap();
+    sec_cfg.apply_project_overrides(&untrusted_proj, &untrusted_proj);
+    assert_eq!(sec_cfg.difft_bin, "difft");
+    assert!(sec_cfg.custom_ai.is_empty());
+    assert_eq!(sec_cfg.ai_provider, "codex");
+    // Cross-provider model was cleared automatically on provider change
+    assert_eq!(sec_cfg.ai_model, None);
+    assert_eq!(sec_cfg.ai_fast_model, None);
+
+    assert!(codeduck::config::validate_effort("xhigh").is_ok());
+    assert!(codeduck::config::validate_effort("bogus").is_err());
+    assert!(codeduck::config::validate_cli_value("model", "--evil-flag").is_err());
+
+    // 2. parse_ai_review_json rejects empty `{}` and skips stray non-review JSON prefix
+    assert!(ai::parse_ai_review_json("{}", "mock", &[]).is_err());
+    let stray_plus_review = r#"Note: {"k": 1}
+
+{
+  "summary": "Valid review summary",
+  "overall_risk": "low",
+  "groups": [{"id":"g1","title":"Group1","files":["a.rs"]}]
+}"#;
+    let parsed_review = ai::parse_ai_review_json(stray_plus_review, "mock", &[]).unwrap();
+    assert_eq!(parsed_review.summary, "Valid review summary");
+    assert_eq!(parsed_review.groups.len(), 1);
+
+    // 3. SVN PropertyOnly directory commit uses --depth empty and does not commit unchecked child files
+    let svn_repo = tmp.path().join("svn_prop_repo");
+    let svn_wc = tmp.path().join("svn_prop_wc");
+    fs::create_dir_all(&svn_repo).unwrap();
+    run("svnadmin", &["create", svn_repo.to_str().unwrap()], tmp.path());
+    let svn_url = format!("file://{}", svn_repo.display());
+    run("svn", &["checkout", &svn_url, svn_wc.to_str().unwrap()], tmp.path());
+    fs::create_dir_all(svn_wc.join("dir")).unwrap();
+    fs::write(svn_wc.join("dir/child.txt"), "v1\n").unwrap();
+    run("svn", &["add", "dir"], &svn_wc);
+    run("svn", &["commit", "-m", "r1"], &svn_wc);
+
+    run("svn", &["propset", "custom:tag", "yes", "dir"], &svn_wc);
+    fs::write(svn_wc.join("dir/child.txt"), "v2-unchecked\n").unwrap();
+    let svn_backend = vcs::open_vcs(&svn_wc, Some(VcsKind::Svn)).unwrap();
+    let svn_bundle = svn_backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    assert!(svn_bundle.changes.iter().any(|c| c.path == "dir" && c.kind == codeduck::model::ChangeKind::PropertyOnly));
+    assert!(svn_bundle.changes.iter().any(|c| c.path == "dir/child.txt"));
+    svn_backend
+        .commit_files(&["dir".to_string()], "Update dir property only")
+        .unwrap();
+    // Unchecked child.txt MUST still be uncommitted!
+    let after_bundle = svn_backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    assert_eq!(after_bundle.changes.len(), 1);
+    assert_eq!(after_bundle.changes[0].path, "dir/child.txt");
+
+    // 4. Git rejects `-` rev option injection and parses `-z` filenames with ` -> ` cleanly
+    let git_dir = tmp.path().join("git_edge");
+    fs::create_dir_all(&git_dir).unwrap();
+    run("git", &["init"], &git_dir);
+    run("git", &["config", "user.email", "t@example.com"], &git_dir);
+    run("git", &["config", "user.name", "Tester"], &git_dir);
+    fs::write(git_dir.join("init.txt"), "base\n").unwrap();
+    run("git", &["add", "init.txt"], &git_dir);
+    run("git", &["commit", "-m", "init"], &git_dir);
+    fs::write(git_dir.join("foo -> bar.txt"), "special\n").unwrap();
+    let git_backend = vcs::open_vcs(&git_dir, Some(VcsKind::Git)).unwrap();
+    assert!(git_backend.collect_changes(&DiffTarget::Commit("--output=/tmp/x".to_string())).is_err());
+    let git_uncomm = git_backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    assert_eq!(git_uncomm.changes[0].path, "foo -> bar.txt");
+
+    // 5. TUI state machine fixes: same-line `]i`, `:tree` focus, `CommitDoubleConfirm` notice vs error, `P -> Off` clearing `ai_deep_running`
+    fs::write(git_dir.join("init.txt"), "base\nupdated\n").unwrap();
+    let mut tcfg = AppConfig::default();
+    tcfg.ai_provider = "none".to_string();
+    let mut app = App::new(git_backend, tcfg, DiffTarget::Uncommitted, 120).unwrap();
+
+    // `:tree` hides sidebar AND restores focus to Diff
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Tree);
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    for ch in "tree".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.show_sidebar);
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
+
+    // Same-line findings cycle with `]i`
+    app.ai_review = Some(codeduck::model::AiReviewResult {
+        provider_name: "mock".to_string(),
+        summary: "s".to_string(),
+        overall_risk: codeduck::model::RiskLevel::Low,
+        review_strategy: String::new(),
+        groups: vec![codeduck::model::ReviewGroup {
+            id: "g1".to_string(),
+            title: "G1".to_string(),
+            description: String::new(),
+            category: "logic".to_string(),
+            risk_level: codeduck::model::RiskLevel::Low,
+            review_order: 1,
+            files: vec!["init.txt".to_string()],
+            key_points: vec![],
+        }],
+        files: vec![],
+        hunks: vec![],
+        findings: vec![
+            codeduck::model::ReviewFinding {
+                id: "f1".to_string(),
+                file: "init.txt".to_string(),
+                line: Some(1),
+                severity: codeduck::model::Severity::Warning,
+                title: "First finding".to_string(),
+                description: String::new(),
+                suggestion: None,
+            },
+            codeduck::model::ReviewFinding {
+                id: "f2".to_string(),
+                file: "init.txt".to_string(),
+                line: Some(1),
+                severity: codeduck::model::Severity::Info,
+                title: "Second finding".to_string(),
+                description: String::new(),
+                suggestion: None,
+            },
+        ],
+    });
+    app.rebuild_tree_and_continuous();
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    assert!(app.status_message.contains("First finding"));
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    assert!(app.status_message.contains("Second finding"));
+
+    // Pressing `y` while commit_msg_generating sets commit_hint_notice (NOT commit_error)
+    app.open_commit_confirm();
+    app.open_commit_double_confirm();
+    app.commit_msg_generating = true;
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(app.commit_error.is_none());
+    assert!(app.commit_hint_notice.is_some());
+    app.commit_msg_generating = false;
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // Selecting `Off` in AiPicker clears `ai_deep_running` & `ai_started_at`
+    app.ai_deep_running = true;
+    app.ai_started_at = Some(std::time::Instant::now());
+    app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
+    app.ai_picker_cursor = app.available_providers.len(); // Off option
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.ai_deep_running);
+    assert!(app.ai_started_at.is_none());
 }

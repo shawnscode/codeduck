@@ -20,10 +20,10 @@ impl SvnBackend {
     pub fn open(dir: &Path) -> Result<Self> {
         let scope_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let output = Command::new("svn")
-            .args(["info", "--xml"])
+            .args(["info", "--non-interactive", "--xml"])
             .current_dir(&scope_dir)
             .output()
-            .context("Failed to execute `svn info --xml`")?;
+            .context("Failed to execute `svn info --non-interactive --xml`")?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -111,8 +111,15 @@ impl SvnBackend {
     }
 
     fn run_svn_in(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-        let output = Command::new("svn")
-            .args(args)
+        let mut cmd = Command::new("svn");
+        if let Some((subcmd, rest)) = args.split_first() {
+            cmd.arg(subcmd);
+            if !args.contains(&"--non-interactive") {
+                cmd.arg("--non-interactive");
+            }
+            cmd.args(rest);
+        }
+        let output = cmd
             .current_dir(dir)
             .output()
             .with_context(|| format!("Failed to run `svn {}`", args.join(" ")))?;
@@ -129,7 +136,7 @@ impl SvnBackend {
     }
 
     fn svn_peg_target(target: &str) -> String {
-        if target.contains('@') && !target.ends_with('@') {
+        if target.contains('@') {
             format!("{}@", target)
         } else {
             target.to_string()
@@ -137,8 +144,9 @@ impl SvnBackend {
     }
 
     fn svn_cat_optional(&self, target: &str) -> Option<Vec<u8>> {
+        let peg = Self::svn_peg_target(target);
         let output = Command::new("svn")
-            .args(["cat", target])
+            .args(["cat", "--non-interactive", "--", &peg])
             .current_dir(&self.scope_dir)
             .output()
             .ok()?;
@@ -152,7 +160,7 @@ impl SvnBackend {
     fn svn_cat_rev_optional(&self, rev: &str, path_or_url: &str) -> Option<Vec<u8>> {
         let peg = Self::svn_peg_target(path_or_url);
         let output = Command::new("svn")
-            .args(["cat", "-r", rev, "--", &peg])
+            .args(["cat", "--non-interactive", "-r", rev, "--", &peg])
             .current_dir(&self.scope_dir)
             .output()
             .ok()?;
@@ -164,7 +172,7 @@ impl SvnBackend {
     }
 
     fn svn_prop_diff(&self, rev_args: &[&str], target: &str) -> Option<String> {
-        let mut args = vec!["diff", "--depth", "empty"];
+        let mut args = vec!["diff", "--non-interactive", "--depth", "empty"];
         args.extend_from_slice(rev_args);
         args.push("--");
         args.push(target);
@@ -744,7 +752,10 @@ impl VcsBackend for SvnBackend {
         let Ok(older) = older_rev_exclusive.trim().parse::<u64>() else {
             return Ok(None);
         };
-        if newer <= older {
+        if newer < older {
+            return Ok(None);
+        }
+        if newer == older {
             return Ok(Some(Vec::new()));
         }
         if newer - older > limit as u64 {
@@ -860,8 +871,16 @@ impl VcsBackend for SvnBackend {
                 format!("external[{}]", prefix)
             };
             let mut cmd = Command::new("svn");
-            cmd.args(["commit", "-F", &msg_path, "--"])
-                .current_dir(&work_dir);
+            cmd.args([
+                "commit",
+                "--non-interactive",
+                "--depth",
+                "empty",
+                "-F",
+                &msg_path,
+                "--",
+            ])
+            .current_dir(&work_dir);
             for (gp, _) in &entries {
                 cmd.arg(Self::svn_peg_target(gp));
             }

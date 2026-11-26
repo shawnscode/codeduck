@@ -77,6 +77,17 @@ impl GitBackend {
             .unwrap_or(false)
     }
 
+    fn validate_rev(rev: &str) -> Result<&str> {
+        let trimmed = rev.trim();
+        if trimmed.is_empty() {
+            bail!("Git revision cannot be empty");
+        }
+        if trimmed.starts_with('-') || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            bail!("Invalid git revision `{}`", trimmed);
+        }
+        Ok(trimmed)
+    }
+
     fn collect_uncommitted(&self, ignore: Option<&IgnoreMatcher>) -> Result<DiffBundle> {
         let has_head = self.has_head();
         let mut changes = Vec::new();
@@ -97,26 +108,28 @@ impl GitBackend {
             }
         }
 
-        // Also check untracked or staged files on unborn HEAD via git status --porcelain -uall scoped to `self.scope_dir`
+        // Also check untracked or staged files on unborn HEAD via NUL-delimited `git status --porcelain -z -uall`
         let status_out =
-            self.run_git_in(&self.scope_dir, &["status", "--porcelain", "-uall", "--", "."])?;
-        let status_text = String::from_utf8_lossy(&status_out);
-        for line in status_text.lines() {
-            if line.len() < 4 {
+            self.run_git_in(&self.scope_dir, &["status", "--porcelain", "-z", "-uall", "--", "."])?;
+        let mut iter = status_out.split(|&b| b == 0).filter(|s| !s.is_empty());
+        while let Some(entry_bytes) = iter.next() {
+            if entry_bytes.len() < 4 {
                 continue;
             }
-            let code = &line[..2];
-            let path_part = line[3..].trim();
-            let path = path_part
-                .split(" -> ")
-                .last()
-                .unwrap_or(path_part)
-                .trim_matches('"')
-                .to_string();
+            let entry = String::from_utf8_lossy(entry_bytes);
+            let mut chars = entry.chars();
+            let x = chars.next().unwrap_or(' ');
+            let y = chars.next().unwrap_or(' ');
+            let _sp = chars.next();
+            let path: String = chars.collect();
+            // In `-z` format, R/C entries emit a second NUL-terminated token for orig_path; consume it.
+            if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+                let _ = iter.next();
+            }
             if path.is_empty() || seen.contains(&path) {
                 continue;
             }
-            if code == "??" || !has_head {
+            if (x == '?' && y == '?') || !has_head {
                 if path == ".codeduck" || path.ends_with("/.codeduck") {
                     continue;
                 }
@@ -222,8 +235,9 @@ impl GitBackend {
     }
 
     fn fetch_commit_info(&self, rev: &str) -> Option<CommitInfo> {
+        let valid_rev = Self::validate_rev(rev).ok()?;
         let out = self
-            .run_git(&["show", "-s", "--format=%H%n%an%n%aI%n%B", rev])
+            .run_git(&["show", "-s", "--format=%H%n%an%n%aI%n%B", valid_rev])
             .ok()?;
         let s = String::from_utf8_lossy(&out);
         let mut lines = s.lines();
@@ -262,17 +276,28 @@ impl VcsBackend for GitBackend {
         let bundle = match target {
             DiffTarget::Uncommitted => self.collect_uncommitted(ignore),
             DiffTarget::Commit(rev) => {
-                let info = self.fetch_commit_info(rev);
-                let out = self.run_git(&["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", "--root", rev])?;
+                let valid_rev = Self::validate_rev(rev)?;
+                let info = self.fetch_commit_info(valid_rev);
+                let out = self.run_git(&[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-r",
+                    "-M",
+                    "--first-parent",
+                    "-m",
+                    "--root",
+                    valid_rev,
+                ])?;
                 let text = String::from_utf8_lossy(&out);
-                let parent_rev = format!("{}^", rev);
+                let parent_rev = format!("{}^", valid_rev);
                 let has_parent = self.run_git(&["rev-parse", "--verify", &parent_rev]).is_ok();
                 let mut changes = Vec::new();
                 for line in text.lines() {
                     if let Some(fc) = self.parse_name_status_line(
                         line,
                         if has_parent { Some(parent_rev.as_str()) } else { None },
-                        Some(rev),
+                        Some(valid_rev),
                         ignore,
                     )? {
                         changes.push(fc);
@@ -289,11 +314,13 @@ impl VcsBackend for GitBackend {
                 })
             }
             DiffTarget::Range { from, to } => {
-                let out = self.run_git(&["diff", "--name-status", "-M", from, to])?;
+                let valid_from = Self::validate_rev(from)?;
+                let valid_to = Self::validate_rev(to)?;
+                let out = self.run_git(&["diff", "--name-status", "-M", valid_from, valid_to])?;
                 let text = String::from_utf8_lossy(&out);
                 let mut changes = Vec::new();
                 for line in text.lines() {
-                    if let Some(fc) = self.parse_name_status_line(line, Some(from), Some(to), ignore)? {
+                    if let Some(fc) = self.parse_name_status_line(line, Some(valid_from), Some(valid_to), ignore)? {
                         changes.push(fc);
                     }
                 }
@@ -349,7 +376,8 @@ impl VcsBackend for GitBackend {
 
     fn resolve_immutable_target(&self, target: &DiffTarget) -> Option<DiffTarget> {
         let resolve_sha = |rev: &str| -> Option<String> {
-            let spec = format!("{}^{{commit}}", rev.trim());
+            let valid = Self::validate_rev(rev).ok()?;
+            let spec = format!("{}^{{commit}}", valid);
             let out = self.run_git(&["rev-parse", "--verify", &spec]).ok()?;
             let sha = String::from_utf8_lossy(&out).trim().to_string();
             (!sha.is_empty()).then_some(sha)

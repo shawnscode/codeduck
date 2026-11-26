@@ -99,10 +99,10 @@ pub struct AppConfig {
     /// Timeout in seconds for each local AI CLI invocation.
     #[serde(default = "default_ai_timeout")]
     pub ai_timeout_secs: u64,
-    /// Reuse local AI CLI sessions across turns/restarts and persist IDs in `.codeduck`.
+    /// Reuse local AI CLI sessions across turns/restarts and persist IDs in `~/.codeduck/sessions.toml`.
     #[serde(default = "default_true")]
     pub reuse_session: bool,
-    /// Persisted AI session IDs per provider, loaded from `.codeduck` `[ai.sessions]`.
+    /// Persisted AI session IDs per provider, loaded from `~/.codeduck/sessions.toml`.
     #[serde(default)]
     pub ai_sessions: BTreeMap<String, String>,
     /// Optional custom AI CLI commands.
@@ -194,6 +194,45 @@ struct PartialFlatConfig {
     ai_sessions: BTreeMap<String, String>,
 }
 
+pub fn normalize_optional_setting(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("default")
+        || trimmed.eq_ignore_ascii_case("clear")
+    {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub fn validate_cli_value<'a>(field: &str, val: &'a str) -> Result<&'a str> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{} cannot be empty", field);
+    }
+    if trimmed.starts_with('-') {
+        anyhow::bail!("{} cannot start with `-` (got `{}`)", field, trimmed);
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        anyhow::bail!("{} contains invalid control characters", field);
+    }
+    Ok(trimmed)
+}
+
+pub fn validate_effort(val: &str) -> Result<String> {
+    let trimmed = validate_cli_value("effort", val)?;
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "low" | "medium" | "high" | "xhigh" | "max" => Ok(lower),
+        _ => anyhow::bail!(
+            "Unsupported effort `{}` (expected low, medium, high, xhigh, or max)",
+            trimmed
+        ),
+    }
+}
+
 impl AppConfig {
     /// Unified user-level codeduck directory: `$CODEDUCK_HOME` or `~/.codeduck`.
     pub fn codeduck_home_dir() -> Option<PathBuf> {
@@ -225,6 +264,19 @@ impl AppConfig {
         Self::codeduck_home_dir().map(|d| d.join("sessions.toml"))
     }
 
+    /// Switch AI provider and clear incompatible model overrides from previous providers.
+    pub fn switch_provider(&mut self, new_provider: &str) {
+        let trimmed = new_provider.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !trimmed.eq_ignore_ascii_case(&self.ai_provider) {
+            self.ai_model = None;
+            self.ai_fast_model = None;
+        }
+        self.ai_provider = trimmed.to_string();
+    }
+
     /// Derive a lightweight, stateless config for fast tasks (Stage 1 grouping & commit messages).
     /// Applies `ai_fast_model`/`ai_fast_effort` and disables `reuse_session` so bloated sessions
     /// never slow down diff-only passes.
@@ -246,30 +298,35 @@ impl AppConfig {
     fn merge_toml_str(&mut self, raw: &str, path_hint: &Path) -> Result<()> {
         // 1. Apply any legacy flat keys (`ai_provider = ...`, etc.) if present.
         if let Ok(flat) = toml::from_str::<PartialFlatConfig>(raw) {
+            let mut flat_provider_changed = false;
             if let Some(p) = flat.ai_provider {
-                if !p.trim().is_empty() {
-                    self.ai_provider = p;
+                let t = p.trim();
+                if !t.is_empty() {
+                    if !t.eq_ignore_ascii_case(&self.ai_provider) {
+                        flat_provider_changed = true;
+                    }
+                    self.ai_provider = t.to_string();
+                }
+            }
+            if flat_provider_changed {
+                if flat.ai_model.is_none() {
+                    self.ai_model = None;
+                }
+                if flat.ai_fast_model.is_none() {
+                    self.ai_fast_model = None;
                 }
             }
             if let Some(m) = flat.ai_model {
-                if !m.trim().is_empty() {
-                    self.ai_model = Some(m);
-                }
+                self.ai_model = normalize_optional_setting(&m);
             }
             if let Some(e) = flat.ai_effort {
-                if !e.trim().is_empty() {
-                    self.ai_effort = Some(e);
-                }
+                self.ai_effort = normalize_optional_setting(&e);
             }
             if let Some(fm) = flat.ai_fast_model {
-                if !fm.trim().is_empty() {
-                    self.ai_fast_model = Some(fm);
-                }
+                self.ai_fast_model = normalize_optional_setting(&fm);
             }
             if let Some(fe) = flat.ai_fast_effort {
-                if !fe.trim().is_empty() {
-                    self.ai_fast_effort = Some(fe);
-                }
+                self.ai_fast_effort = normalize_optional_setting(&fe);
             }
             if let Some(lang) = flat.review_language {
                 if !lang.trim().is_empty() {
@@ -306,38 +363,49 @@ impl AppConfig {
             }
         }
 
-        // 2. Apply structured `[ai]` / `[diff]` / `[[custom_ai]]` sections (`.codeduck` compatible).
+        // 2. Apply structured `[ai]` / `[diff]` / `[[custom_ai]]` sections (trusted global config).
         let proj: ProjectCodeduckConfig = toml::from_str(raw)
             .with_context(|| format!("Failed to parse config file {}", path_hint.display()))?;
-        self.merge_project_config(proj);
+        self.merge_project_config(proj, true);
         Ok(())
     }
 
-    fn merge_project_config(&mut self, proj: ProjectCodeduckConfig) {
-        if let Some(p) = proj.ai.provider.or(proj.provider) {
-            if !p.trim().is_empty() {
-                self.ai_provider = p;
+    fn merge_project_config(&mut self, proj: ProjectCodeduckConfig, trusted: bool) {
+        let new_provider = proj.ai.provider.or(proj.provider);
+        let provider_changed = if let Some(ref p) = new_provider {
+            let t = p.trim();
+            if !t.is_empty() && !t.eq_ignore_ascii_case(&self.ai_provider) {
+                self.ai_provider = t.to_string();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let model_override = proj.ai.model.or(proj.model);
+        let effort_override = proj.ai.effort.or(proj.effort);
+        if provider_changed {
+            if model_override.is_none() {
+                self.ai_model = None;
+            }
+            if proj.ai.fast_model.is_none() {
+                self.ai_fast_model = None;
             }
         }
-        if let Some(m) = proj.ai.model.or(proj.model) {
-            if !m.trim().is_empty() {
-                self.ai_model = Some(m);
-            }
+
+        if let Some(m) = model_override {
+            self.ai_model = normalize_optional_setting(&m);
         }
-        if let Some(e) = proj.ai.effort.or(proj.effort) {
-            if !e.trim().is_empty() {
-                self.ai_effort = Some(e);
-            }
+        if let Some(e) = effort_override {
+            self.ai_effort = normalize_optional_setting(&e);
         }
         if let Some(fm) = proj.ai.fast_model {
-            if !fm.trim().is_empty() {
-                self.ai_fast_model = Some(fm);
-            }
+            self.ai_fast_model = normalize_optional_setting(&fm);
         }
         if let Some(fe) = proj.ai.fast_effort {
-            if !fe.trim().is_empty() {
-                self.ai_fast_effort = Some(fe);
-            }
+            self.ai_fast_effort = normalize_optional_setting(&fe);
         }
         if let Some(lang) = proj.ai.language {
             if !lang.trim().is_empty() {
@@ -364,20 +432,28 @@ impl AppConfig {
         if let Some(ic) = proj.diff.ignore_comments {
             self.ignore_comments = ic;
         }
-        if let Some(db) = proj.diff.difft_bin {
-            if !db.trim().is_empty() {
-                self.difft_bin = db;
-            }
-        }
         if let Some(ch) = proj.diff.cache_history {
             self.cache_history = ch;
         }
-        for custom in proj.custom_ai {
-            if let Some(existing) = self.custom_ai.iter_mut().find(|c| c.name == custom.name) {
-                *existing = custom;
-            } else {
-                self.custom_ai.push(custom);
+
+        // Security boundary: untrusted project `.codeduck` files must never override executable commands.
+        if trusted {
+            if let Some(db) = proj.diff.difft_bin {
+                if !db.trim().is_empty() {
+                    self.difft_bin = db;
+                }
             }
+            for custom in proj.custom_ai {
+                if let Some(existing) = self.custom_ai.iter_mut().find(|c| c.name == custom.name) {
+                    *existing = custom;
+                } else {
+                    self.custom_ai.push(custom);
+                }
+            }
+        } else if proj.diff.difft_bin.is_some() || !proj.custom_ai.is_empty() {
+            eprintln!(
+                "Security notice: ignoring `diff.difft_bin` / `[[custom_ai]]` in untrusted project `.codeduck`; configure executables in ~/.codeduck/configs.toml."
+            );
         }
     }
 
@@ -450,7 +526,7 @@ impl AppConfig {
                     continue;
                 }
             };
-            self.merge_project_config(proj);
+            self.merge_project_config(proj, false);
         }
 
         // Overlay unified user-level dialogue sessions (`~/.codeduck/sessions.toml`)
@@ -489,23 +565,16 @@ fn canonical_scope_key(dir: &Path) -> String {
 }
 
 fn atomic_write_file(target: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-    }
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        target
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("sessions.toml"),
-        std::process::id()
-    );
-    let tmp_path = target.with_file_name(tmp_name);
-    std::fs::write(&tmp_path, content)
-        .with_context(|| format!("Failed to write temporary file {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, target)
-        .with_context(|| format!("Failed to replace {}", target.display()))?;
+    use std::io::Write;
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
+    tmp.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write temporary file for {}", target.display()))?;
+    tmp.persist(target)
+        .map_err(|e| anyhow::anyhow!("Failed to replace {}: {}", target.display(), e.error))?;
     Ok(())
 }
 

@@ -7,7 +7,7 @@
 
 - **Difftastic**: `difft` 已安装并在 `$PATH` 中（例如 `brew install difftastic`）
 - **SVN** (`svn`) 或 **Git** (`git`)
-- 可选本地已登录的 AI CLI（无需额外配置 API Key，支持跨重启复用本地对话 session 并记录到 `.codeduck` 的 `[ai.sessions]`）：
+- 可选本地已登录的 AI CLI（无需额外配置 API Key，支持跨重启复用本地对话 session 并集中记录在 `~/.codeduck/sessions.toml`）：
   - `agy` (Google Antigravity CLI，支持 `--model`、`--effort`、`--resume`)
   - `codex` (OpenAI Codex CLI，只读沙箱执行并通过 `exec resume` 复用会话)
   - `claude` (Claude Code CLI，使用 `--tools ""` 与 `--resume` 复用只读会话)
@@ -46,7 +46,10 @@ cargo run -- -r 123 --headless-export review-r123.md
 | --- | --- |
 | `Tab` / `Ctrl-w` / `H` / `L` | 在「左侧重点树」与「右侧连续 Diff」间切换焦点 |
 | `j` / `k` | 向下 / 向上移动（左侧切重点/文件，右侧移动光标跨文件滚动） |
-| `h` / `l` | 左侧折叠 / 展开分组；右侧左右滚动 Diff |
+| `h` / `l` / `0` | 左侧折叠 / 展开分组；右侧左右滚动 Diff / 回到行首 |
+| `Enter` / `Space` | 左侧分组展开/折叠或切到右侧对应文件 Diff；右侧跳到下一差异块 |
+| `J` / `K` | 向下 / 向上滚动底部详情面板 |
+| `B` / `I` | 显示/隐藏左侧栏 / 底部详情面板 |
 | `n` / `N` | 跨文件跳转到下一个 / 上一个差异处（`]c` / `[c` 亦可） |
 | `]f` / `[f` | 切换下一个 / 上一个文件 |
 | `]g` / `[g` | 跳到下一个 / 上一个 AI 重点分组 |
@@ -64,7 +67,7 @@ cargo run -- -r 123 --headless-export review-r123.md
 | `C` | 打开 Commit / Revision 选择器（可切回 Uncommitted） |
 | `R` | 强制刷新当前改动、Diff 与提交历史缓存 |
 | `e` | 导出 Markdown Review 报告 (`codeduck-review.md`) |
-| `:` | 进入 Vim 命令行模式（`:rev 123`、`:uncommitted`、`:ignore *.meta`、`:ai codex`、`:new-session`、`:ask 问题`、`:export out.md`、`:q`） |
+| `:` | 进入 Vim 命令行模式（`:rev 123`、`:wc`、`:ci`、`:ignore *.meta`、`:ai codex`、`:model`、`:fast-model`、`:effort`、`:fast-effort`、`:new-session`、`:ask 问题`、`:export out.md`、`:q`） |
 | `?` | 打开完整帮助弹窗 |
 
 ## 配置文件（项目 `.codeduck` 与通用 `~/.codeduck/configs.toml`）
@@ -110,6 +113,8 @@ patterns = [
 provider = "auto"        # auto | agy | codex | claude | gemini | none | 自定义名称
 # model = "gemini-4-hydrogen-medium"
 # effort = "medium"
+# fast_model = "gemini-4-hydrogen-low"
+# fast_effort = "low"
 language = "zh-CN"
 timeout_secs = 90
 reuse_session = true
@@ -123,7 +128,7 @@ cache_history = true
 # 全局兜底忽略规则（项目 .codeduck 中可用 !规则 局部取消忽略）
 patterns = []
 
-# 可选：接入其他本地 AI CLI（从 stdin 读取 prompt，stdout 返回结果）
+# 可选：接入其他本地 AI CLI（仅支持在全局 ~/.codeduck/configs.toml 配置，项目 .codeduck 不会生效）
 # [[custom_ai]]
 # name = "my-ai"
 # command = "my-ai-cli"

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::config::{ProjectCodeduckConfig, directory_chain};
-use crate::model::FileChange;
 
 pub const IGNORE_FILE_NAME: &str = ".codeduck";
 
@@ -155,25 +154,6 @@ impl IgnoreMatcher {
         let base_canon =
             std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
         self.is_ignored_canon(&base_canon, rel_path)
-    }
-
-    pub fn filter_changes(&self, base_dir: &Path, changes: Vec<FileChange>) -> Vec<FileChange> {
-        if self.layers.is_empty() {
-            return changes;
-        }
-        let base_canon =
-            std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
-        changes
-            .into_iter()
-            .filter(|c| !self.is_ignored_canon(&base_canon, &c.path))
-            .collect()
-    }
-
-    /// Format a relative file path into a `.gitignore`-style exact path pattern (`/path/to/file`).
-    pub fn exact_pattern_for_rel_path(rel_path: &str) -> String {
-        let normalized = rel_path.replace('\\', "/");
-        let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
-        format!("/{}", trimmed)
     }
 
     /// Append an ignore pattern to `primary_file` (`.codeduck`), preserving TOML structure & comments.

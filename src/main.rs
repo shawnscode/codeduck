@@ -57,6 +57,14 @@ struct Cli {
     #[arg(long)]
     effort: Option<String>,
 
+    /// Fast model override for Stage 1 grouping and commit message generation
+    #[arg(long)]
+    fast_model: Option<String>,
+
+    /// Fast reasoning/thinking effort level for Stage 1 grouping and commit messages
+    #[arg(long)]
+    fast_effort: Option<String>,
+
     /// AI review output language (e.g. zh-CN, en)
     #[arg(long)]
     lang: Option<String>,
@@ -73,7 +81,7 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
-    /// Start a fresh AI session instead of resuming saved session from .codeduck
+    /// Start a fresh AI session instead of resuming saved session from ~/.codeduck/sessions.toml
     #[arg(long)]
     new_session: bool,
 
@@ -86,8 +94,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = AppConfig::load(cli.config.as_deref())?;
 
-    DifftEngine::check_available(&config.difft_bin)?;
-
     let preferred_vcs = match cli.vcs.to_ascii_lowercase().as_str() {
         "svn" => Some(VcsKind::Svn),
         "git" => Some(VcsKind::Git),
@@ -97,15 +103,28 @@ fn main() -> Result<()> {
 
     // Merge project-level `.codeduck` TOML settings (global -> .codeduck -> CLI flags)
     config.apply_project_overrides(vcs_backend.repo_root(), vcs_backend.scope_dir());
+    DifftEngine::check_available(&config.difft_bin)?;
 
     if let Some(ai_p) = cli.ai {
-        config.ai_provider = ai_p;
+        config.switch_provider(&ai_p);
     }
     if let Some(m) = cli.model {
-        config.ai_model = Some(m);
+        config.ai_model = codeduck::config::normalize_optional_setting(&m);
     }
     if let Some(e) = cli.effort {
-        config.ai_effort = Some(e);
+        config.ai_effort = match codeduck::config::normalize_optional_setting(&e) {
+            Some(v) => Some(codeduck::config::validate_effort(&v)?),
+            None => None,
+        };
+    }
+    if let Some(fm) = cli.fast_model {
+        config.ai_fast_model = codeduck::config::normalize_optional_setting(&fm);
+    }
+    if let Some(fe) = cli.fast_effort {
+        config.ai_fast_effort = match codeduck::config::normalize_optional_setting(&fe) {
+            Some(v) => Some(codeduck::config::validate_effort(&v)?),
+            None => None,
+        };
     }
     if let Some(l) = cli.lang {
         config.review_language = l;
@@ -169,7 +188,7 @@ fn main() -> Result<()> {
                 &bundle,
                 &rendered,
                 &config,
-                false,
+                cli.new_session,
             )?;
             if config.reuse_session {
                 if let Some(sid) = out.session_id.as_deref() {
@@ -193,6 +212,9 @@ fn main() -> Result<()> {
 
     let (term_w, _) = crossterm::terminal::size().unwrap_or((140, 40));
     let mut app = App::new_async(vcs_backend, config, target, term_w)?;
+    if cli.new_session {
+        app.bypass_next_ai_cache = true;
+    }
 
     install_terminal_panic_hook();
     enable_raw_mode()?;

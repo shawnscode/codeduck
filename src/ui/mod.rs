@@ -169,46 +169,50 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         line2_spans.push(Span::raw(" "));
         line2_spans.push(deep);
     }
-    let shown_model = if app.ai_running {
-        app.config
-            .ai_fast_model
-            .as_deref()
-            .or(app.config.ai_model.as_deref())
-    } else {
-        app.config.ai_model.as_deref()
-    };
-    if let Some(m) = shown_model {
-        line2_spans.push(Span::styled(
-            format!("  model:{}", m),
-            Style::default().fg(Color::Magenta),
-        ));
-    }
-    let shown_effort = if app.ai_running {
-        app.config
-            .ai_fast_effort
-            .as_deref()
-            .or_else(|| app.config.ai_fast_model.as_ref().map(|_| "low"))
-            .or(app.config.ai_effort.as_deref())
-    } else {
-        app.config.ai_effort.as_deref()
-    };
-    if let Some(e) = shown_effort {
-        line2_spans.push(Span::styled(
-            format!("  effort:{}", e),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    if app.config.reuse_session {
-        if let Some(sid) = app
-            .active_ai_session_id
-            .as_ref()
-            .or_else(|| app.config.ai_sessions.get(&app.active_ai_provider_id))
-        {
-            let short: String = sid.chars().take(8).collect();
+    let ai_disabled = app.active_ai_provider_id.eq_ignore_ascii_case("none")
+        || app.active_ai_provider_id.eq_ignore_ascii_case("off");
+    if !ai_disabled {
+        let shown_model = if app.ai_running {
+            app.config
+                .ai_fast_model
+                .as_deref()
+                .or(app.config.ai_model.as_deref())
+        } else {
+            app.config.ai_model.as_deref()
+        };
+        if let Some(m) = shown_model {
             line2_spans.push(Span::styled(
-                format!("  session:{}", short),
-                Style::default().fg(Color::Green),
+                format!("  model:{}", m),
+                Style::default().fg(Color::Magenta),
             ));
+        }
+        let shown_effort = if app.ai_running {
+            app.config
+                .ai_fast_effort
+                .as_deref()
+                .or_else(|| app.config.ai_fast_model.as_ref().map(|_| "low"))
+                .or(app.config.ai_effort.as_deref())
+        } else {
+            app.config.ai_effort.as_deref()
+        };
+        if let Some(e) = shown_effort {
+            line2_spans.push(Span::styled(
+                format!("  effort:{}", e),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if app.config.reuse_session && !app.ai_running && !app.ai_deep_running {
+            if let Some(sid) = app
+                .active_ai_session_id
+                .as_ref()
+                .or_else(|| app.config.ai_sessions.get(&app.active_ai_provider_id))
+            {
+                let short: String = sid.chars().take(8).collect();
+                line2_spans.push(Span::styled(
+                    format!("  session:{}", short),
+                    Style::default().fg(Color::Green),
+                ));
+            }
         }
     }
     let line2 = Line::from(line2_spans);
@@ -873,9 +877,11 @@ fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("  a / P / A      分析改动 / 切换工具 / 对当前文件提问"),
         Line::from("  C / R          切换 Commit 或未提交改动 / 强刷"),
         Line::from("  :ai / :model / :effort  切换工具、模型与推理强度"),
+        Line::from("  :fast-model / :fast-effort  设置 Stage 1 与提交说明的快速模型/强度"),
         Line::from("  :new-session   重置对话会话并重新分析（:reset-session 亦可）"),
         Line::from("  :ignore <pat>  添加忽略规则到 .codeduck"),
-        Line::from("  :rev 123       查看 SVN r123（或 :rev 100:120, :uncommitted）"),
+        Line::from("  :rev 123 / :wc 查看 SVN r123（或 :rev 100:120），:wc 切回未提交改动"),
+        Line::from("  :ci / :ask / :export / :q  打开提交 / AI 追问 / 导出报告 / 退出"),
         Line::raw(""),
         Line::from(Span::styled(
             "j/k 或 Ctrl-d/u 滚动；Esc / q / ? 关闭。",
@@ -1224,7 +1230,8 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(4), // Groups & repo split summary
-            Constraint::Length(if app.commit_msg_generating { 9 } else { 6 }), // Fixed 1-sentence commit message + status + action bar
+            Constraint::Length(if app.commit_msg_generating { 8 } else { 5 }), // Commit message preview + progress/error
+            Constraint::Length(1), // Fixed action bar (never clipped)
         ])
         .split(inner);
 
@@ -1343,6 +1350,12 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             1,
             2,
         );
+        if let Some(hint) = &app.commit_hint_notice {
+            bottom_lines.push(Line::from(Span::styled(
+                format!("提示: {}", hint),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+        }
     } else if app.commit_executing {
         bottom_lines.push(Line::from(Span::styled(
             "正在执行提交，请稍候...",
@@ -1355,13 +1368,24 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             format!("提交失败: {}", err),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
+    } else if let Some(hint) = &app.commit_hint_notice {
+        bottom_lines.push(Line::from(Span::styled(
+            format!("提示: {}", hint),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
     } else {
         bottom_lines.push(Line::from(Span::styled(
             "确认文件与说明无误后提交：",
             Style::default().fg(Color::Gray),
         )));
     }
-    bottom_lines.push(Line::from(Span::styled(
+
+    frame.render_widget(
+        Paragraph::new(bottom_lines).wrap(Wrap { trim: false }),
+        sections[1],
+    );
+
+    let action_bar = Line::from(Span::styled(
         if app.commit_msg_generating {
             "y/Enter: 生成后提交  |  f: 用当前说明提交  |  n/Esc: 返回"
         } else {
@@ -1370,12 +1394,8 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-    )));
-
-    frame.render_widget(
-        Paragraph::new(bottom_lines).wrap(Wrap { trim: false }),
-        sections[1],
-    );
+    ));
+    frame.render_widget(Paragraph::new(action_bar), sections[2]);
 }
 
 fn pane_border_style(focused: bool) -> Style {
@@ -1544,8 +1564,13 @@ fn build_ai_progress_lines(app: &App) -> Vec<Line<'static>> {
         3,
         4,
     );
+    let stage_hint = if app.ai_deep_running && !app.ai_running {
+        "可先用 j/k 或 Tab 浏览 Diff 与分组，完成后自动刷新风险与代码说明。"
+    } else {
+        "可先用 j/k 或 Tab 浏览 Diff，完成后自动刷新分组。"
+    };
     lines.push(Line::from(Span::styled(
-        "可先用 j/k 或 Tab 浏览 Diff，完成后自动刷新分组。",
+        stage_hint,
         Style::default().fg(Color::DarkGray),
     )));
     lines

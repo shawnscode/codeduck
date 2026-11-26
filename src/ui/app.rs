@@ -236,6 +236,7 @@ pub struct App {
     pub display_mode: DifftDisplayMode,
     pub focus: PaneFocus,
     pub tree_mode: TreeMode,
+    pub user_forced_flat_tree: bool,
     pub input_mode: InputMode,
     pub overlay: OverlayKind,
 
@@ -263,9 +264,12 @@ pub struct App {
     pub ai_stream_text: String,
     pub ai_error: Option<String>,
     pub ai_generation: u64,
+    pub ai_stage1_completed_gen: u64,
     pub ai_session_epoch: u64,
     pub ai_followup_generation: u64,
     pub ai_cancel_flag: Arc<AtomicBool>,
+    pub ai_followup_cancel_flag: Arc<AtomicBool>,
+    pub bypass_next_ai_cache: bool,
     pub active_ai_provider_id: String,
     pub resolved_ai_provider_id: Option<String>,
     pub active_ai_session_id: Option<String>,
@@ -300,10 +304,12 @@ pub struct App {
     pub pending_commit_regen_at: Option<Instant>,
     pub commit_msg_cache: HashMap<String, String>,
     pub commit_error: Option<String>,
+    pub commit_hint_notice: Option<String>,
 
     pub session: ReviewSessionState,
     pub qa_history: Vec<QaEntry>,
     pub ai_followup_running: bool,
+    pub last_stepped_finding_id: Option<String>,
 
     pub input_buffer: String,
     pub input_cursor: usize,
@@ -367,6 +373,7 @@ impl App {
             display_mode,
             focus: PaneFocus::Tree,
             tree_mode: TreeMode::FlatFiles,
+            user_forced_flat_tree: false,
             input_mode: InputMode::Normal,
             overlay: OverlayKind::None,
             show_sidebar: true,
@@ -390,9 +397,12 @@ impl App {
             ai_stream_text: String::new(),
             ai_error: None,
             ai_generation: 0,
+            ai_stage1_completed_gen: 0,
             ai_session_epoch: 0,
             ai_followup_generation: 0,
             ai_cancel_flag: Arc::new(AtomicBool::new(false)),
+            ai_followup_cancel_flag: Arc::new(AtomicBool::new(false)),
+            bypass_next_ai_cache: false,
             active_ai_provider_id,
             resolved_ai_provider_id: None,
             active_ai_session_id,
@@ -425,9 +435,11 @@ impl App {
             pending_commit_regen_at: None,
             commit_msg_cache: HashMap::new(),
             commit_error: None,
+            commit_hint_notice: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
             ai_followup_running: false,
+            last_stepped_finding_id: None,
             input_buffer: String::new(),
             input_cursor: 0,
             search_query: String::new(),
@@ -493,6 +505,7 @@ impl App {
             display_mode,
             focus: PaneFocus::Tree,
             tree_mode: TreeMode::FlatFiles,
+            user_forced_flat_tree: false,
             input_mode: InputMode::Normal,
             overlay: OverlayKind::None,
             show_sidebar: true,
@@ -516,9 +529,12 @@ impl App {
             ai_stream_text: String::new(),
             ai_error: None,
             ai_generation: 0,
+            ai_stage1_completed_gen: 0,
             ai_session_epoch: 0,
             ai_followup_generation: 0,
             ai_cancel_flag: Arc::new(AtomicBool::new(false)),
+            ai_followup_cancel_flag: Arc::new(AtomicBool::new(false)),
+            bypass_next_ai_cache: false,
             active_ai_provider_id,
             resolved_ai_provider_id: None,
             active_ai_session_id,
@@ -551,9 +567,11 @@ impl App {
             pending_commit_regen_at: None,
             commit_msg_cache: HashMap::new(),
             commit_error: None,
+            commit_hint_notice: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
             ai_followup_running: false,
+            last_stepped_finding_id: None,
             input_buffer: String::new(),
             input_cursor: 0,
             search_query: String::new(),
@@ -587,29 +605,18 @@ impl App {
         self.diff_loading = true;
         self.diff_error = None;
         self.ai_generation += 1;
+        self.ai_stage1_completed_gen = 0;
         self.ai_followup_generation += 1;
         self.commit_generation += 1;
-        self.cancel_active_ai_tasks();
-        self.ai_running = false;
-        self.ai_deep_running = false;
-        self.ai_started_at = None;
-        self.ai_progress_stage.clear();
-        self.ai_stream_logs.clear();
-        self.ai_stream_thinking.clear();
-        self.ai_stream_text.clear();
-        self.ai_followup_running = false;
-        self.ai_deep_running = false;
-        self.commit_msg_generating = false;
-        self.pending_commit_regen_at = None;
+        self.clear_ai_runtime_flags();
         self.commit_msg_cache.clear();
-        self.commit_started_at = None;
-        self.commit_progress_stage.clear();
-        self.commit_stream_logs.clear();
-        self.commit_stream_thinking.clear();
-        self.commit_stream_text.clear();
+        self.commit_error = None;
+        self.commit_hint_notice = None;
         self.ai_review = None;
         self.ai_error = None;
         self.qa_history.clear();
+        self.last_stepped_finding_id = None;
+        self.user_forced_flat_tree = false;
         self.bundle = DiffBundle {
             vcs: self.vcs.kind(),
             repo_root: self.vcs.repo_root().to_path_buf(),
@@ -674,10 +681,39 @@ impl App {
         Ok(())
     }
 
-    fn cancel_active_ai_tasks(&mut self) {
+    fn cancel_analysis_task(&mut self) {
         self.ai_cancel_flag.store(true, Ordering::Relaxed);
         self.ai_cancel_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    fn cancel_followup_task(&mut self) {
+        self.ai_followup_cancel_flag.store(true, Ordering::Relaxed);
+        self.ai_followup_cancel_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    fn cancel_active_ai_tasks(&mut self) {
+        self.cancel_analysis_task();
+        self.cancel_followup_task();
         self.cancel_commit_msg_task();
+    }
+
+    fn clear_ai_runtime_flags(&mut self) {
+        self.cancel_active_ai_tasks();
+        self.ai_running = false;
+        self.ai_deep_running = false;
+        self.ai_started_at = None;
+        self.ai_progress_stage.clear();
+        self.ai_stream_logs.clear();
+        self.ai_stream_thinking.clear();
+        self.ai_stream_text.clear();
+        self.ai_followup_running = false;
+        self.commit_msg_generating = false;
+        self.pending_commit_regen_at = None;
+        self.commit_started_at = None;
+        self.commit_progress_stage.clear();
+        self.commit_stream_logs.clear();
+        self.commit_stream_thinking.clear();
+        self.commit_stream_text.clear();
     }
 
     fn cancel_commit_msg_task(&mut self) {
@@ -687,19 +723,24 @@ impl App {
 
     pub fn trigger_ai_analysis(&mut self, bypass_cache: bool) {
         if self.bundle.changes.is_empty() {
+            self.cancel_analysis_task();
             self.ai_running = false;
             self.ai_deep_running = false;
+            self.ai_started_at = None;
             self.status_message = "No changes found for this target.".to_string();
             return;
         }
 
         let Some(provider) = ai::resolve_provider(&self.active_ai_provider_id, &self.config) else {
+            self.cancel_analysis_task();
             self.ai_running = false;
             self.ai_deep_running = false;
+            self.ai_started_at = None;
             self.resolved_ai_provider_id = None;
             if self.active_ai_provider_id.eq_ignore_ascii_case("none")
                 || self.active_ai_provider_id.eq_ignore_ascii_case("off")
             {
+                self.ai_error = None;
                 self.status_message =
                     "AI analysis disabled (press P or :ai to enable).".to_string();
             } else {
@@ -719,6 +760,8 @@ impl App {
             None
         };
 
+        // Cancel any previous in-flight Stage 1 / Stage 2 worker before launching a new run
+        self.cancel_analysis_task();
         self.ai_generation += 1;
         let current_gen = self.ai_generation;
         let current_epoch = self.ai_session_epoch;
@@ -831,20 +874,13 @@ impl App {
         let provider_id = ai::resolve_provider(&self.active_ai_provider_id, &self.config)
             .map(|p| p.id().to_string())
             .unwrap_or_else(|| self.active_ai_provider_id.clone());
+        self.ai_generation += 1;
+        self.ai_stage1_completed_gen = 0;
         self.ai_session_epoch += 1;
         self.ai_followup_generation += 1;
         self.commit_generation += 1;
-        self.cancel_active_ai_tasks();
-        self.ai_followup_running = false;
-        self.ai_deep_running = false;
-        self.commit_msg_generating = false;
-        self.pending_commit_regen_at = None;
+        self.clear_ai_runtime_flags();
         self.commit_msg_cache.clear();
-        self.commit_started_at = None;
-        self.commit_progress_stage.clear();
-        self.commit_stream_logs.clear();
-        self.commit_stream_thinking.clear();
-        self.commit_stream_text.clear();
         self.config.ai_sessions.remove(&provider_id);
         self.active_ai_session_id = None;
         let _ = crate::config::save_project_session(
@@ -907,6 +943,12 @@ impl App {
                             self.selected_file_idx =
                                 (!self.rendered_diffs.is_empty()).then_some(0);
                             self.rebuild_tree_and_continuous();
+                            if self.rendered_diffs.iter().any(|r| {
+                                r.rendered_width != self.diff_pane_width
+                                    || r.rendered_mode != self.display_mode
+                            }) {
+                                self.re_render_all_for_mode_or_width();
+                            }
                             self.status_message = if let Some(override_msg) =
                                 self.pending_status_override.take()
                             {
@@ -918,7 +960,8 @@ impl App {
                                     self.bundle.changes.len()
                                 )
                             };
-                            self.trigger_ai_analysis(false);
+                            let bypass_cache = std::mem::take(&mut self.bypass_next_ai_cache);
+                            self.trigger_ai_analysis(bypass_cache);
                         }
                         Err(err) => {
                             self.pending_status_override = None;
@@ -940,6 +983,8 @@ impl App {
                         || diff_generation != self.diff_generation
                         || mode != self.display_mode
                         || width != self.diff_pane_width
+                        || rendered_diffs.len() != self.bundle.changes.len()
+                        || parsed_texts.len() != self.bundle.changes.len()
                     {
                         continue;
                     }
@@ -978,7 +1023,7 @@ impl App {
                     generation,
                     session_epoch,
                     provider_id,
-                    review,
+                    mut review,
                     session_id,
                 } => {
                     if generation != self.ai_generation {
@@ -986,16 +1031,21 @@ impl App {
                     }
                     self.ai_running = false;
                     self.ai_deep_running = true;
+                    self.ai_stage1_completed_gen = generation;
                     self.ai_started_at = Some(Instant::now());
                     self.ai_stream_logs.clear();
                     self.ai_stream_thinking.clear();
                     self.ai_stream_text.clear();
                     self.ai_progress_stage = "深入分析核心风险...".to_string();
                     self.persist_provider_session(&provider_id, session_epoch, session_id);
+                    self.retain_review_active_paths(&mut review);
                     let group_cnt = review.groups.len();
                     self.ai_review = Some(review);
-                    self.tree_mode = TreeMode::AiGrouped;
+                    if !self.user_forced_flat_tree {
+                        self.tree_mode = TreeMode::AiGrouped;
+                    }
                     self.rebuild_tree_and_continuous();
+                    self.sync_tree_to_diff_cursor();
                     self.status_message = format!(
                         "分组就绪 ({} 组)，后台分析核心风险...",
                         group_cnt
@@ -1022,7 +1072,8 @@ impl App {
                                 session_epoch,
                                 out.session_id,
                             );
-                            let review = out.review;
+                            let mut review = out.review;
+                            self.retain_review_active_paths(&mut review);
                             let group_cnt = review.groups.len();
                             let finding_cnt = review.findings.len();
                             self.session.file_analysis_map.clear();
@@ -1032,15 +1083,19 @@ impl App {
                                     .insert(fa.path.clone(), fa.clone());
                             }
                             self.ai_review = Some(review);
-                            self.tree_mode = TreeMode::AiGrouped;
+                            if !self.user_forced_flat_tree {
+                                self.tree_mode = TreeMode::AiGrouped;
+                            }
                             self.rebuild_tree_and_continuous();
+                            self.sync_tree_to_diff_cursor();
                             self.status_message = format!(
                                 "就绪：{} 组，{} 条提示 — j/k:浏览  n/N:跳块  Tab:切窗",
                                 group_cnt, finding_cnt
                             );
                         }
                         Err(err) => {
-                            if self.ai_review.is_some() {
+                            if self.ai_stage1_completed_gen == generation && self.ai_review.is_some()
+                            {
                                 self.ai_error = None;
                                 self.status_message = format!(
                                     "分组已就绪；核心风险分析失败: {}",
@@ -1136,12 +1191,14 @@ impl App {
                     }
                     self.commit_msg_generating = false;
                     self.commit_started_at = None;
+                    self.commit_hint_notice = None;
                     match result {
                         Ok(out) => {
                             if !out.text.trim().is_empty() {
                                 self.commit_msg_cache.insert(cache_key, out.text.clone());
-                                if !self.commit_msg_dirty {
+                                if !self.commit_msg_dirty && !self.commit_editing_msg {
                                     self.commit_message = out.text;
+                                    self.commit_msg_cursor = self.commit_message.len();
                                 }
                             }
                         }
@@ -1503,11 +1560,40 @@ impl App {
             .and_then(|i| self.rendered_diffs.get(i))
     }
 
+    fn retain_review_active_paths(&self, review: &mut AiReviewResult) {
+        for g in &mut review.groups {
+            g.files.retain(|p| self.path_to_index.contains_key(p));
+        }
+        review.groups.retain(|g| !g.files.is_empty());
+        review
+            .files
+            .retain(|f| self.path_to_index.contains_key(&f.path));
+        review
+            .hunks
+            .retain(|h| self.path_to_index.contains_key(&h.file));
+        review
+            .findings
+            .retain(|f| self.path_to_index.contains_key(&f.file));
+    }
+
     pub fn active_group_in_tree(&self) -> Option<&ReviewGroup> {
         let ai = self.ai_review.as_ref()?;
         match self.tree_rows.get(self.tree_cursor)? {
             TreeRow::GroupHeader { group_id, .. } => ai.groups.iter().find(|g| &g.id == group_id),
-            TreeRow::FileItem { path, .. } => ai.groups.iter().find(|g| g.files.contains(path)),
+            TreeRow::FileItem {
+                path, in_group, ..
+            } => {
+                if *in_group {
+                    for row in self.tree_rows[..self.tree_cursor].iter().rev() {
+                        if let TreeRow::GroupHeader { group_id, .. } = row {
+                            if let Some(grp) = ai.groups.iter().find(|g| &g.id == group_id) {
+                                return Some(grp);
+                            }
+                        }
+                    }
+                }
+                ai.groups.iter().find(|g| g.files.contains(path))
+            }
         }
     }
 
@@ -1605,7 +1691,7 @@ impl App {
                 &mut self.commit_msg_cursor,
                 &sanitized,
             );
-            self.commit_msg_dirty = true;
+            self.mark_commit_message_edited();
         } else if self.overlay == OverlayKind::None && self.input_mode != InputMode::Normal {
             crate::ui::text_input::insert_clean_str(
                 &mut self.input_buffer,
@@ -1689,19 +1775,19 @@ impl App {
                         self.ai_session_epoch += 1;
                         self.ai_followup_generation += 1;
                         self.commit_generation += 1;
-                        self.cancel_active_ai_tasks();
-                        self.ai_followup_running = false;
-                        self.commit_msg_generating = false;
+                        self.clear_ai_runtime_flags();
                         if self.ai_picker_cursor < self.available_providers.len() {
-                            self.active_ai_provider_id =
+                            let new_id =
                                 self.available_providers[self.ai_picker_cursor].id.clone();
+                            self.config.switch_provider(&new_id);
+                            self.active_ai_provider_id = new_id;
                             self.trigger_ai_analysis(true);
                         } else {
                             self.active_ai_provider_id = "none".to_string();
                             self.resolved_ai_provider_id = None;
                             self.active_ai_session_id = None;
                             self.ai_generation += 1;
-                            self.ai_running = false;
+                            self.ai_stage1_completed_gen = 0;
                             self.ai_error = None;
                             self.status_message = "AI analysis turned off".to_string();
                         }
@@ -1765,8 +1851,15 @@ impl App {
         self.commit_editing_msg = false;
         self.commit_executing = false;
         self.commit_error = None;
+        self.commit_hint_notice = None;
         self.commit_msg_dirty = false;
         self.commit_msg_needs_regen = false;
+        if self.resolved_ai_provider_id.is_none() {
+            let fast_cfg = self.config.fast_config();
+            self.resolved_ai_provider_id =
+                ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg)
+                    .map(|p| p.id().to_string());
+        }
 
         let selected_paths: Vec<String> = self
             .commit_files
@@ -1856,6 +1949,7 @@ impl App {
         self.cancel_commit_msg_task();
         self.commit_msg_generating = false;
         self.pending_commit_regen_at = None;
+        self.commit_hint_notice = None;
         let selected_paths: Vec<String> = self
             .commit_files
             .iter()
@@ -1864,21 +1958,48 @@ impl App {
             .collect();
         if selected_paths.is_empty() {
             self.commit_error = Some("请至少勾选一个需要提交的文件".to_string());
+            self.commit_msg_needs_regen = false;
             if !self.commit_msg_dirty {
                 self.commit_message.clear();
             }
             return;
         }
         self.commit_error = None;
-        self.commit_msg_needs_regen = true;
         if !self.commit_msg_dirty {
+            let fast_cfg = self.config.fast_config();
+            let cache_key = self.build_commit_cache_key(&selected_paths, &fast_cfg);
+            if let Some(cached) = self.commit_msg_cache.get(&cache_key).cloned() {
+                self.commit_msg_needs_regen = false;
+                self.commit_progress_stage = "命中本地缓存".to_string();
+                self.commit_message = cached;
+                self.commit_msg_cursor = self.commit_message.len();
+                return;
+            }
             self.commit_message = ai::build_fallback_commit_message(
                 &self.bundle,
                 &selected_paths,
                 self.ai_review.as_ref(),
             );
-            // Debounce slightly so rapid Space toggles coalesce into one AI regeneration
-            self.pending_commit_regen_at = Some(Instant::now() + Duration::from_millis(350));
+            if ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg).is_some() {
+                self.commit_msg_needs_regen = true;
+                // Debounce slightly so rapid Space toggles coalesce into one AI regeneration
+                self.pending_commit_regen_at = Some(Instant::now() + Duration::from_millis(350));
+            } else {
+                self.commit_msg_needs_regen = false;
+            }
+        }
+    }
+
+    fn mark_commit_message_edited(&mut self) {
+        self.commit_msg_dirty = true;
+        self.commit_msg_needs_regen = false;
+        self.pending_commit_regen_at = None;
+        self.commit_hint_notice = None;
+        if self.commit_msg_generating {
+            self.commit_generation += 1;
+            self.cancel_commit_msg_task();
+            self.commit_msg_generating = false;
+            self.commit_started_at = None;
         }
     }
 
@@ -1896,6 +2017,7 @@ impl App {
             return;
         }
         self.commit_error = None;
+        self.commit_hint_notice = None;
         self.pending_commit_regen_at = None;
         if self.commit_msg_needs_regen && !self.commit_msg_dirty {
             self.regenerate_commit_message();
@@ -1909,6 +2031,7 @@ impl App {
 
     pub fn regenerate_commit_message_with_cache(&mut self, bypass_cache: bool) {
         self.pending_commit_regen_at = None;
+        self.commit_hint_notice = None;
         let selected_paths: Vec<String> = self
             .commit_files
             .iter()
@@ -1935,12 +2058,14 @@ impl App {
                 self.commit_stream_thinking.clear();
                 self.commit_stream_text.clear();
                 self.commit_message = cached;
+                self.commit_msg_cursor = self.commit_message.len();
                 return;
             }
         }
 
         let Some(provider) = ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg) else {
             self.commit_msg_generating = false;
+            self.commit_msg_needs_regen = false;
             self.commit_message = ai::build_fallback_commit_message(
                 &self.bundle,
                 &selected_paths,
@@ -1948,6 +2073,7 @@ impl App {
             );
             return;
         };
+        self.resolved_ai_provider_id = Some(provider.id().to_string());
 
         self.commit_generation += 1;
         let current_gen = self.commit_generation;
@@ -2063,18 +2189,34 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.commit_editing_msg = false;
+                    if self.commit_msg_needs_regen
+                        && !self.commit_msg_dirty
+                        && self.pending_commit_regen_at.is_none()
+                        && !self.commit_msg_generating
+                    {
+                        self.regenerate_commit_message();
+                    }
                 }
                 KeyCode::Tab => {
                     self.commit_editing_msg = false;
                     self.commit_modal_focus = CommitModalFocus::Files;
+                    if self.commit_msg_needs_regen
+                        && !self.commit_msg_dirty
+                        && self.pending_commit_regen_at.is_none()
+                        && !self.commit_msg_generating
+                    {
+                        self.regenerate_commit_message();
+                    }
                 }
                 _ => {
+                    let prev_msg = self.commit_message.clone();
                     if crate::ui::text_input::handle_key(
                         &mut self.commit_message,
                         &mut self.commit_msg_cursor,
                         key,
-                    ) {
-                        self.commit_msg_dirty = true;
+                    ) && self.commit_message != prev_msg
+                    {
+                        self.mark_commit_message_edited();
                     }
                 }
             }
@@ -2083,8 +2225,11 @@ impl App {
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
+                self.commit_generation += 1;
                 self.pending_commit_regen_at = None;
                 self.commit_msg_generating = false;
+                self.commit_started_at = None;
+                self.commit_hint_notice = None;
                 self.cancel_commit_msg_task();
                 self.overlay = OverlayKind::None;
             }
@@ -2214,21 +2359,29 @@ impl App {
         match key.code {
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.commit_error = None;
+                self.commit_hint_notice = None;
                 self.overlay = OverlayKind::CommitConfirm;
             }
             KeyCode::Char('f') => {
+                if !self.commit_msg_generating {
+                    return;
+                }
                 self.commit_generation += 1;
+                self.cancel_commit_msg_task();
                 self.commit_msg_generating = false;
+                self.commit_started_at = None;
+                self.commit_hint_notice = None;
                 self.execute_commit_confirm();
             }
             KeyCode::Char('y') | KeyCode::Enter => {
                 if self.commit_msg_generating {
-                    self.commit_error = Some(
+                    self.commit_hint_notice = Some(
                         "AI 正在更新一句话日志，请稍候完成（或按 f 立即使用当前预览日志提交）"
                             .to_string(),
                     );
                     return;
                 }
+                self.commit_hint_notice = None;
                 self.execute_commit_confirm();
             }
             _ => {}
@@ -2424,6 +2577,7 @@ impl App {
                 self.inspector_scroll_y = self.inspector_scroll_y.saturating_sub(2);
             }
             KeyCode::Char('a') => {
+                self.user_forced_flat_tree = false;
                 self.trigger_ai_analysis(true);
             }
             KeyCode::Char('P') => {
@@ -2448,14 +2602,21 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.tree_mode = match self.tree_mode {
-                    TreeMode::AiGrouped => TreeMode::FlatFiles,
-                    TreeMode::FlatFiles if self.ai_review.is_some() => TreeMode::AiGrouped,
+                    TreeMode::AiGrouped => {
+                        self.user_forced_flat_tree = true;
+                        TreeMode::FlatFiles
+                    }
+                    TreeMode::FlatFiles if self.ai_review.is_some() => {
+                        self.user_forced_flat_tree = false;
+                        TreeMode::AiGrouped
+                    }
                     TreeMode::FlatFiles => {
                         self.status_message = "AI groups not ready yet".to_string();
                         TreeMode::FlatFiles
                     }
                 };
                 self.rebuild_tree_and_continuous();
+                self.sync_tree_to_diff_cursor();
             }
             KeyCode::Char('B') => {
                 self.show_sidebar = !self.show_sidebar;
@@ -2488,10 +2649,12 @@ impl App {
             KeyCode::Tab => self.toggle_focus_pane(),
             KeyCode::Char('H') => {
                 if self.show_sidebar {
+                    self.inspector_scroll_y = 0;
                     self.focus = PaneFocus::Tree;
                 }
             }
             KeyCode::Char('L') => {
+                self.inspector_scroll_y = 0;
                 self.focus = PaneFocus::Diff;
             }
             KeyCode::Char('g') => self.pending_key = Some('g'),
@@ -2633,6 +2796,7 @@ impl App {
     }
 
     fn jump_top(&mut self) {
+        self.inspector_scroll_y = 0;
         match self.focus {
             PaneFocus::Tree => {
                 self.tree_cursor = 0;
@@ -2647,6 +2811,7 @@ impl App {
     }
 
     fn jump_bottom(&mut self) {
+        self.inspector_scroll_y = 0;
         match self.focus {
             PaneFocus::Tree => {
                 if !self.tree_rows.is_empty() {
@@ -2806,6 +2971,14 @@ impl App {
                 self.rendered_diffs = new_rendered;
                 self.parsed_texts = new_texts;
                 self.path_to_index = new_path_map;
+                // Invalidate in-flight width/mode rerenders and cached commit messages for the old file set
+                self.rerender_generation += 1;
+                self.pending_rerender_at = None;
+                self.commit_generation += 1;
+                self.cancel_commit_msg_task();
+                self.commit_msg_generating = false;
+                self.pending_commit_regen_at = None;
+                self.commit_msg_cache.clear();
 
                 for p in &removed_paths {
                     self.session.file_analysis_map.remove(p);
@@ -2850,6 +3023,7 @@ impl App {
         if self.continuous.global_hunks.is_empty() {
             return;
         }
+        self.inspector_scroll_y = 0;
         let cur = self.diff_cursor_y;
         let target = if forward {
             self.continuous
@@ -2876,6 +3050,7 @@ impl App {
         if self.continuous.sections.is_empty() {
             return;
         }
+        self.inspector_scroll_y = 0;
         let cur = self.selected_file_idx.unwrap_or(0);
         let pos = self
             .continuous
@@ -2905,6 +3080,7 @@ impl App {
         if group_positions.is_empty() {
             return;
         }
+        self.inspector_scroll_y = 0;
         let next_pos = if forward {
             group_positions
                 .iter()
@@ -2930,12 +3106,14 @@ impl App {
         if ai.findings.is_empty() {
             return;
         }
+        self.inspector_scroll_y = 0;
         let cur_y = self.diff_cursor_y;
-        // Find target y for each finding in continuous diff
-        let mut finding_targets: Vec<(usize, &ReviewFinding)> = ai
+        // Find target y for each finding in continuous diff, preserving deterministic order for same-line items
+        let mut finding_targets: Vec<(usize, u32, usize, &ReviewFinding)> = ai
             .findings
             .iter()
-            .filter_map(|f| {
+            .enumerate()
+            .filter_map(|(ord, f)| {
                 let cidx = *self.path_to_index.get(&f.file)?;
                 let sec = self
                     .continuous
@@ -2949,29 +3127,49 @@ impl App {
                 } else {
                     sec.start_y
                 };
-                Some((y, f))
+                Some((y, f.line.unwrap_or(0), ord, f))
             })
             .collect();
-        finding_targets.sort_by_key(|(y, _)| *y);
+        finding_targets.sort_by_key(|(y, ln, ord, _)| (*y, *ln, *ord));
         if finding_targets.is_empty() {
             return;
         }
 
-        let chosen = if forward {
+        let current_match_pos = self
+            .last_stepped_finding_id
+            .as_deref()
+            .and_then(|last_id| {
+                finding_targets
+                    .iter()
+                    .position(|(y, _, _, f)| *y == cur_y && f.id == last_id)
+            });
+
+        let chosen = if let Some(pos) = current_match_pos {
+            let next_pos = if forward {
+                (pos + 1) % finding_targets.len()
+            } else if pos == 0 {
+                finding_targets.len() - 1
+            } else {
+                pos - 1
+            };
+            &finding_targets[next_pos]
+        } else if forward {
             finding_targets
                 .iter()
-                .find(|(y, _)| *y > cur_y)
+                .find(|(y, _, _, _)| *y > cur_y)
                 .unwrap_or(&finding_targets[0])
         } else {
             finding_targets
                 .iter()
                 .rev()
-                .find(|(y, _)| *y < cur_y)
+                .find(|(y, _, _, _)| *y < cur_y)
                 .unwrap_or(finding_targets.last().unwrap())
         };
 
         let target_y = chosen.0;
-        let finding_title = chosen.1.title.clone();
+        let finding_id = chosen.3.id.clone();
+        let finding_title = chosen.3.title.clone();
+        self.last_stepped_finding_id = Some(finding_id);
         self.diff_cursor_y = target_y;
         self.diff_scroll_y = self
             .diff_cursor_y
@@ -3009,6 +3207,7 @@ impl App {
             }
             return;
         }
+        self.inspector_scroll_y = 0;
         let line = self.search_matches[self.search_match_cursor];
         self.diff_cursor_y = line;
         self.diff_scroll_y = line.saturating_sub(3);
@@ -3082,11 +3281,12 @@ impl App {
         }
         let provider_id = provider.id().to_string();
         let tx = self.bg_tx.clone();
+        self.cancel_followup_task();
         self.ai_followup_generation += 1;
         let followup_gen = self.ai_followup_generation;
         let diff_gen = self.diff_generation;
         let epoch = self.ai_session_epoch;
-        let cancel_flag = Arc::clone(&self.ai_cancel_flag);
+        let cancel_flag = Arc::clone(&self.ai_followup_cancel_flag);
         self.ai_followup_running = true;
         self.status_message = format!("Asking {}...", provider.display_name());
 
@@ -3114,7 +3314,10 @@ impl App {
         };
         match cmd {
             "q" | "quit" | "wq" => self.should_quit = true,
-            "help" | "h" => self.overlay = OverlayKind::Help,
+            "help" | "h" => {
+                self.help_scroll_y = 0;
+                self.overlay = OverlayKind::Help;
+            }
             "uncommitted" | "wc" => {
                 if let Err(e) = self.reload_target(DiffTarget::Uncommitted) {
                     self.status_message = format!("Error: {}", e);
@@ -3135,13 +3338,18 @@ impl App {
             "ai" => {
                 if let Some(p) = parts.get(1) {
                     self.ai_session_epoch += 1;
+                    self.ai_generation += 1;
+                    self.ai_stage1_completed_gen = 0;
                     self.ai_followup_generation += 1;
                     self.commit_generation += 1;
-                    self.cancel_active_ai_tasks();
-                    self.active_ai_provider_id = (*p).to_string();
+                    self.clear_ai_runtime_flags();
+                    self.config.switch_provider(p);
+                    self.active_ai_provider_id = self.config.ai_provider.clone();
+                    self.user_forced_flat_tree = false;
                     self.trigger_ai_analysis(true);
                 } else {
                     self.available_providers = ai::detect_available_providers(&self.config);
+                    self.ai_picker_cursor = 0;
                     self.overlay = OverlayKind::AiPicker;
                 }
             }
@@ -3150,29 +3358,74 @@ impl App {
             }
             "model" => {
                 if let Some(m) = parts.get(1) {
-                    if *m == "default" || *m == "none" || *m == "clear" {
-                        self.config.ai_model = None;
-                    } else {
-                        self.config.ai_model = Some((*m).to_string());
-                    }
+                    self.config.ai_model = crate::config::normalize_optional_setting(m);
+                    self.user_forced_flat_tree = false;
                     self.trigger_ai_analysis(true);
                 } else {
                     let cur = self.config.ai_model.as_deref().unwrap_or("<default>");
-                    self.status_message = format!("Current model: {} (use :model <name>)", cur);
+                    self.status_message = format!("Current model: {} (use :model <name|clear>)", cur);
+                }
+            }
+            "fast-model" => {
+                if let Some(fm) = parts.get(1) {
+                    self.config.ai_fast_model = crate::config::normalize_optional_setting(fm);
+                    self.commit_msg_cache.clear();
+                    self.user_forced_flat_tree = false;
+                    self.trigger_ai_analysis(true);
+                } else {
+                    let cur = self.config.ai_fast_model.as_deref().unwrap_or("<default>");
+                    self.status_message =
+                        format!("Current fast_model: {} (use :fast-model <name|clear>)", cur);
                 }
             }
             "effort" => {
                 if let Some(e) = parts.get(1) {
-                    if *e == "default" || *e == "none" || *e == "clear" {
-                        self.config.ai_effort = None;
-                    } else {
-                        self.config.ai_effort = Some((*e).to_string());
+                    match crate::config::normalize_optional_setting(e) {
+                        None => {
+                            self.config.ai_effort = None;
+                            self.user_forced_flat_tree = false;
+                            self.trigger_ai_analysis(true);
+                        }
+                        Some(v) => match crate::config::validate_effort(&v) {
+                            Ok(valid) => {
+                                self.config.ai_effort = Some(valid);
+                                self.user_forced_flat_tree = false;
+                                self.trigger_ai_analysis(true);
+                            }
+                            Err(err) => self.status_message = format!("Error: {}", err),
+                        },
                     }
-                    self.trigger_ai_analysis(true);
                 } else {
                     let cur = self.config.ai_effort.as_deref().unwrap_or("<default>");
                     self.status_message = format!(
-                        "Current effort: {} (use :effort low|medium|high|xhigh|max)",
+                        "Current effort: {} (use :effort low|medium|high|xhigh|max|clear)",
+                        cur
+                    );
+                }
+            }
+            "fast-effort" => {
+                if let Some(fe) = parts.get(1) {
+                    match crate::config::normalize_optional_setting(fe) {
+                        None => {
+                            self.config.ai_fast_effort = None;
+                            self.commit_msg_cache.clear();
+                            self.user_forced_flat_tree = false;
+                            self.trigger_ai_analysis(true);
+                        }
+                        Some(v) => match crate::config::validate_effort(&v) {
+                            Ok(valid) => {
+                                self.config.ai_fast_effort = Some(valid);
+                                self.commit_msg_cache.clear();
+                                self.user_forced_flat_tree = false;
+                                self.trigger_ai_analysis(true);
+                            }
+                            Err(err) => self.status_message = format!("Error: {}", err),
+                        },
+                    }
+                } else {
+                    let cur = self.config.ai_fast_effort.as_deref().unwrap_or("<default>");
+                    self.status_message = format!(
+                        "Current fast_effort: {} (use :fast-effort low|medium|high|xhigh|max|clear)",
                         cur
                     );
                 }
@@ -3217,7 +3470,12 @@ impl App {
                 self.display_mode = DifftDisplayMode::SideBySide;
                 self.re_render_all_for_mode_or_width();
             }
-            "tree" => self.show_sidebar = !self.show_sidebar,
+            "tree" => {
+                self.show_sidebar = !self.show_sidebar;
+                if !self.show_sidebar {
+                    self.focus = PaneFocus::Diff;
+                }
+            }
             "inspector" => self.show_inspector = !self.show_inspector,
             "refresh" | "r" => {
                 let t = self.bundle.target.clone();
@@ -3236,6 +3494,8 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.ai_cancel_flag.store(true, Ordering::Relaxed);
+        self.ai_followup_cancel_flag.store(true, Ordering::Relaxed);
+        self.commit_cancel_flag.store(true, Ordering::Relaxed);
     }
 }
 

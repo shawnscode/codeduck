@@ -18,6 +18,18 @@ pub struct DifftEngine {
     next_pair_id: AtomicU64,
 }
 
+struct PairTempGuard {
+    old_dir: PathBuf,
+    new_dir: PathBuf,
+}
+
+impl Drop for PairTempGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.old_dir);
+        let _ = std::fs::remove_dir_all(&self.new_dir);
+    }
+}
+
 impl DifftEngine {
     pub fn new(difft_bin: &str, ignore_comments: bool) -> Result<Self> {
         let snapshot_dir = TempDir::new().context("Failed to create temp dir for difft snapshots")?;
@@ -47,7 +59,7 @@ impl DifftEngine {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    fn write_pair(&self, change: &FileChange) -> Result<(PathBuf, PathBuf)> {
+    fn write_pair(&self, change: &FileChange) -> Result<(PathBuf, PathBuf, PairTempGuard)> {
         let pair_id = self.next_pair_id.fetch_add(1, Ordering::Relaxed);
         let raw_name = Path::new(&change.path)
             .file_name()
@@ -78,7 +90,7 @@ impl DifftEngine {
         let new_path = new_dir.join(&safe_name);
         std::fs::write(&old_path, change.old_content.as_deref().unwrap_or(&[]))?;
         std::fs::write(&new_path, change.new_content.as_deref().unwrap_or(&[]))?;
-        Ok((old_path, new_path))
+        Ok((old_path, new_path, PairTempGuard { old_dir, new_dir }))
     }
 
     pub fn render_changes_bounded(
@@ -183,7 +195,7 @@ impl DifftEngine {
             });
         }
 
-        let (old_file, new_file) = self.write_pair(change)?;
+        let (old_file, new_file, _pair_guard) = self.write_pair(change)?;
         let max_bytes = change
             .old_content
             .as_ref()
@@ -242,7 +254,7 @@ impl DifftEngine {
             existing.rendered_width = width;
             return Ok(());
         }
-        let (old_file, new_file) = self.write_pair(change)?;
+        let (old_file, new_file, _pair_guard) = self.write_pair(change)?;
         let mut ansi_output = self.run_ansi(&old_file, &new_file, mode, width, &change.path)?;
         if let Some(prop_diff) = &change.prop_changes {
             ansi_output.push_str(&format!("\n\x1b[1;36m--- SVN Properties ---\x1b[0m\n{}", prop_diff));
@@ -672,8 +684,54 @@ pub fn build_ai_structural_diff(change: &FileChange, json: Option<&DifftJsonOutp
             }
         }
         _ => {
-            for (i, line) in new_lines.iter().take(80).enumerate() {
-                out.push_str(&format!("  {:>4} | {}\n", i + 1, line));
+            // Bounded line-level diff snippet when AST JSON was skipped (e.g. >256KB files)
+            let mut prefix = 0usize;
+            let min_len = old_lines.len().min(new_lines.len());
+            while prefix < min_len && old_lines[prefix] == new_lines[prefix] {
+                prefix += 1;
+            }
+            let mut suffix = 0usize;
+            while prefix + suffix < min_len
+                && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+            {
+                suffix += 1;
+            }
+            let old_mid_end = old_lines.len().saturating_sub(suffix);
+            let new_mid_end = new_lines.len().saturating_sub(suffix);
+            if prefix >= old_mid_end && prefix >= new_mid_end {
+                out.push_str("(No textual changes)\n");
+            } else {
+                let ctx_start = prefix.saturating_sub(2);
+                out.push_str(&format!(
+                    "@@ Line-diff fallback (old L{}-L{}, new L{}-L{}) @@\n",
+                    prefix + 1,
+                    old_mid_end.max(prefix + 1),
+                    prefix + 1,
+                    new_mid_end.max(prefix + 1),
+                ));
+                for idx in ctx_start..prefix {
+                    if let Some(line) = new_lines.get(idx) {
+                        out.push_str(&format!("  {:>4} | {}\n", idx + 1, line));
+                    }
+                }
+                let mut emitted = 0usize;
+                for idx in prefix..old_mid_end {
+                    if emitted >= 60 {
+                        out.push_str(&format!("... ({} more old lines omitted)\n", old_mid_end - idx));
+                        break;
+                    }
+                    out.push_str(&format!("- {:>4} | {}\n", idx + 1, old_lines[idx]));
+                    emitted += 1;
+                }
+                let mut emitted_new = 0usize;
+                for idx in prefix..new_mid_end {
+                    if emitted_new >= 60 {
+                        out.push_str(&format!("... ({} more new lines omitted)\n", new_mid_end - idx));
+                        break;
+                    }
+                    out.push_str(&format!("+ {:>4} | {}\n", idx + 1, new_lines[idx]));
+                    emitted_new += 1;
+                }
             }
         }
     }
