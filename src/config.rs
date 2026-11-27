@@ -786,7 +786,19 @@ pub fn save_project_session_at(
     let mut doc = if sfile.is_file() {
         let existing = std::fs::read_to_string(sfile)
             .with_context(|| format!("Failed to read {}", sfile.display()))?;
-        existing.parse::<DocumentMut>().unwrap_or_default()
+        match existing.parse::<DocumentMut>() {
+            Ok(d) => d,
+            Err(err) => {
+                let backup = sfile.with_extension("toml.bak");
+                let _ = std::fs::copy(sfile, &backup);
+                anyhow::bail!(
+                    "Failed to parse {}; original preserved and backed up to {}: {}",
+                    sfile.display(),
+                    backup.display(),
+                    err
+                );
+            }
+        }
     } else {
         let mut d = DocumentMut::new();
         d.decor_mut().set_prefix(

@@ -202,7 +202,14 @@ fn main() -> Result<()> {
             false,
         )?;
         let engine = DifftEngine::new(&config.difft_bin, config.ignore_comments)?;
-        let rendered = engine.render_changes_bounded(&bundle.changes, config.display_mode, 120)?;
+        let need_json = !config.ai_provider.eq_ignore_ascii_case("none")
+            && !config.ai_provider.eq_ignore_ascii_case("off");
+        let rendered = engine.render_changes_bounded_with_options(
+            &bundle.changes,
+            config.display_mode,
+            120,
+            need_json,
+        )?;
         let ai_res = if let Some(provider) = ai::resolve_provider(&config.ai_provider, &config) {
             let out = ai::analyze_diff_with_session(
                 provider.as_ref(),
@@ -213,12 +220,14 @@ fn main() -> Result<()> {
             )?;
             if config.reuse_session {
                 if let Some(sid) = out.session_id.as_deref() {
-                    let _ = codeduck::config::save_project_session(
+                    if let Err(err) = codeduck::config::save_project_session(
                         vcs_backend.repo_root(),
                         vcs_backend.scope_dir(),
                         provider.id(),
                         Some(sid),
-                    );
+                    ) {
+                        eprintln!("Warning: {}", err);
+                    }
                 }
             }
             Some(out.review)
@@ -293,9 +302,16 @@ fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    let mut last_anim_draw = std::time::Instant::now();
     while !app.should_quit {
-        app.poll_background();
-        terminal.draw(|f| ui::draw(f, app))?;
+        let bg_updated = app.poll_background();
+        let anim_tick = app.has_active_animation()
+            && last_anim_draw.elapsed() >= std::time::Duration::from_millis(200);
+        if bg_updated || app.dirty || anim_tick {
+            terminal.draw(|f| ui::draw(f, app))?;
+            app.dirty = false;
+            last_anim_draw = std::time::Instant::now();
+        }
 
         if event::poll(Duration::from_millis(80))? {
             match event::read()? {
@@ -304,6 +320,9 @@ fn run_tui_loop(
                 }
                 Event::Paste(text) => {
                     app.handle_paste(&text);
+                }
+                Event::Resize(_, _) => {
+                    app.dirty = true;
                 }
                 _ => {}
             }

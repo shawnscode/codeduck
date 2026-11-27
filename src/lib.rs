@@ -6,5 +6,6 @@ pub mod difft;
 pub mod i18n;
 pub mod ignore;
 pub mod model;
+pub mod parallel;
 pub mod ui;
 pub mod vcs;

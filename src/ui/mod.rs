@@ -566,21 +566,21 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             .into_owned()
         };
 
-        // Render visible slice with cursor row highlight when Diff pane is focused
+        // Render visible slice with cursor row highlight, borrowing spans without cloning text
         let start = app.diff_scroll_y.min(app.continuous.lines.len().saturating_sub(1));
         let visible_h = inner_h as usize;
         let end = (start + visible_h).min(app.continuous.lines.len());
-        let mut visible_lines = Vec::with_capacity(end.saturating_sub(start));
+        let mut visible_lines: Vec<Line<'_>> = Vec::with_capacity(end.saturating_sub(start));
 
-        for y in start..end {
-            let mut line = app.continuous.lines[y].clone();
-            if y == app.diff_cursor_y {
+        for (y, src_line) in app.continuous.lines[start..end].iter().enumerate() {
+            let abs_y = start + y;
+            let mut spans = Vec::with_capacity(src_line.spans.len() + 1);
+            if abs_y == app.diff_cursor_y {
                 let cursor_bg = if focused {
                     Color::Rgb(38, 48, 66)
                 } else {
                     Color::Rgb(28, 32, 42)
                 };
-                let mut spans = Vec::with_capacity(line.spans.len() + 1);
                 spans.push(Span::styled(
                     "▶ ",
                     Style::default()
@@ -588,18 +588,16 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                         .bg(cursor_bg)
                         .add_modifier(Modifier::BOLD),
                 ));
-                for mut sp in line.spans {
-                    sp.style = sp.style.bg(cursor_bg);
-                    spans.push(sp);
+                for sp in &src_line.spans {
+                    spans.push(Span::styled(sp.content.as_ref(), sp.style.bg(cursor_bg)));
                 }
-                line = Line::from(spans);
             } else {
-                let mut spans = Vec::with_capacity(line.spans.len() + 1);
                 spans.push(Span::raw("  "));
-                spans.extend(line.spans);
-                line = Line::from(spans);
+                for sp in &src_line.spans {
+                    spans.push(Span::styled(sp.content.as_ref(), sp.style));
+                }
             }
-            visible_lines.push(line);
+            visible_lines.push(Line::from(spans));
         }
         (title, Text::from(visible_lines))
     };
@@ -1245,7 +1243,7 @@ fn draw_settings_modal(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(idx, (k, v))| {
             let selected = idx == app.settings_cursor;
-            let k_pad = format!("{:<width$}", k, width = label_col_w);
+            let k_pad = pad_display_width(k, label_col_w);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     if selected { "▶ " } else { "  " },
@@ -1344,7 +1342,7 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut state = ListState::default();
-    state.select(Some(app.commit_picker_cursor));
+    state.select(Some(app.commit_picker_cursor.min(items.len().saturating_sub(1))));
     let title = if app.commits_loading {
         t!("commit_picker.title_loading", locale = locale).into_owned()
     } else {
@@ -1552,20 +1550,14 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
     let main_has_stream = !(app.commit_editing_msg
         && app.commit_modal_focus == CommitModalFocus::Message)
-        && (app.commit_msg_generating
-            || !app.commit_stream_logs.is_empty()
-            || !app.commit_stream_thinking.is_empty()
-            || !app.commit_stream_text.is_empty());
+        && app.commit_main.has_stream_activity();
     let ext_has_stream = !(app.commit_editing_msg
         && app.commit_modal_focus == CommitModalFocus::ExternalMessage)
-        && (app.ext_commit_msg_generating
-            || !app.ext_commit_stream_logs.is_empty()
-            || !app.ext_commit_stream_thinking.is_empty()
-            || !app.ext_commit_stream_text.is_empty());
+        && app.commit_ext.has_stream_activity();
 
     let main_box_h: u16 = if !has_main_box {
         0
-    } else if app.commit_msg_generating {
+    } else if app.commit_main.generating {
         if has_ext { 7 } else { 9 }
     } else if main_has_stream {
         if has_ext { 5 } else { 7 }
@@ -1576,7 +1568,7 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     };
     let ext_box_h: u16 = if !has_ext {
         0
-    } else if app.ext_commit_msg_generating {
+    } else if app.commit_ext.generating {
         if has_main_box { 7 } else { 9 }
     } else if ext_has_stream {
         if has_main_box { 5 } else { 7 }
@@ -1735,9 +1727,9 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
             has_ext,
             false,
             editing_main,
-            app.commit_msg_generating,
-            app.commit_msg_needs_regen,
-            app.commit_msg_dirty,
+            app.commit_main.generating,
+            app.commit_main.needs_regen,
+            app.commit_main.dirty,
         );
         render_commit_msg_box(
             frame,
@@ -1745,16 +1737,16 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
             sections[sec_idx],
             CommitMsgRenderParams {
                 title: main_title,
-                message: &app.commit_message,
-                cursor: app.commit_msg_cursor,
+                message: &app.commit_main.message,
+                cursor: app.commit_main.cursor,
                 focused: focused_main,
                 editing: editing_main,
-                generating: app.commit_msg_generating,
-                started_at: app.commit_started_at,
-                progress_stage: &app.commit_progress_stage,
-                stream_logs: &app.commit_stream_logs,
-                stream_thinking: &app.commit_stream_thinking,
-                stream_text: &app.commit_stream_text,
+                generating: app.commit_main.generating,
+                started_at: app.commit_main.started_at,
+                progress_stage: &app.commit_main.progress_stage,
+                stream_logs: &app.commit_main.stream_logs,
+                stream_thinking: &app.commit_main.stream_thinking,
+                stream_text: &app.commit_main.stream_text,
                 provider_id: prov,
             },
         );
@@ -1769,9 +1761,9 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
             true,
             true,
             editing_ext,
-            app.ext_commit_msg_generating,
-            app.ext_commit_msg_needs_regen,
-            app.ext_commit_msg_dirty,
+            app.commit_ext.generating,
+            app.commit_ext.needs_regen,
+            app.commit_ext.dirty,
         );
         render_commit_msg_box(
             frame,
@@ -1779,16 +1771,16 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
             sections[sec_idx],
             CommitMsgRenderParams {
                 title: ext_title,
-                message: &app.ext_commit_message,
-                cursor: app.ext_commit_msg_cursor,
+                message: &app.commit_ext.message,
+                cursor: app.commit_ext.cursor,
                 focused: focused_ext,
                 editing: editing_ext,
-                generating: app.ext_commit_msg_generating,
-                started_at: app.ext_commit_started_at,
-                progress_stage: &app.ext_commit_progress_stage,
-                stream_logs: &app.ext_commit_stream_logs,
-                stream_thinking: &app.ext_commit_stream_thinking,
-                stream_text: &app.ext_commit_stream_text,
+                generating: app.commit_ext.generating,
+                started_at: app.commit_ext.started_at,
+                progress_stage: &app.commit_ext.progress_stage,
+                stream_logs: &app.commit_ext.stream_logs,
+                stream_thinking: &app.commit_ext.stream_thinking,
+                stream_text: &app.commit_ext.stream_text,
                 provider_id: prov,
             },
         );
@@ -1879,18 +1871,25 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let mut ext_buckets: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     let mut main_file_cnt = 0usize;
-    let mut exts = app.cached_external_prefixes.clone();
-    exts.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    let exts = &app.cached_external_prefixes;
     let main_repo_label = t!("commit.main_repo", locale = locale);
     for f in &selected_files {
         let norm = f.path.trim_start_matches("./");
-        if let Some(ext) = exts.iter().find(|e| {
-            if is_git {
-                norm.starts_with(&format!("{}/", e))
-            } else {
-                norm == **e || norm.starts_with(&format!("{}/", e))
-            }
-        }) {
+        if let Some(ext) = exts
+            .iter()
+            .filter(|e| {
+                let prefix = e.as_str();
+                let is_under = norm.len() > prefix.len()
+                    && norm.starts_with(prefix)
+                    && norm.as_bytes()[prefix.len()] == b'/';
+                if is_git {
+                    is_under
+                } else {
+                    norm == prefix || is_under
+                }
+            })
+            .max_by_key(|e| e.len())
+        {
             *ext_buckets
                 .entry(format!("external[{}]", ext))
                 .or_default() += 1;
@@ -1994,7 +1993,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let top_line_cnt = top_lines.len().min(6) as u16;
     let main_msg_h: u16 = if !has_main_box {
         0
-    } else if app.commit_msg_generating {
+    } else if app.commit_main.generating {
         6
     } else if has_ext {
         3
@@ -2003,7 +2002,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     };
     let ext_msg_h: u16 = if !has_ext {
         0
-    } else if app.ext_commit_msg_generating {
+    } else if app.commit_ext.generating {
         6
     } else if has_main_box {
         3
@@ -2049,7 +2048,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(&app.active_ai_provider_id);
     let mut sec_idx = 1;
     if has_main_box {
-        let main_title_key = match (has_ext, app.commit_msg_generating) {
+        let main_title_key = match (has_ext, app.commit_main.generating) {
             (false, true) => "commit.confirm_msg_generating",
             (false, false) => "commit.confirm_msg",
             (true, true) => "commit.confirm_msg_main_generating",
@@ -2060,19 +2059,19 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             locale,
             sections[sec_idx],
             t!(main_title_key, locale = locale).into_owned(),
-            &app.commit_message,
-            app.commit_msg_generating,
-            app.commit_started_at,
-            &app.commit_progress_stage,
-            &app.commit_stream_logs,
-            &app.commit_stream_thinking,
-            &app.commit_stream_text,
+            &app.commit_main.message,
+            app.commit_main.generating,
+            app.commit_main.started_at,
+            &app.commit_main.progress_stage,
+            &app.commit_main.stream_logs,
+            &app.commit_main.stream_thinking,
+            &app.commit_main.stream_text,
             prov,
         );
         sec_idx += 1;
     }
     if has_ext {
-        let ext_title_key = if app.ext_commit_msg_generating {
+        let ext_title_key = if app.commit_ext.generating {
             "commit.confirm_msg_ext_generating"
         } else {
             "commit.confirm_msg_ext"
@@ -2082,13 +2081,13 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             locale,
             sections[sec_idx],
             t!(ext_title_key, locale = locale).into_owned(),
-            &app.ext_commit_message,
-            app.ext_commit_msg_generating,
-            app.ext_commit_started_at,
-            &app.ext_commit_progress_stage,
-            &app.ext_commit_stream_logs,
-            &app.ext_commit_stream_thinking,
-            &app.ext_commit_stream_text,
+            &app.commit_ext.message,
+            app.commit_ext.generating,
+            app.commit_ext.started_at,
+            &app.commit_ext.progress_stage,
+            &app.commit_ext.stream_logs,
+            &app.commit_ext.stream_thinking,
+            &app.commit_ext.stream_text,
             prov,
         );
         sec_idx += 1;
@@ -2428,6 +2427,15 @@ fn pane_border_style(focused: bool) -> Style {
     }
 }
 
+pub fn pad_display_width(s: &str, target_cols: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= target_cols {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(target_cols - w))
+    }
+}
+
 pub fn truncate_display_width(s: &str, max_cols: usize) -> String {
     if UnicodeWidthStr::width(s) <= max_cols {
         return s.to_string();
@@ -2524,48 +2532,57 @@ fn append_stream_progress_lines(
         }
     }
 
-    let thinking_lines: Vec<&str> = thinking
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if !thinking_lines.is_empty() && max_thinking > 0 {
-        lines.push(Line::from(Span::styled(
-            t!("progress.thinking", locale = locale).into_owned(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )));
-        let start = thinking_lines.len().saturating_sub(max_thinking);
-        for l in &thinking_lines[start..] {
+    if max_thinking > 0 {
+        let tail = tail_non_empty_lines(thinking, max_thinking);
+        if !tail.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("  {}", l),
-                Style::default().fg(Color::Gray),
+                t!("progress.thinking", locale = locale).into_owned(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )));
+            for l in tail {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", l),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
         }
     }
 
-    let text_lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if !text_lines.is_empty() && max_text > 0 {
-        lines.push(Line::from(Span::styled(
-            t!(
-                "progress.output_chars",
-                locale = locale,
-                count = text.chars().count()
-            )
-            .into_owned(),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )));
-        let start = text_lines.len().saturating_sub(max_text);
-        for l in &text_lines[start..] {
+    if max_text > 0 {
+        let tail = tail_non_empty_lines(text, max_text);
+        if !tail.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("  {}", l),
-                Style::default().fg(Color::White),
+                t!(
+                    "progress.output_chars",
+                    locale = locale,
+                    count = text.chars().count()
+                )
+                .into_owned(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             )));
+            for l in tail {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", l),
+                    Style::default().fg(Color::White),
+                )));
+            }
         }
     }
+}
+
+fn tail_non_empty_lines(s: &str, max_lines: usize) -> Vec<&str> {
+    if max_lines == 0 || s.is_empty() {
+        return Vec::new();
+    }
+    let mut tail: Vec<&str> = s
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(max_lines)
+        .collect();
+    tail.reverse();
+    tail
 }
 
 fn build_ai_progress_lines(app: &App) -> Vec<Line<'static>> {

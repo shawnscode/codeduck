@@ -318,6 +318,8 @@ pub struct FileDiffRendered {
     pub ansi_output: String,
     pub rendered_width: u16,
     pub rendered_mode: DifftDisplayMode,
+    pub rendered_ignore_comments: bool,
+    pub json_ignore_comments: bool,
     pub json: Option<DifftJsonOutput>,
     /// 0-based line indices inside `ansi_output` that start a new diff hunk/section.
     pub hunk_anchors: Vec<usize>,
@@ -346,6 +348,31 @@ impl RiskLevel {
             "medium" | "moderate" => RiskLevel::Medium,
             "low" => RiskLevel::Low,
             _ => RiskLevel::Info,
+        }
+    }
+
+    pub fn severity_rank(self) -> u8 {
+        match self {
+            RiskLevel::Critical => 4,
+            RiskLevel::High => 3,
+            RiskLevel::Medium => 2,
+            RiskLevel::Low => 1,
+            RiskLevel::Info => 0,
+        }
+    }
+
+    pub fn is_elevated(self) -> bool {
+        matches!(
+            self,
+            RiskLevel::Critical | RiskLevel::High | RiskLevel::Medium
+        )
+    }
+
+    pub fn max_risk(self, other: Self) -> Self {
+        if self.severity_rank() >= other.severity_rank() {
+            self
+        } else {
+            other
         }
     }
 

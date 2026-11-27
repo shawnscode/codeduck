@@ -1,6 +1,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::sync::Mutex;
+
+static CODEDUCK_HOME_LOCK: Mutex<()> = Mutex::new(());
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tempfile::TempDir;
@@ -90,6 +93,26 @@ fn test_svn_uncommitted_and_commit_with_difft_and_mock_ai() {
         r2_bundle.commit_info.as_ref().unwrap().message,
         "r2: saturating add and sub"
     );
+    let r2_calc = r2_bundle
+        .changes
+        .iter()
+        .find(|c| c.path == "src/calc.rs")
+        .expect("r2 should contain src/calc.rs");
+    assert_eq!(
+        r2_calc.old_content.as_deref(),
+        Some(b"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n".as_slice())
+    );
+    assert_eq!(
+        r2_calc.new_content.as_deref(),
+        Some(b"pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}\n\npub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n".as_slice())
+    );
+    let r2_readme = r2_bundle
+        .changes
+        .iter()
+        .find(|c| c.path == "README.txt")
+        .expect("r2 should contain README.txt");
+    assert_eq!(r2_readme.old_content.as_deref(), Some(b"initial\n".as_slice()));
+    assert_eq!(r2_readme.new_content, None);
 
     let commits = backend.recent_commits(5).unwrap();
     assert_eq!(commits.len(), 2);
@@ -566,13 +589,13 @@ echo "- 调整 a.lua 逻辑为返回 10"
     // Wait for AI commit message generation and confirm single-sentence normalization
     for _ in 0..30 {
         app.poll_background();
-        if !app.commit_msg_generating {
+        if !app.commit_main.generating {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
-    assert_eq!(app.commit_message, "更新 a.lua 返回值");
-    assert!(!app.commit_message.contains('\n'));
+    assert_eq!(app.commit_main.message, "更新 a.lua 返回值");
+    assert!(!app.commit_main.message.contains('\n'));
 
     // Move to GroupHeader(1) ("逻辑分组B") and uncheck the entire group with Space
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -581,16 +604,16 @@ echo "- 调整 a.lua 逻辑为返回 10"
     assert!(app.commit_files[0].included);
     assert!(!app.commit_files[1].included);
     // Fallback updates immediately to a single-sentence English summary without file counts
-    assert!(!app.commit_message.contains('\n'));
-    assert!(!app.commit_message.contains("个文件"));
-    assert!(app.commit_message.is_ascii());
+    assert!(!app.commit_main.message.contains('\n'));
+    assert!(!app.commit_main.message.contains("个文件"));
+    assert!(app.commit_main.message.is_ascii());
     // Wait briefly past the 350ms debounce and verify auto-regeneration starts automatically without pressing 'g'
     std::thread::sleep(std::time::Duration::from_millis(380));
     app.poll_background();
-    assert!(app.commit_msg_generating || !app.commit_msg_needs_regen);
+    assert!(app.commit_main.generating || !app.commit_main.needs_regen);
     for _ in 0..30 {
         app.poll_background();
-        if !app.commit_msg_generating {
+        if !app.commit_main.generating {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -599,13 +622,13 @@ echo "- 调整 a.lua 逻辑为返回 10"
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     std::thread::sleep(std::time::Duration::from_millis(380));
     app.poll_background();
-    assert!(!app.commit_msg_generating);
-    assert_eq!(app.commit_message, "更新 a.lua 返回值");
+    assert!(!app.commit_main.generating);
+    assert_eq!(app.commit_main.message, "更新 a.lua 返回值");
     assert!(!app.commit_msg_cache.is_empty());
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     std::thread::sleep(std::time::Duration::from_millis(380));
     app.poll_background();
-    assert!(!app.commit_msg_generating);
+    assert!(!app.commit_main.generating);
 
     // Step 1 'y' opens double confirmation (does NOT commit yet)
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
@@ -626,7 +649,7 @@ echo "- 调整 a.lua 逻辑为返回 10"
         codeduck::ui::app::OverlayKind::CommitDoubleConfirm
     );
     // Pressing 'y' while AI is regenerating the commit message is safely guarded
-    if app.commit_msg_generating {
+    if app.commit_main.generating {
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert_eq!(
             app.overlay,
@@ -634,7 +657,7 @@ echo "- 调整 a.lua 逻辑为返回 10"
         );
         for _ in 0..30 {
             app.poll_background();
-            if !app.commit_msg_generating {
+            if !app.commit_main.generating {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -872,9 +895,12 @@ patterns = ["*.meta"]
     assert!(!cfg3.ai_sessions.contains_key("mock-sess"));
 
     // 9. Verify AppConfig::sessions_path() resolves under ~/.codeduck/sessions.toml
-    if std::env::var_os("CODEDUCK_HOME").is_none() {
-        let home = AppConfig::codeduck_home_dir().unwrap();
-        assert_eq!(AppConfig::sessions_path().unwrap(), home.join("sessions.toml"));
+    {
+        let _env_guard = CODEDUCK_HOME_LOCK.lock().unwrap();
+        if std::env::var_os("CODEDUCK_HOME").is_none() {
+            let home = AppConfig::codeduck_home_dir().unwrap();
+            assert_eq!(AppConfig::sessions_path().unwrap(), home.join("sessions.toml"));
+        }
     }
 
     let recorded = calls.lock().unwrap();
@@ -971,6 +997,7 @@ patterns = ["*.meta"]
 
 #[test]
 fn test_history_and_commit_diff_disk_cache() {
+    let _env_guard = CODEDUCK_HOME_LOCK.lock().unwrap();
     let tmp = TempDir::new().unwrap();
     let repo_dir = tmp.path().join("repo");
     let wc_dir = tmp.path().join("wc");
@@ -1270,16 +1297,16 @@ fn test_audit_regressions_edge_cases_and_ui_rendering() {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
-        app.commit_msg_generating = true;
-        app.commit_started_at = Some(std::time::Instant::now());
-        app.commit_progress_stage = "模型正在生成英文日志...".to_string();
-        app.commit_stream_logs = vec!["[0.3s] 已连接 agy".to_string()];
-        app.commit_stream_thinking = "Summarizing selected files".to_string();
-        app.commit_stream_text = "Initialize codeduck repository".to_string();
+        app.commit_main.generating = true;
+        app.commit_main.started_at = Some(std::time::Instant::now());
+        app.commit_main.progress_stage = "模型正在生成英文日志...".to_string();
+        app.commit_main.stream_logs = vec!["[0.3s] 已连接 agy".to_string()];
+        app.commit_main.stream_thinking = "Summarizing selected files".to_string();
+        app.commit_main.stream_text = "Initialize codeduck repository".to_string();
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
-        app.commit_msg_generating = false;
+        app.commit_main.generating = false;
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     }
@@ -1358,12 +1385,15 @@ patterns = ["!keep.meta"]
     assert!(!matcher.is_ignored(&proj_dir, "src/main.rs"));
 
     // Verify default codeduck_home_dir resolves to ~/.codeduck and cache_dir under it/cache
-    if std::env::var_os("CODEDUCK_HOME").is_none() {
-        let home = AppConfig::codeduck_home_dir().unwrap();
-        let expected_home = dirs::home_dir().unwrap().join(".codeduck");
-        assert_eq!(home, expected_home);
-        assert_eq!(AppConfig::config_path().unwrap(), home.join("configs.toml"));
-        assert_eq!(AppConfig::cache_dir().unwrap(), home.join("cache"));
+    {
+        let _env_guard = CODEDUCK_HOME_LOCK.lock().unwrap();
+        if std::env::var_os("CODEDUCK_HOME").is_none() {
+            let home = AppConfig::codeduck_home_dir().unwrap();
+            let expected_home = dirs::home_dir().unwrap().join(".codeduck");
+            assert_eq!(home, expected_home);
+            assert_eq!(AppConfig::config_path().unwrap(), home.join("configs.toml"));
+            assert_eq!(AppConfig::cache_dir().unwrap(), home.join("cache"));
+        }
     }
 }
 
@@ -1576,11 +1606,11 @@ args = ["-c", "echo pwned"]
     // Pressing `y` while commit_msg_generating sets commit_hint_notice (NOT commit_error)
     app.open_commit_confirm();
     app.open_commit_double_confirm();
-    app.commit_msg_generating = true;
+    app.commit_main.generating = true;
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(app.commit_error.is_none());
     assert!(app.commit_hint_notice.is_some());
-    app.commit_msg_generating = false;
+    app.commit_main.generating = false;
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
@@ -2166,7 +2196,7 @@ fn git_submodule_uncommitted_commit_and_revert_flow() {
     // Open CommitConfirm ('S')
     app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
     assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
-    // In submodule-only selection, external log is separate (`ext_commit_message`)
+    // In submodule-only selection, external log is separate (`commit_ext.message`)
     // and main message auto-derives submodule link log (`Update submodule moss: ...`).
     for _ in 0..40 {
         app.poll_background();
@@ -2175,11 +2205,11 @@ fn git_submodule_uncommitted_commit_and_revert_flow() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert!(!app.ext_commit_message.trim().is_empty());
+    assert!(!app.commit_ext.message.trim().is_empty());
     assert!(
-        app.commit_message.starts_with("Update submodule moss:"),
-        "commit_message={:?}",
-        app.commit_message
+        app.commit_main.message.starts_with("Update submodule moss:"),
+        "commit_main.message={:?}",
+        app.commit_main.message
     );
 
     // Tab cycles Files -> Message -> ExternalMessage -> Files, and rendering both boxes panics nowhere
@@ -2468,7 +2498,7 @@ fn test_partial_commit_and_revert_prune_in_place_without_full_reload() {
     for f in &mut app.commit_files {
         f.included = f.path == "a.rs";
     }
-    app.commit_message = "commit only a.rs".to_string();
+    app.commit_main.message = "commit only a.rs".to_string();
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     for _ in 0..40 {
@@ -2679,4 +2709,864 @@ fn test_header_project_name_scheme_c_diff_and_synced_footer_progress() {
         .map(|c| c.symbol())
         .collect();
     assert!(!after_i_key.contains("Code Inspector"));
+}
+
+#[test]
+fn test_p0_regression_fixes() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Git literal pathspecs: committing or reverting `file[1].txt` must NOT touch `file1.txt`
+    let git_dir = tmp.path().join("git_literal");
+    fs::create_dir_all(&git_dir).unwrap();
+    run("git", &["init"], &git_dir);
+    run("git", &["config", "user.email", "t@example.com"], &git_dir);
+    run("git", &["config", "user.name", "Tester"], &git_dir);
+    fs::write(git_dir.join("file[1].txt"), "orig-bracket\n").unwrap();
+    fs::write(git_dir.join("file1.txt"), "orig-plain\n").unwrap();
+    run("git", &["add", "--", "file[1].txt", "file1.txt"], &git_dir);
+    run("git", &["commit", "-m", "init"], &git_dir);
+
+    fs::write(git_dir.join("file[1].txt"), "mod-bracket\n").unwrap();
+    fs::write(git_dir.join("file1.txt"), "mod-plain\n").unwrap();
+    let backend = vcs::open_vcs(&git_dir, Some(VcsKind::Git)).unwrap();
+    backend
+        .commit_files(&["file[1].txt".to_string()], "commit literal only")
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(git_dir.join("file1.txt")).unwrap(),
+        "mod-plain\n"
+    );
+    let rem = backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    assert_eq!(rem.changes.len(), 1);
+    assert_eq!(rem.changes[0].path, "file1.txt");
+
+    // Now modify file[1].txt again and revert only file[1].txt
+    fs::write(git_dir.join("file[1].txt"), "revert-me\n").unwrap();
+    backend
+        .revert_files(&["file[1].txt".to_string()])
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(git_dir.join("file[1].txt")).unwrap(),
+        "mod-bracket\n"
+    );
+    assert_eq!(
+        fs::read_to_string(git_dir.join("file1.txt")).unwrap(),
+        "mod-plain\n"
+    );
+
+    // 2. Worktree symlink read protection: symlink pointing outside repo must not leak target file contents
+    #[cfg(unix)]
+    {
+        let secret = tmp.path().join("outside_secret.txt");
+        fs::write(&secret, "TOP_SECRET_OUTSIDE_REPO\n").unwrap();
+        std::os::unix::fs::symlink(&secret, git_dir.join("leak.txt")).unwrap();
+        let sym_bundle = backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+        let leak_change = sym_bundle
+            .changes
+            .iter()
+            .find(|c| c.path == "leak.txt")
+            .expect("symlink change should be listed");
+        let leaked_text = leak_change
+            .new_content
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        assert!(
+            !leaked_text.contains("TOP_SECRET_OUTSIDE_REPO"),
+            "symlink target contents leaked: {}",
+            leaked_text
+        );
+        assert_eq!(leaked_text, secret.to_string_lossy());
+        backend.revert_files(&["leak.txt".to_string()]).unwrap();
+    }
+
+    // 3. Language switch refreshes inline AI cards and `ignore_comments` triggers re-render
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "none".to_string();
+    cfg.ui_language = "en".to_string();
+    let mut app = App::new(backend, cfg, DiffTarget::Uncommitted, 120).unwrap();
+    let initial_rerender_gen = app.rerender_generation;
+
+    app.ai_review = Some(codeduck::model::AiReviewResult {
+        provider_name: "mock".to_string(),
+        summary: "s".to_string(),
+        overall_risk: codeduck::model::RiskLevel::Low,
+        review_strategy: String::new(),
+        groups: vec![codeduck::model::ReviewGroup {
+            id: "g1".to_string(),
+            title: "G1".to_string(),
+            description: String::new(),
+            category: "logic".to_string(),
+            risk_level: codeduck::model::RiskLevel::Low,
+            review_order: 1,
+            files: vec!["file1.txt".to_string()],
+            key_points: vec![],
+        }],
+        files: vec![],
+        hunks: vec![],
+        findings: vec![codeduck::model::ReviewFinding {
+            id: "f1".to_string(),
+            file: "file1.txt".to_string(),
+            line: Some(1),
+            severity: codeduck::model::Severity::Warning,
+            title: "Check change".to_string(),
+            description: "desc".to_string(),
+            suggestion: Some("fix it".to_string()),
+        }],
+    });
+    app.rebuild_tree_and_continuous();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let en_screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(en_screen.contains("Suggestion:"));
+
+    // Switch language via Ex command and verify inline card rebuilt in zh-CN
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    for ch in "ui-lang zh-CN".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.config.ui_language, "zh-CN");
+    let mut term_zh = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term_zh.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let zh_screen: String = term_zh
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .filter(|s| *s != " ")
+        .collect();
+    assert!(zh_screen.contains("建议:fixit"), "zh_screen={}", zh_screen);
+
+    // Toggle ignore_comments in Settings modal (row 4) and confirm rerender_generation advances
+    app.handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE));
+    for _ in 0..4 {
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(app.config.ignore_comments);
+    assert!(app.rerender_generation > initial_rerender_gen);
+
+    // 4. Re-audit High/Medium/Low regressions:
+    //    (a) identical new blobs in same commit do not lose second file's content;
+    //    (b) whitespace-only filename in HEAD is restored on revert rather than deleted;
+    //    (c) parent symlink escape is blocked for both read & revert;
+    //    (d) nested wrapper JSON (`data.result`) & unclosed-brace prefixes parse cleanly.
+    let dup_repo = tmp.path().join("git_dup_and_ws");
+    fs::create_dir_all(&dup_repo).unwrap();
+    run("git", &["init"], &dup_repo);
+    run("git", &["config", "user.email", "t@example.com"], &dup_repo);
+    run("git", &["config", "user.name", "Tester"], &dup_repo);
+    fs::write(dup_repo.join("   "), "ws-v1\n").unwrap();
+    run("git", &["add", "--", "   "], &dup_repo);
+    run("git", &["commit", "-m", "ws init"], &dup_repo);
+
+    fs::write(dup_repo.join("dup1.txt"), "IDENTICAL_BLOB_CONTENT\n").unwrap();
+    fs::write(dup_repo.join("dup2.txt"), "IDENTICAL_BLOB_CONTENT\n").unwrap();
+    run("git", &["add", "--", "dup1.txt", "dup2.txt"], &dup_repo);
+    run("git", &["commit", "-m", "add identical blobs"], &dup_repo);
+
+    let dup_backend = vcs::open_vcs(&dup_repo, Some(VcsKind::Git)).unwrap();
+    let dup_commit = dup_backend
+        .collect_changes(&DiffTarget::Commit("HEAD".to_string()))
+        .unwrap();
+    assert_eq!(dup_commit.changes.len(), 2);
+    for ch in &dup_commit.changes {
+        assert_eq!(
+            ch.new_content.as_deref(),
+            Some(b"IDENTICAL_BLOB_CONTENT\n".as_slice()),
+            "missing new_content for duplicate blob file {}",
+            ch.path
+        );
+    }
+
+    // Modify whitespace-only tracked file and revert it -> restored, NOT deleted
+    fs::write(dup_repo.join("   "), "ws-v2\n").unwrap();
+    dup_backend.revert_files(&["   ".to_string()]).unwrap();
+    assert_eq!(fs::read_to_string(dup_repo.join("   ")).unwrap(), "ws-v1\n");
+
+    // Parent directory symlink outside repo must not leak or allow outside deletion on revert
+    #[cfg(unix)]
+    {
+        let out_dir = tmp.path().join("outside_dir");
+        fs::create_dir_all(&out_dir).unwrap();
+        let victim = out_dir.join("victim.txt");
+        fs::write(&victim, "OUTSIDE_PARENT_SECRET\n").unwrap();
+        std::os::unix::fs::symlink(&out_dir, dup_repo.join("linked_dir")).unwrap();
+        let b = dup_backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+        for ch in &b.changes {
+            let txt = ch
+                .new_content
+                .as_deref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            assert!(!txt.contains("OUTSIDE_PARENT_SECRET"));
+        }
+        // Attempting to revert a path through a symlinked ancestor fails safely without deleting outside target
+        assert!(
+            dup_backend
+                .revert_files(&["linked_dir/victim.txt".to_string()])
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "OUTSIDE_PARENT_SECRET\n");
+    }
+
+    // Nested wrapper (`data.result`) + consecutive unclosed `{` prefix parse cleanly in linear time
+    let nested = r#"{"data":{"result":{"summary":"Nested wrapper ok","overall_risk":"low","groups":[{"id":"g1","title":"G","files":["a.rs"]}]}}}"#;
+    let parsed_nested = ai::parse_ai_review_json(nested, "mock", &[]).unwrap();
+    assert_eq!(parsed_nested.summary, "Nested wrapper ok");
+
+    let mut unclosed = "{".repeat(8000);
+    unclosed.push_str(
+        r#"{"summary":"Recovered after unclosed braces","overall_risk":"low","groups":[{"id":"g1","title":"G","files":["a.rs"]}]}"#,
+    );
+    let parsed_unclosed = ai::parse_ai_review_json(&unclosed, "mock", &[]).unwrap();
+    assert_eq!(parsed_unclosed.summary, "Recovered after unclosed braces");
+
+    // Deeply nested balanced invalid outer object `{ { ... invalid ... } }` with valid inner JSON parses linearly
+    let mut nested_invalid = String::from("{ ".repeat(2000));
+    nested_invalid.push_str("not_json: true ");
+    nested_invalid.push_str(
+        r#"{"summary":"Recovered inside nested invalid","overall_risk":"low","groups":[{"id":"g1","title":"G","files":["a.rs"]}]}"#,
+    );
+    nested_invalid.push_str(&" }".repeat(2000));
+    let parsed_nested_invalid = ai::parse_ai_review_json(&nested_invalid, "mock", &[]).unwrap();
+    assert_eq!(parsed_nested_invalid.summary, "Recovered inside nested invalid");
+
+    // (e) Unstaged delete + staged add rename is paired in revert_files
+    fs::write(dup_repo.join("old_name.txt"), "rename payload line 1\nrename payload line 2\n").unwrap();
+    run("git", &["add", "old_name.txt"], &dup_repo);
+    run("git", &["commit", "-m", "add old_name"], &dup_repo);
+    fs::remove_file(dup_repo.join("old_name.txt")).unwrap();
+    fs::write(dup_repo.join("new_name.txt"), "rename payload line 1\nrename payload line 2\n").unwrap();
+    run("git", &["add", "new_name.txt"], &dup_repo);
+    let rename_bundle = dup_backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    let ren = rename_bundle
+        .changes
+        .iter()
+        .find(|c| c.path == "new_name.txt")
+        .expect("new_name.txt should be detected as rename");
+    assert_eq!(ren.old_path.as_deref(), Some("old_name.txt"));
+    dup_backend
+        .revert_files(&["new_name.txt".to_string()])
+        .unwrap();
+    assert!(!dup_repo.join("new_name.txt").exists());
+    assert!(dup_repo.join("old_name.txt").exists());
+
+    // (f) Oversized invalid outer sibling inside unclosed/invalid block does not starve later valid sibling
+    let mut sibling_mix = String::from("{ ");
+    sibling_mix.push_str(&"{ invalid: 1 ".repeat(1500));
+    sibling_mix.push_str(&" }".repeat(1500));
+    sibling_mix.push_str(
+        r#" {"summary":"Sibling after oversized invalid","overall_risk":"low","groups":[{"id":"g1","title":"G","files":["a.rs"]}]} }"#,
+    );
+    let parsed_sib = ai::parse_ai_review_json(&sibling_mix, "mock", &[]).unwrap();
+    assert_eq!(parsed_sib.summary, "Sibling after oversized invalid");
+
+    // (g) Removing `.gitmodules` after selecting a submodule file causes revert to error BEFORE deleting
+    let super_gm = tmp.path().join("super_gm");
+    let sub_gm_src = tmp.path().join("sub_gm_src");
+    fs::create_dir_all(&sub_gm_src).unwrap();
+    run("git", &["init"], &sub_gm_src);
+    run("git", &["config", "user.email", "t@example.com"], &sub_gm_src);
+    run("git", &["config", "user.name", "Tester"], &sub_gm_src);
+    fs::write(sub_gm_src.join("keep.txt"), "sub-v1\n").unwrap();
+    run("git", &["add", "keep.txt"], &sub_gm_src);
+    run("git", &["commit", "-m", "sub init"], &sub_gm_src);
+
+    fs::create_dir_all(&super_gm).unwrap();
+    run("git", &["init"], &super_gm);
+    run("git", &["config", "user.email", "t@example.com"], &super_gm);
+    run("git", &["config", "user.name", "Tester"], &super_gm);
+    run(
+        "git",
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_gm_src.to_str().unwrap(),
+            "sub",
+        ],
+        &super_gm,
+    );
+    run("git", &["commit", "-m", "add sub"], &super_gm);
+    fs::write(super_gm.join("sub/keep.txt"), "sub-v2\n").unwrap();
+    fs::remove_file(super_gm.join(".gitmodules")).unwrap();
+    let gm_backend = vcs::open_vcs(&super_gm, Some(VcsKind::Git)).unwrap();
+    assert!(
+        gm_backend
+            .revert_files(&["sub/keep.txt".to_string()])
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(super_gm.join("sub/keep.txt")).unwrap(),
+        "sub-v2\n"
+    );
+
+    // (h) Staged deletion of gitlink `sub` + removed `.gitmodules` still blocks `revert_files(&["sub/keep.txt"])`,
+    //     preserving both `sub/keep.txt` on disk and the staged gitlink deletion in parent index
+    run("git", &["rm", "--cached", "sub"], &super_gm);
+    assert!(
+        gm_backend
+            .revert_files(&["sub/keep.txt".to_string()])
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(super_gm.join("sub/keep.txt")).unwrap(),
+        "sub-v2\n"
+    );
+    let idx_out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", "sub"])
+        .current_dir(&super_gm)
+        .output()
+        .unwrap();
+    let idx_after = String::from_utf8_lossy(&idx_out.stdout);
+    assert!(
+        idx_after.starts_with("D "),
+        "staged gitlink deletion should remain intact, got: {:?}",
+        idx_after
+    );
+
+    // (i) Converting submodule `sub` to a normal directory and staging `sub/keep.txt` in parent index
+    //     is explicitly owned by the parent index and succeeds on commit as a regular file
+    let sub_dot_git = super_gm.join("sub/.git");
+    if sub_dot_git.is_dir() {
+        fs::remove_dir_all(&sub_dot_git).unwrap();
+    } else if sub_dot_git.exists() {
+        fs::remove_file(&sub_dot_git).unwrap();
+    }
+    run("git", &["add", "--", "sub/keep.txt"], &super_gm);
+    gm_backend
+        .commit_files(&["sub/keep.txt".to_string()], "convert sub to normal dir")
+        .unwrap();
+    let ls_tree_out = std::process::Command::new("git")
+        .args(["ls-tree", "HEAD", "--", "sub/keep.txt"])
+        .current_dir(&super_gm)
+        .output()
+        .unwrap();
+    let ls_tree_str = String::from_utf8_lossy(&ls_tree_out.stdout);
+    assert!(
+        ls_tree_str.starts_with("100644 blob "),
+        "sub/keep.txt should be committed as regular file in HEAD, got: {:?}",
+        ls_tree_str
+    );
+
+    // (j) First-time submodule NEVER committed to HEAD (`git submodule add` followed by removing
+    //     `.gitmodules` & `git rm --cached sub` while `sub/.git` remains on disk):
+    //     `revert_files(&["sub/keep.txt"])` MUST error and leave `sub/keep.txt` intact.
+    let super_uncomm = tmp.path().join("super_uncomm_sub");
+    fs::create_dir_all(&super_uncomm).unwrap();
+    run("git", &["init"], &super_uncomm);
+    run("git", &["config", "user.email", "t@example.com"], &super_uncomm);
+    run("git", &["config", "user.name", "Tester"], &super_uncomm);
+    fs::write(super_uncomm.join("root.txt"), "root\n").unwrap();
+    run("git", &["add", "root.txt"], &super_uncomm);
+    run("git", &["commit", "-m", "root init"], &super_uncomm);
+    run(
+        "git",
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_gm_src.to_str().unwrap(),
+            "sub",
+        ],
+        &super_uncomm,
+    );
+    // Notice `sub` was NEVER committed to HEAD! Now remove both `.gitmodules` and staged `sub`.
+    fs::write(super_uncomm.join("sub/keep.txt"), "uncommitted-sub-v2\n").unwrap();
+    run("git", &["rm", "--cached", "-f", "sub"], &super_uncomm);
+    fs::remove_file(super_uncomm.join(".gitmodules")).unwrap();
+    let uncomm_sub_backend = vcs::open_vcs(&super_uncomm, Some(VcsKind::Git)).unwrap();
+    assert!(
+        uncomm_sub_backend
+            .revert_files(&["sub/keep.txt".to_string()])
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(super_uncomm.join("sub/keep.txt")).unwrap(),
+        "uncommitted-sub-v2\n"
+    );
+
+    // (k) Legacy v1 empty SVN historical cache is ignored by v2 cache key and re-fetched with full bytes
+    let svn_cache_repo = tmp.path().join("svn_cache_v2_repo");
+    let svn_cache_wc = tmp.path().join("svn_cache_v2_wc");
+    fs::create_dir_all(&svn_cache_repo).unwrap();
+    run("svnadmin", &["create", svn_cache_repo.to_str().unwrap()], tmp.path());
+    let svn_cache_url = format!("file://{}", svn_cache_repo.display());
+    run(
+        "svn",
+        &["checkout", &svn_cache_url, svn_cache_wc.to_str().unwrap()],
+        tmp.path(),
+    );
+    fs::write(svn_cache_wc.join("f.txt"), "old-line\n").unwrap();
+    run("svn", &["add", "f.txt"], &svn_cache_wc);
+    run("svn", &["commit", "-m", "r1"], &svn_cache_wc);
+    fs::write(svn_cache_wc.join("f.txt"), "new-line\n").unwrap();
+    run("svn", &["commit", "-m", "r2"], &svn_cache_wc);
+    let svn_cache_backend = vcs::open_vcs(&svn_cache_wc, Some(VcsKind::Svn)).unwrap();
+    let fake_home = tmp.path().join("fake_home_cache");
+    fs::create_dir_all(&fake_home).unwrap();
+    {
+        struct EnvReset(Option<std::ffi::OsString>);
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    if let Some(prev) = self.0.take() {
+                        std::env::set_var("CODEDUCK_HOME", prev);
+                    } else {
+                        std::env::remove_var("CODEDUCK_HOME");
+                    }
+                }
+            }
+        }
+        let _env_guard = CODEDUCK_HOME_LOCK.lock().unwrap();
+        let _env_reset = EnvReset(std::env::var_os("CODEDUCK_HOME"));
+        unsafe {
+            std::env::set_var("CODEDUCK_HOME", &fake_home);
+        }
+        // Seed a legacy v1 (empty old_content/new_content) cache file under the pre-v2 key.
+        use sha2::{Digest, Sha256};
+        let canon_target = svn_cache_backend
+            .resolve_immutable_target(&DiffTarget::Commit("r2".to_string()))
+            .unwrap();
+        let target_str = match &canon_target {
+            DiffTarget::Commit(r) => format!("commit:{}", r),
+            _ => unreachable!(),
+        };
+        let mut hasher = Sha256::new();
+        for part in [
+            svn_cache_backend.kind().to_string(),
+            svn_cache_backend.cache_identity(),
+            svn_cache_backend.scope_dir().to_string_lossy().into_owned(),
+            target_str,
+            String::new(),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\n");
+        }
+        let legacy_key = format!("{:x}", hasher.finalize());
+        let legacy_path = fake_home
+            .join("cache")
+            .join("history_diffs")
+            .join(format!("{}.json", legacy_key));
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let legacy_bundle = codeduck::vcs::DiffBundle {
+            vcs: VcsKind::Svn,
+            repo_root: svn_cache_backend.repo_root().to_path_buf(),
+            path_base_dir: svn_cache_backend.scope_dir().to_path_buf(),
+            target: canon_target,
+            commit_info: None,
+            changes: vec![codeduck::model::FileChange {
+                path: "f.txt".to_string(),
+                old_path: None,
+                kind: codeduck::model::ChangeKind::Modified,
+                old_content: None,
+                new_content: None,
+                old_size: None,
+                new_size: None,
+                is_binary: false,
+                prop_changes: None,
+            }],
+        };
+        fs::write(&legacy_path, serde_json::to_vec(&legacy_bundle).unwrap()).unwrap();
+
+        let fresh_r2 = vcs::collect_changes_cached(
+            svn_cache_backend.as_ref(),
+            &DiffTarget::Commit("r2".to_string()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fresh_r2.changes[0].old_content.as_deref(), Some(b"old-line\n".as_slice()));
+        assert_eq!(fresh_r2.changes[0].new_content.as_deref(), Some(b"new-line\n".as_slice()));
+    }
+
+    // (l) `AiPicker -> Off` updates `config.ai_provider = "none"` and Settings switch bumps `ai_generation`
+    let mut cfg_off = AppConfig::default();
+    cfg_off.ai_provider = "mock".to_string();
+    let mut app_off = App::new(gm_backend, cfg_off, DiffTarget::Uncommitted, 120).unwrap();
+    let gen_before_off = app_off.ai_generation;
+    app_off.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
+    app_off.ai_picker_cursor = app_off.available_providers.len();
+    app_off.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app_off.active_ai_provider_id, "none");
+    assert_eq!(app_off.config.ai_provider, "none");
+    assert!(app_off.ai_generation > gen_before_off);
+
+    // (m) AI worker refreshes stale `ignore_comments` metadata before prompting provider
+    let ig_ai_repo = tmp.path().join("ig_ai_repo");
+    fs::create_dir_all(&ig_ai_repo).unwrap();
+    run("git", &["init"], &ig_ai_repo);
+    run("git", &["config", "user.email", "t@example.com"], &ig_ai_repo);
+    run("git", &["config", "user.name", "Tester"], &ig_ai_repo);
+    fs::write(
+        ig_ai_repo.join("code.rs"),
+        "fn f() -> i32 { 1 }\nfn p1() {}\nfn p2() {}\nfn p3() {}\nfn p4() {}\n",
+    )
+    .unwrap();
+    fs::write(ig_ai_repo.join("z_other.rs"), "fn other() -> i32 { 1 }\n").unwrap();
+    run("git", &["add", "code.rs", "z_other.rs"], &ig_ai_repo);
+    run("git", &["commit", "-m", "base"], &ig_ai_repo);
+    fs::write(
+        ig_ai_repo.join("code.rs"),
+        "fn f() -> i32 { 42 }\nfn p1() {}\nfn p2() {}\nfn p3() {}\nfn p4() {}\n// COMMENT_ONLY_SENTINEL\n",
+    )
+    .unwrap();
+    fs::write(ig_ai_repo.join("z_other.rs"), "fn other() -> i32 { 2 }\n").unwrap();
+
+    let prompt_dump = tmp.path().join("ai_prompt_dump.txt");
+    let mock_prompt_ai = tmp.path().join("mock_prompt_ai.sh");
+    fs::write(
+        &mock_prompt_ai,
+        format!(
+            r#"#!/bin/sh
+cat >> "{dump}"
+echo '{{
+  "summary": "ok",
+  "overall_risk": "low",
+  "groups": [{{"id":"g1","title":"Code","description":"d","risk":"low","file_paths":["code.rs"]}}],
+  "files": [{{"path":"code.rs","risk":"low","summary":"code change"}}],
+  "hunks": [],
+  "findings": []
+}}'
+"#,
+            dump = prompt_dump.display()
+        ),
+    )
+    .unwrap();
+    let mut mp_perms = fs::metadata(&mock_prompt_ai).unwrap().permissions();
+    mp_perms.set_mode(0o755);
+    fs::set_permissions(&mock_prompt_ai, mp_perms).unwrap();
+
+    let ig_backend = vcs::open_vcs(&ig_ai_repo, Some(VcsKind::Git)).unwrap();
+    let mut cfg_ig = AppConfig::default();
+    cfg_ig.ai_provider = "mock-ig".to_string();
+    cfg_ig.ignore_comments = false;
+    cfg_ig.cache_ai_results = false;
+    cfg_ig.custom_ai.push(CustomAiConfig {
+        name: "mock-ig".to_string(),
+        command: mock_prompt_ai.to_string_lossy().to_string(),
+        args: vec![],
+    });
+    let mut app_ig = App::new(ig_backend, cfg_ig, DiffTarget::Uncommitted, 120).unwrap();
+    for _ in 0..80 {
+        app_ig.poll_background();
+        if !app_ig.ai_running && !app_ig.ai_deep_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!app_ig.ai_running && !app_ig.ai_deep_running);
+    assert!(!app_ig.rendered_diffs[0].rendered_ignore_comments);
+    assert!(app_ig.rendered_diffs[0].json.is_some());
+    assert!(
+        fs::read_to_string(&prompt_dump)
+            .unwrap()
+            .contains("COMMENT_ONLY_SENTINEL")
+    );
+    fs::write(&prompt_dump, "").unwrap();
+    // Simulate `ignore_comments = true` on `difft_engine` while `rendered_diffs` still carries
+    // stale `rendered_ignore_comments = false` metadata, then immediately run AI via `trigger_ai_analysis`.
+    app_ig.config.ignore_comments = true;
+    app_ig.difft_engine = std::sync::Arc::new(
+        DifftEngine::new(&app_ig.config.difft_bin, true).unwrap(),
+    );
+    app_ig.trigger_ai_analysis(true);
+    for _ in 0..80 {
+        app_ig.poll_background();
+        if !app_ig.ai_running && !app_ig.ai_deep_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!app_ig.ai_running && !app_ig.ai_deep_running);
+    let sent_prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(sent_prompt.contains("42"), "prompt={}", sent_prompt);
+    assert!(
+        !sent_prompt.contains("COMMENT_ONLY_SENTINEL"),
+        "stale comment hunk leaked into AI prompt: {}",
+        sent_prompt
+    );
+    assert!(app_ig.rendered_diffs[0].json_ignore_comments);
+    // `DiffJsonReady` must NOT stamp ANSI as updated before `DiffReRendered` runs!
+    assert!(!app_ig.rendered_diffs[0].rendered_ignore_comments);
+
+    // Partial commit of `z_other.rs` retains `code.rs` and triggers same-width/same-mode re-render;
+    // because ANSI tracking is independent, `code.rs` is NOT skipped and visible text updates.
+    app_ig.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+    for f in &mut app_ig.commit_files {
+        f.included = f.path == "z_other.rs";
+    }
+    app_ig.commit_main.message = "commit z_other.rs".to_string();
+    app_ig.commit_main.dirty = true;
+    app_ig.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app_ig.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    for _ in 0..80 {
+        app_ig.poll_background();
+        if !app_ig.commit_executing && app_ig.rendered_diffs.len() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(app_ig.rendered_diffs.len(), 1);
+    for _ in 0..80 {
+        app_ig.poll_background();
+        if app_ig.rendered_diffs[0].rendered_ignore_comments {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(app_ig.rendered_diffs[0].rendered_ignore_comments);
+    let visible_ansi = codeduck::difft::strip_ansi_escapes(&app_ig.rendered_diffs[0].ansi_output);
+    assert!(
+        !visible_ansi.contains("COMMENT_ONLY_SENTINEL"),
+        "stale ANSI comment leaked after re-render: {}",
+        visible_ansi
+    );
+    let parsed_visible: String = app_ig.parsed_texts[0]
+        .lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !parsed_visible.contains("COMMENT_ONLY_SENTINEL"),
+        "stale parsed_texts leaked after re-render: {}",
+        parsed_visible
+    );
+
+    // (n) Re-render where old JSON was `Some` and new JSON under `ignore_comments = true` is `None`
+    //     clears stale JSON, hunks_meta, and structural chunk summaries.
+    let comment_only_repo = tmp.path().join("comment_only_rerender");
+    fs::create_dir_all(&comment_only_repo).unwrap();
+    run("git", &["init"], &comment_only_repo);
+    run("git", &["config", "user.email", "t@example.com"], &comment_only_repo);
+    run("git", &["config", "user.name", "Tester"], &comment_only_repo);
+    fs::write(comment_only_repo.join("c.rs"), "fn pure() {}\n").unwrap();
+    run("git", &["add", "c.rs"], &comment_only_repo);
+    run("git", &["commit", "-m", "base"], &comment_only_repo);
+    fs::write(
+        comment_only_repo.join("c.rs"),
+        "fn pure() {}\n// PURE_COMMENT_CHANGE\n",
+    )
+    .unwrap();
+    // Wrap `difft` so `--display json` + `--ignore-comments` yields empty stdout (`json == None`),
+    // covering the exact "old JSON = Some, new JSON = None" path in `DiffReRendered`.
+    let wrap_difft = tmp.path().join("wrap_difft.sh");
+    fs::write(
+        &wrap_difft,
+        r#"#!/bin/sh
+has_json=0
+has_ig=0
+for arg in "$@"; do
+  [ "$arg" = "json" ] && has_json=1
+  [ "$arg" = "--ignore-comments" ] && has_ig=1
+done
+if [ "$has_json" = "1" ] && [ "$has_ig" = "1" ]; then
+  exit 0
+fi
+exec difft "$@"
+"#,
+    )
+    .unwrap();
+    let mut wd_perms = fs::metadata(&wrap_difft).unwrap().permissions();
+    wd_perms.set_mode(0o755);
+    fs::set_permissions(&wrap_difft, wd_perms).unwrap();
+
+    let co_backend = vcs::open_vcs(&comment_only_repo, Some(VcsKind::Git)).unwrap();
+    let mut cfg_co = AppConfig::default();
+    cfg_co.difft_bin = wrap_difft.to_string_lossy().to_string();
+    cfg_co.ai_provider = "mock-co".to_string();
+    cfg_co.ignore_comments = false;
+    cfg_co.cache_ai_results = false;
+    cfg_co.custom_ai.push(CustomAiConfig {
+        name: "mock-co".to_string(),
+        command: mock_prompt_ai.to_string_lossy().to_string(),
+        args: vec![],
+    });
+    let mut app_co = App::new(co_backend, cfg_co, DiffTarget::Uncommitted, 120).unwrap();
+    for _ in 0..80 {
+        app_co.poll_background();
+        if !app_co.ai_running && !app_co.ai_deep_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(app_co.rendered_diffs[0].json.is_some());
+    assert!(
+        app_co.rendered_diffs[0]
+            .hunks_meta
+            .iter()
+            .any(|h| h.start_line.is_some())
+    );
+    assert!(
+        app_co.rendered_diffs[0]
+            .ai_summary_diff
+            .contains("@@ Chunk")
+    );
+    // Toggle ignore_comments via Settings row 4 and wait for background DiffReRendered.
+    app_co.handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE));
+    for _ in 0..4 {
+        app_co.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    app_co.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app_co.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    for _ in 0..80 {
+        app_co.poll_background();
+        if app_co.rendered_diffs[0].rendered_ignore_comments {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(app_co.rendered_diffs[0].rendered_ignore_comments);
+    assert!(
+        app_co.rendered_diffs[0].json.is_none(),
+        "stale JSON resurrected after ignore_comments = true"
+    );
+    assert!(
+        app_co.rendered_diffs[0]
+            .hunks_meta
+            .iter()
+            .all(|h| h.start_line.is_none() && h.end_line.is_none()),
+        "hunks_meta unexpectedly inherited stale JSON ranges: {:?}",
+        app_co.rendered_diffs[0].hunks_meta
+    );
+    assert!(
+        !app_co.rendered_diffs[0]
+            .ai_summary_diff
+            .contains("@@ Chunk")
+    );
+    // Also trigger AI directly in `(n)` and confirm empty-JSON fallback omits `PURE_COMMENT_CHANGE`.
+    fs::write(&prompt_dump, "").unwrap();
+    app_co.trigger_ai_analysis(true);
+    for _ in 0..80 {
+        app_co.poll_background();
+        if !app_co.ai_running && !app_co.ai_deep_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!app_co.ai_running && !app_co.ai_deep_running);
+    let co_prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(
+        !co_prompt.contains("PURE_COMMENT_CHANGE"),
+        "pure comment change leaked into AI prompt on empty-JSON fallback: {}",
+        co_prompt
+    );
+
+    // (o) Files > 256 KiB under `ignore_comments = true` (where Difftastic falls back to text
+    //     mode `exceeded DFT_BYTE_LIMIT`) must still withhold comment lines from AI prompts.
+    let big_repo = tmp.path().join("big_comment_repo");
+    fs::create_dir_all(&big_repo).unwrap();
+    run("git", &["init"], &big_repo);
+    run("git", &["config", "user.email", "t@example.com"], &big_repo);
+    run("git", &["config", "user.name", "Tester"], &big_repo);
+    let mut big_base = String::with_capacity(340_000);
+    for i in 0..20_000 {
+        use std::fmt::Write;
+        let _ = writeln!(&mut big_base, "fn f_{}() {{}}", i);
+    }
+    let big_old = format!("{}// BEFORE_ONLY\n", big_base);
+    let big_new = format!("{}// AFTER_ONLY\n", big_base);
+    assert!(big_old.len() > 262_144);
+    fs::write(big_repo.join("big_comment.rs"), &big_old).unwrap();
+    run("git", &["add", "big_comment.rs"], &big_repo);
+    run("git", &["commit", "-m", "big base"], &big_repo);
+    fs::write(big_repo.join("big_comment.rs"), &big_new).unwrap();
+
+    fs::write(&prompt_dump, "").unwrap();
+    let big_backend = vcs::open_vcs(&big_repo, Some(VcsKind::Git)).unwrap();
+    let mut cfg_big = AppConfig::default();
+    cfg_big.ai_provider = "mock-big".to_string();
+    cfg_big.ignore_comments = true;
+    cfg_big.cache_ai_results = false;
+    cfg_big.custom_ai.push(CustomAiConfig {
+        name: "mock-big".to_string(),
+        command: mock_prompt_ai.to_string_lossy().to_string(),
+        args: vec![],
+    });
+    let mut app_big = App::new(big_backend, cfg_big, DiffTarget::Uncommitted, 120).unwrap();
+    for _ in 0..80 {
+        app_big.poll_background();
+        if !app_big.ai_running && !app_big.ai_deep_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!app_big.ai_running && !app_big.ai_deep_running);
+    let big_prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(
+        big_prompt.contains("big_comment.rs"),
+        "expected big_comment.rs in prompt, got: {}",
+        big_prompt
+    );
+    assert!(
+        !big_prompt.contains("BEFORE_ONLY") && !big_prompt.contains("AFTER_ONLY"),
+        "comments leaked from >256KiB text-fallback diff into AI prompt: {}",
+        big_prompt
+    );
+
+    // (p) Small (< 256 KiB) file whose syntax parse errors exceed DFT_PARSE_ERROR_LIMIT (so JSON
+    //     sets language = "Text (...)" while still returning non-empty `chunks`) must also withhold
+    //     comment lines when `ignore_comments = true`.
+    let pe_repo = tmp.path().join("parse_err_comment_repo");
+    fs::create_dir_all(&pe_repo).unwrap();
+    run("git", &["init"], &pe_repo);
+    run("git", &["config", "user.email", "t@example.com"], &pe_repo);
+    run("git", &["config", "user.name", "Tester"], &pe_repo);
+    let pe_base = "let = ;\n".repeat(60);
+    let pe_old = format!("{}// BEFORE_ONLY\n", pe_base);
+    let pe_new = format!("{}// AFTER_ONLY\n", pe_base);
+    assert!(pe_old.len() < 262_144);
+    fs::write(pe_repo.join("parse_err.rs"), &pe_old).unwrap();
+    run("git", &["add", "parse_err.rs"], &pe_repo);
+    run("git", &["commit", "-m", "parse err base"], &pe_repo);
+    fs::write(pe_repo.join("parse_err.rs"), &pe_new).unwrap();
+
+    fs::write(&prompt_dump, "").unwrap();
+    let pe_backend = vcs::open_vcs(&pe_repo, Some(VcsKind::Git)).unwrap();
+    let mut cfg_pe = AppConfig::default();
+    cfg_pe.ai_provider = "mock-pe".to_string();
+    cfg_pe.ignore_comments = true;
+    cfg_pe.cache_ai_results = false;
+    cfg_pe.custom_ai.push(CustomAiConfig {
+        name: "mock-pe".to_string(),
+        command: mock_prompt_ai.to_string_lossy().to_string(),
+        args: vec![],
+    });
+    let mut app_pe = App::new(pe_backend, cfg_pe, DiffTarget::Uncommitted, 120).unwrap();
+    for _ in 0..80 {
+        app_pe.poll_background();
+        if !app_pe.ai_running && !app_pe.ai_deep_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!app_pe.ai_running && !app_pe.ai_deep_running);
+    let pe_prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(
+        pe_prompt.contains("parse_err.rs"),
+        "expected parse_err.rs in prompt, got: {}",
+        pe_prompt
+    );
+    assert!(
+        !pe_prompt.contains("BEFORE_ONLY") && !pe_prompt.contains("AFTER_ONLY"),
+        "comments leaked from DFT_PARSE_ERROR_LIMIT text fallback JSON chunks into AI prompt: {}",
+        pe_prompt
+    );
 }

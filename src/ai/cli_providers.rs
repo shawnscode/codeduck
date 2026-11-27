@@ -67,10 +67,9 @@ enum CliStreamEvent {
     StderrLine(String),
 }
 
-fn read_lossy_lines<R: std::io::Read, F: FnMut(String)>(pipe: Option<R>, mut on_line: F) -> String {
-    let mut all = String::new();
+fn read_lossy_lines<R: std::io::Read, F: FnMut(String)>(pipe: Option<R>, mut on_line: F) {
     let Some(r) = pipe else {
-        return all;
+        return;
     };
     let mut reader = BufReader::new(r);
     let mut buf = Vec::with_capacity(1024);
@@ -83,14 +82,25 @@ fn read_lossy_lines<R: std::io::Read, F: FnMut(String)>(pipe: Option<R>, mut on_
                     buf.pop();
                 }
                 let line = String::from_utf8_lossy(&buf).into_owned();
-                all.push_str(&line);
-                all.push('\n');
                 on_line(line);
             }
             Err(_) => break,
         }
     }
-    all
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn run_with_stdin(
@@ -114,12 +124,18 @@ fn run_with_stdin_streaming<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let mut child = Command::new(bin)
-        .args(args)
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .current_dir(work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn local AI CLI `{}`", bin))?;
 
@@ -135,60 +151,76 @@ where
     let (tx, rx) = mpsc::channel::<CliStreamEvent>();
 
     let tx_out = tx.clone();
-    let out_handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         read_lossy_lines(stdout_pipe, |line| {
             let _ = tx_out.send(CliStreamEvent::StdoutLine(line));
-        })
+        });
     });
 
     let tx_err = tx;
-    let err_handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         read_lossy_lines(stderr_pipe, |line| {
             let _ = tx_err.send(CliStreamEvent::StderrLine(line));
-        })
+        });
     });
 
     let mut collected_stdout = String::new();
+    let mut collected_stderr = String::new();
     let mut terminal_result_at: Option<Instant> = None;
 
-    let drain_events = |stderr_hook: bool,
+    let handle_event = |ev: CliStreamEvent,
+                        stderr_hook: bool,
                         on_line: &mut F,
-                        acc: &mut String,
+                        out_acc: &mut String,
+                        err_acc: &mut String,
                         done_at: &mut Option<Instant>| {
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                CliStreamEvent::StdoutLine(line) => {
-                    acc.push_str(&line);
-                    acc.push('\n');
-                    if on_line(&line) && done_at.is_none() {
-                        *done_at = Some(Instant::now());
-                    }
+        match ev {
+            CliStreamEvent::StdoutLine(line) => {
+                out_acc.push_str(&line);
+                out_acc.push('\n');
+                if on_line(&line) && done_at.is_none() {
+                    *done_at = Some(Instant::now());
                 }
-                CliStreamEvent::StderrLine(line) => {
-                    if stderr_hook {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            let clipped: String = trimmed.chars().take(160).collect();
-                            emit_progress(AiProgressUpdate::LogLine(clipped));
-                        }
+            }
+            CliStreamEvent::StderrLine(line) => {
+                if err_acc.len() < 64 * 1024 {
+                    err_acc.push_str(&line);
+                    err_acc.push('\n');
+                }
+                if stderr_hook {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        let clipped: String = trimmed.chars().take(160).collect();
+                        emit_progress(AiProgressUpdate::LogLine(clipped));
                     }
                 }
             }
         }
     };
 
+    let drain_ready = |stderr_hook: bool,
+                       on_line: &mut F,
+                       out_acc: &mut String,
+                       err_acc: &mut String,
+                       done_at: &mut Option<Instant>| {
+        while let Ok(ev) = rx.try_recv() {
+            handle_event(ev, stderr_hook, on_line, out_acc, err_acc, done_at);
+        }
+    };
+
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(5));
     let mut lingering_reap = false;
+    let mut pipes_open = true;
     let status = loop {
-        drain_events(
+        drain_ready(
             true,
             &mut on_stdout_line,
             &mut collected_stdout,
+            &mut collected_stderr,
             &mut terminal_result_at,
         );
         if crate::ai::is_current_task_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_tree(&mut child);
             bail!("`{}` cancelled", bin);
         }
         match child.try_wait()? {
@@ -199,43 +231,85 @@ where
                 // slow sidecar/telemetry teardown never stalls the UI after output is complete.
                 if terminal_result_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(250)) {
                     lingering_reap = true;
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     break None;
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     bail!("`{}` timed out after {}s", bin, timeout_secs);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let wait_slice = if let Some(t) = terminal_result_at {
+                    Duration::from_millis(250)
+                        .saturating_sub(t.elapsed())
+                        .min(Duration::from_millis(50))
+                } else {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50))
+                };
+                if pipes_open {
+                    match rx.recv_timeout(wait_slice) {
+                        Ok(ev) => handle_event(
+                            ev,
+                            true,
+                            &mut on_stdout_line,
+                            &mut collected_stdout,
+                            &mut collected_stderr,
+                            &mut terminal_result_at,
+                        ),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            pipes_open = false;
+                            std::thread::sleep(wait_slice);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                } else {
+                    std::thread::sleep(wait_slice);
+                }
             }
         }
     };
 
     if lingering_reap {
-        drain_events(
+        drain_ready(
             false,
             &mut on_stdout_line,
             &mut collected_stdout,
+            &mut collected_stderr,
             &mut terminal_result_at,
         );
         return Ok(collected_stdout);
     }
 
-    let stdout_text = out_handle.join().unwrap_or_default();
-    let stderr_text = err_handle.join().unwrap_or_default();
-    drain_events(
-        false,
-        &mut on_stdout_line,
-        &mut collected_stdout,
-        &mut terminal_result_at,
-    );
+    // Once the child has exited normally, give pipe reader threads a dedicated 2s drain window
+    // unclipped by the overall process timeout so late trailing lines are not dropped near deadline.
+    let pipe_drain_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if crate::ai::is_current_task_cancelled() {
+            bail!("`{}` cancelled", bin);
+        }
+        let rem = pipe_drain_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(rem.min(Duration::from_millis(25))) {
+            Ok(ev) => handle_event(
+                ev,
+                false,
+                &mut on_stdout_line,
+                &mut collected_stdout,
+                &mut collected_stderr,
+                &mut terminal_result_at,
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 
     if let Some(st) = status {
         if !st.success() {
-            let stderr = stderr_text.trim();
-            let stdout = stdout_text.trim();
+            let stderr = collected_stderr.trim();
+            let stdout = collected_stdout.trim();
             bail!(
                 "`{}` exited with status {}: {}{}",
                 bin,
@@ -246,7 +320,7 @@ where
         }
     }
 
-    Ok(stdout_text)
+    Ok(collected_stdout)
 }
 
 pub struct ClaudeCliProvider {

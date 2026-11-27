@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ai::{self, ProviderDescriptor};
 use crate::config::AppConfig;
-use crate::difft::{DifftEngine, parse_source_line_from_ansi};
+use crate::difft::{DifftEngine, parse_source_line_from_ansi_with_buf};
 use crate::i18n;
 use crate::ignore::IgnoreMatcher;
 use crate::model::{
@@ -200,8 +200,19 @@ pub enum BgMessage {
         diff_generation: u64,
         mode: DifftDisplayMode,
         width: u16,
-        rendered_diffs: Vec<FileDiffRendered>,
-        parsed_texts: Vec<Text<'static>>,
+        ignore_comments: bool,
+        updates: Vec<(usize, FileDiffRendered, Text<'static>)>,
+    },
+    DiffJsonReady {
+        diff_generation: u64,
+        ignore_comments: bool,
+        updates: Vec<(
+            usize,
+            String,
+            Option<crate::model::DifftJsonOutput>,
+            String,
+            Vec<crate::model::HunkMeta>,
+        )>,
     },
     AiAnalysisProgress {
         generation: u64,
@@ -251,6 +262,101 @@ pub struct QaEntry {
     pub answer: String,
 }
 
+/// Unified state for one commit message target (main repo vs external/submodule repo).
+pub struct CommitMsgSlot {
+    pub message: String,
+    pub cursor: usize,
+    pub dirty: bool,
+    pub generating: bool,
+    pub needs_regen: bool,
+    pub started_at: Option<Instant>,
+    pub progress_stage: String,
+    pub stream_logs: Vec<String>,
+    pub stream_thinking: String,
+    pub stream_text: String,
+    pub generation: u64,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+impl Default for CommitMsgSlot {
+    fn default() -> Self {
+        Self {
+            message: String::new(),
+            cursor: 0,
+            dirty: false,
+            generating: false,
+            needs_regen: false,
+            started_at: None,
+            progress_stage: String::new(),
+            stream_logs: Vec::new(),
+            stream_thinking: String::new(),
+            stream_text: String::new(),
+            generation: 0,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl CommitMsgSlot {
+    pub fn has_stream_activity(&self) -> bool {
+        self.generating
+            || !self.stream_logs.is_empty()
+            || !self.stream_thinking.is_empty()
+            || !self.stream_text.is_empty()
+    }
+
+    fn cancel_task(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+        self.cancel_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    fn stop_and_bump(&mut self) {
+        self.generation += 1;
+        self.cancel_task();
+        self.generating = false;
+        self.started_at = None;
+    }
+
+    fn clear_runtime(&mut self) {
+        self.stop_and_bump();
+        self.progress_stage.clear();
+        self.stream_logs.clear();
+        self.stream_thinking.clear();
+        self.stream_text.clear();
+    }
+
+    fn apply_cached(&mut self, msg: String, stage: String) {
+        self.stop_and_bump();
+        self.dirty = false;
+        self.needs_regen = false;
+        self.progress_stage = stage;
+        self.stream_logs.clear();
+        self.stream_thinking.clear();
+        self.stream_text.clear();
+        self.message = msg;
+        self.cursor = self.message.len();
+    }
+
+    fn set_message(&mut self, msg: String) {
+        self.message = msg;
+        self.cursor = self.message.len();
+    }
+
+    fn begin_generation(&mut self, prep_stage: String) -> (u64, Arc<AtomicBool>) {
+        self.cancel_task();
+        self.generation += 1;
+        self.generating = true;
+        self.started_at = Some(Instant::now());
+        self.progress_stage = prep_stage;
+        self.stream_logs.clear();
+        self.stream_thinking.clear();
+        self.stream_text.clear();
+        self.dirty = false;
+        self.needs_regen = false;
+        (self.generation, Arc::clone(&self.cancel_flag))
+    }
+}
+
 pub struct App {
     pub vcs: Arc<dyn VcsBackend>,
     pub config: AppConfig,
@@ -263,6 +369,7 @@ pub struct App {
     pub diff_loading: bool,
     pub diff_generation: u64,
     pub rerender_generation: u64,
+    rerender_cancel_seq: Arc<AtomicU64>,
     pub pending_rerender_at: Option<Instant>,
     pub diff_error: Option<String>,
 
@@ -318,33 +425,11 @@ pub struct App {
     pub commit_groups: Vec<CommitGroupSection>,
     pub commit_rows: Vec<CommitListRow>,
     pub commit_files_cursor: usize,
-    pub commit_message: String,
-    pub commit_msg_cursor: usize,
-    pub commit_msg_dirty: bool,
     pub commit_modal_focus: CommitModalFocus,
     pub commit_editing_msg: bool,
-    pub commit_msg_generating: bool,
-    pub commit_msg_needs_regen: bool,
-    pub commit_started_at: Option<Instant>,
-    pub commit_progress_stage: String,
-    pub commit_stream_logs: Vec<String>,
-    pub commit_stream_thinking: String,
-    pub commit_stream_text: String,
     pub commit_executing: bool,
-    pub commit_generation: u64,
-    pub commit_cancel_flag: Arc<AtomicBool>,
-    pub ext_commit_message: String,
-    pub ext_commit_msg_cursor: usize,
-    pub ext_commit_msg_dirty: bool,
-    pub ext_commit_msg_generating: bool,
-    pub ext_commit_msg_needs_regen: bool,
-    pub ext_commit_started_at: Option<Instant>,
-    pub ext_commit_progress_stage: String,
-    pub ext_commit_stream_logs: Vec<String>,
-    pub ext_commit_stream_thinking: String,
-    pub ext_commit_stream_text: String,
-    pub ext_commit_generation: u64,
-    pub ext_commit_cancel_flag: Arc<AtomicBool>,
+    pub commit_main: CommitMsgSlot,
+    pub commit_ext: CommitMsgSlot,
     pub pending_commit_regen_at: Option<Instant>,
     pub commit_msg_cache: HashMap<String, String>,
     pub commit_error: Option<String>,
@@ -373,6 +458,7 @@ pub struct App {
     pub pending_key: Option<char>,
     pub status_message: String,
     pub should_quit: bool,
+    pub dirty: bool,
 
     pub settings_cursor: usize,
     pub settings_status: Option<String>,
@@ -384,22 +470,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
+    fn build_base(
         vcs: Arc<dyn VcsBackend>,
         config: AppConfig,
-        target: DiffTarget,
-        initial_width: u16,
-    ) -> anyhow::Result<Self> {
-        let difft_engine = Arc::new(DifftEngine::new(&config.difft_bin, config.ignore_comments)?);
-        let matcher = IgnoreMatcher::load(vcs.repo_root(), vcs.scope_dir());
-        let bundle = vcs.collect_changes_filtered(&target, Some(&matcher))?;
-
+        difft_engine: Arc<DifftEngine>,
+        bundle: DiffBundle,
+        rendered_diffs: Vec<FileDiffRendered>,
+        parsed_texts: Vec<Text<'static>>,
+        path_to_index: HashMap<String, usize>,
+        cached_external_prefixes: Vec<String>,
+        diff_pane_width: u16,
+        status_message: String,
+    ) -> Self {
         let display_mode = config.display_mode;
-        let diff_pane_width = initial_width.saturating_sub(44).max(40);
-
-        let (rendered_diffs, parsed_texts, path_to_index) =
-            render_all_files(&difft_engine, &bundle, display_mode, diff_pane_width)?;
-
         let available_providers = ai::detect_available_providers(&config);
         let active_ai_provider_id = config.ai_provider.clone();
         let active_ai_session_id = if config.reuse_session {
@@ -408,11 +491,9 @@ impl App {
             None
         };
         let (bg_tx, bg_rx) = mpsc::channel();
-        let ui_locale = config.ui_language.clone();
         let selected_file_idx = (!rendered_diffs.is_empty()).then_some(0);
-        let cached_external_prefixes = vcs.external_prefixes();
 
-        let mut app = Self {
+        Self {
             vcs,
             config,
             bundle,
@@ -424,6 +505,7 @@ impl App {
             diff_loading: false,
             diff_generation: 0,
             rerender_generation: 0,
+            rerender_cancel_seq: Arc::new(AtomicU64::new(0)),
             pending_rerender_at: None,
             diff_error: None,
             display_mode,
@@ -472,33 +554,11 @@ impl App {
             commit_groups: Vec::new(),
             commit_rows: Vec::new(),
             commit_files_cursor: 0,
-            commit_message: String::new(),
-            commit_msg_cursor: 0,
-            commit_msg_dirty: false,
             commit_modal_focus: CommitModalFocus::Files,
             commit_editing_msg: false,
-            commit_msg_generating: false,
-            commit_msg_needs_regen: false,
-            commit_started_at: None,
-            commit_progress_stage: String::new(),
-            commit_stream_logs: Vec::new(),
-            commit_stream_thinking: String::new(),
-            commit_stream_text: String::new(),
             commit_executing: false,
-            commit_generation: 0,
-            commit_cancel_flag: Arc::new(AtomicBool::new(false)),
-            ext_commit_message: String::new(),
-            ext_commit_msg_cursor: 0,
-            ext_commit_msg_dirty: false,
-            ext_commit_msg_generating: false,
-            ext_commit_msg_needs_regen: false,
-            ext_commit_started_at: None,
-            ext_commit_progress_stage: String::new(),
-            ext_commit_stream_logs: Vec::new(),
-            ext_commit_stream_thinking: String::new(),
-            ext_commit_stream_text: String::new(),
-            ext_commit_generation: 0,
-            ext_commit_cancel_flag: Arc::new(AtomicBool::new(false)),
+            commit_main: CommitMsgSlot::default(),
+            commit_ext: CommitMsgSlot::default(),
             pending_commit_regen_at: None,
             commit_msg_cache: HashMap::new(),
             commit_error: None,
@@ -521,17 +581,59 @@ impl App {
             help_scroll_y: 0,
             pending_commits_force_refresh: false,
             pending_key: None,
-            status_message: rust_i18n::t!("status.startup_hint", locale = ui_locale.as_str())
-                .into_owned(),
+            status_message,
             should_quit: false,
+            dirty: true,
             settings_cursor: 0,
             settings_status: None,
             settings_ai_dirty: false,
             config_path_override: None,
             bg_rx,
             bg_tx,
-        };
+        }
+    }
 
+    pub fn new(
+        vcs: Arc<dyn VcsBackend>,
+        config: AppConfig,
+        target: DiffTarget,
+        initial_width: u16,
+    ) -> anyhow::Result<Self> {
+        let difft_engine = Arc::new(DifftEngine::new(&config.difft_bin, config.ignore_comments)?);
+        let matcher = IgnoreMatcher::load(vcs.repo_root(), vcs.scope_dir());
+        let bundle = crate::vcs::collect_changes_cached(
+            &*vcs,
+            &target,
+            Some(&matcher),
+            config.cache_history,
+            false,
+        )?;
+        let diff_pane_width = initial_width.saturating_sub(44).max(40);
+        let need_json = !config.ai_provider.eq_ignore_ascii_case("none")
+            && !config.ai_provider.eq_ignore_ascii_case("off");
+        let (rendered_diffs, parsed_texts, path_to_index) = render_all_files(
+            &difft_engine,
+            &bundle,
+            config.display_mode,
+            diff_pane_width,
+            need_json,
+        )?;
+        let cached_external_prefixes = vcs.external_prefixes();
+        let status_message =
+            rust_i18n::t!("status.startup_hint", locale = config.ui_language.as_str()).into_owned();
+
+        let mut app = Self::build_base(
+            vcs,
+            config,
+            difft_engine,
+            bundle,
+            rendered_diffs,
+            parsed_texts,
+            path_to_index,
+            cached_external_prefixes,
+            diff_pane_width,
+            status_message,
+        );
         app.rebuild_tree_and_continuous();
         app.trigger_ai_analysis(false);
         Ok(app)
@@ -545,18 +647,7 @@ impl App {
         initial_width: u16,
     ) -> anyhow::Result<Self> {
         let difft_engine = Arc::new(DifftEngine::new(&config.difft_bin, config.ignore_comments)?);
-        let display_mode = config.display_mode;
         let diff_pane_width = initial_width.saturating_sub(44).max(40);
-        let available_providers = ai::detect_available_providers(&config);
-        let active_ai_provider_id = config.ai_provider.clone();
-        let active_ai_session_id = if config.reuse_session {
-            config.ai_sessions.get(&active_ai_provider_id).cloned()
-        } else {
-            None
-        };
-        let ui_locale = config.ui_language.clone();
-        let (bg_tx, bg_rx) = mpsc::channel();
-
         let empty_bundle = DiffBundle {
             vcs: vcs.kind(),
             repo_root: vcs.repo_root().to_path_buf(),
@@ -565,133 +656,55 @@ impl App {
             commit_info: None,
             changes: Vec::new(),
         };
+        let status_message =
+            rust_i18n::t!("status.loading_diff", locale = config.ui_language.as_str()).into_owned();
 
-        let mut app = Self {
+        let mut app = Self::build_base(
             vcs,
             config,
-            bundle: empty_bundle,
             difft_engine,
-            rendered_diffs: Vec::new(),
-            path_to_index: HashMap::new(),
-            parsed_texts: Vec::new(),
-            continuous: ContinuousDiff::default(),
-            diff_loading: false,
-            diff_generation: 0,
-            rerender_generation: 0,
-            pending_rerender_at: None,
-            diff_error: None,
-            display_mode,
-            focus: PaneFocus::Diff,
-            tree_mode: TreeMode::FlatFiles,
-            user_forced_flat_tree: false,
-            input_mode: InputMode::Normal,
-            overlay: OverlayKind::None,
-            show_sidebar: true,
-            show_inspector: false,
-            tree_rows: Vec::new(),
-            tree_cursor: 0,
-            selected_file_idx: None,
-            diff_cursor_y: 0,
-            diff_scroll_y: 0,
-            diff_scroll_x: 0,
+            empty_bundle,
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
             diff_pane_width,
-            diff_pane_height: 24,
-            ai_review: None,
-            ai_running: false,
-            ai_deep_running: false,
-            ai_started_at: None,
-            ai_progress_stage: String::new(),
-            ai_stream_logs: Vec::new(),
-            ai_stream_thinking: String::new(),
-            ai_stream_text: String::new(),
-            ai_error: None,
-            ai_generation: 0,
-            ai_stage1_completed_gen: 0,
-            ai_session_epoch: 0,
-            ai_followup_generation: 0,
-            ai_cancel_flag: Arc::new(AtomicBool::new(false)),
-            ai_followup_cancel_flag: Arc::new(AtomicBool::new(false)),
-            bypass_next_ai_cache: false,
-            active_ai_provider_id,
-            resolved_ai_provider_id: None,
-            active_ai_session_id,
-            available_providers,
-            ai_picker_cursor: 0,
-            cached_external_prefixes: Vec::new(),
-            pending_status_override: None,
-            commits_cache: Vec::new(),
-            commits_loading: false,
-            commit_picker_cursor: 0,
-            commit_files: Vec::new(),
-            commit_groups: Vec::new(),
-            commit_rows: Vec::new(),
-            commit_files_cursor: 0,
-            commit_message: String::new(),
-            commit_msg_cursor: 0,
-            commit_msg_dirty: false,
-            commit_modal_focus: CommitModalFocus::Files,
-            commit_editing_msg: false,
-            commit_msg_generating: false,
-            commit_msg_needs_regen: false,
-            commit_started_at: None,
-            commit_progress_stage: String::new(),
-            commit_stream_logs: Vec::new(),
-            commit_stream_thinking: String::new(),
-            commit_stream_text: String::new(),
-            commit_executing: false,
-            commit_generation: 0,
-            commit_cancel_flag: Arc::new(AtomicBool::new(false)),
-            ext_commit_message: String::new(),
-            ext_commit_msg_cursor: 0,
-            ext_commit_msg_dirty: false,
-            ext_commit_msg_generating: false,
-            ext_commit_msg_needs_regen: false,
-            ext_commit_started_at: None,
-            ext_commit_progress_stage: String::new(),
-            ext_commit_stream_logs: Vec::new(),
-            ext_commit_stream_thinking: String::new(),
-            ext_commit_stream_text: String::new(),
-            ext_commit_generation: 0,
-            ext_commit_cancel_flag: Arc::new(AtomicBool::new(false)),
-            pending_commit_regen_at: None,
-            commit_msg_cache: HashMap::new(),
-            commit_error: None,
-            commit_hint_notice: None,
-            revert_title: String::new(),
-            revert_files: Vec::new(),
-            revert_files_cursor: 0,
-            revert_executing: false,
-            revert_error: None,
-            session: ReviewSessionState::default(),
-            qa_history: Vec::new(),
-            ai_followup_running: false,
-            last_stepped_finding_id: None,
-            input_buffer: String::new(),
-            input_cursor: 0,
-            search_query: String::new(),
-            search_matches: Vec::new(),
-            search_match_cursor: 0,
-            inspector_scroll_y: 0,
-            help_scroll_y: 0,
-            pending_commits_force_refresh: false,
-            pending_key: None,
-            status_message: rust_i18n::t!("status.loading_diff", locale = ui_locale.as_str())
-                .into_owned(),
-            should_quit: false,
-            settings_cursor: 0,
-            settings_status: None,
-            settings_ai_dirty: false,
-            config_path_override: None,
-            bg_rx,
-            bg_tx,
-        };
-
+            status_message,
+        );
         app.reload_target(target)?;
         Ok(app)
     }
 
     pub fn locale(&self) -> &str {
         self.config.ui_language.as_str()
+    }
+
+    fn commit_slot(&self, is_external: bool) -> &CommitMsgSlot {
+        if is_external {
+            &self.commit_ext
+        } else {
+            &self.commit_main
+        }
+    }
+
+    fn commit_slot_mut(&mut self, is_external: bool) -> &mut CommitMsgSlot {
+        if is_external {
+            &mut self.commit_ext
+        } else {
+            &mut self.commit_main
+        }
+    }
+
+    fn stop_commit_slots(&mut self) {
+        self.commit_main.stop_and_bump();
+        self.commit_ext.stop_and_bump();
+        self.pending_commit_regen_at = None;
+    }
+
+    fn clear_commit_slots_runtime(&mut self) {
+        self.commit_main.clear_runtime();
+        self.commit_ext.clear_runtime();
+        self.pending_commit_regen_at = None;
     }
 
     pub fn reload_target(&mut self, target: DiffTarget) -> anyhow::Result<()> {
@@ -705,12 +718,14 @@ impl App {
     ) -> anyhow::Result<()> {
         self.diff_generation += 1;
         let current_gen = self.diff_generation;
+        self.rerender_generation += 1;
+        self.rerender_cancel_seq
+            .store(self.rerender_generation, Ordering::Relaxed);
         self.diff_loading = true;
         self.diff_error = None;
         self.ai_generation += 1;
         self.ai_stage1_completed_gen = 0;
         self.ai_followup_generation += 1;
-        self.commit_generation += 1;
         self.clear_ai_runtime_flags();
         self.commit_msg_cache.clear();
         self.commit_error = None;
@@ -753,6 +768,8 @@ impl App {
         let display_mode = self.display_mode;
         let width = self.diff_pane_width;
         let cache_history = self.config.cache_history;
+        let need_json = !self.active_ai_provider_id.eq_ignore_ascii_case("none")
+            && !self.active_ai_provider_id.eq_ignore_ascii_case("off");
         let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
@@ -768,7 +785,7 @@ impl App {
                 let externals = vcs.external_prefixes();
                 let engine = Arc::new(DifftEngine::new(&difft_bin, ignore_comments)?);
                 let (rendered_diffs, parsed_texts, path_to_index) =
-                    render_all_files(&engine, &bundle, display_mode, width)?;
+                    render_all_files(&engine, &bundle, display_mode, width, need_json)?;
                 Ok((
                     bundle,
                     engine,
@@ -815,29 +832,11 @@ impl App {
         self.ai_stream_thinking.clear();
         self.ai_stream_text.clear();
         self.ai_followup_running = false;
-        self.commit_msg_generating = false;
-        self.pending_commit_regen_at = None;
-        self.commit_started_at = None;
-        self.commit_progress_stage.clear();
-        self.commit_stream_logs.clear();
-        self.commit_stream_thinking.clear();
-        self.commit_stream_text.clear();
-        self.ext_commit_msg_generating = false;
-        self.ext_commit_started_at = None;
-        self.ext_commit_progress_stage.clear();
-        self.ext_commit_stream_logs.clear();
-        self.ext_commit_stream_thinking.clear();
-        self.ext_commit_stream_text.clear();
+        self.clear_commit_slots_runtime();
     }
 
     fn cancel_commit_msg_task_for(&mut self, is_external: bool) {
-        if is_external {
-            self.ext_commit_cancel_flag.store(true, Ordering::Relaxed);
-            self.ext_commit_cancel_flag = Arc::new(AtomicBool::new(false));
-        } else {
-            self.commit_cancel_flag.store(true, Ordering::Relaxed);
-            self.commit_cancel_flag = Arc::new(AtomicBool::new(false));
-        }
+        self.commit_slot_mut(is_external).cancel_task();
     }
 
     fn cancel_commit_msg_task(&mut self) {
@@ -918,7 +917,9 @@ impl App {
         .into_owned();
 
         let bundle = self.bundle.clone();
-        let diffs = self.rendered_diffs.clone();
+        let mut diffs = self.rendered_diffs.clone();
+        let difft_engine = Arc::clone(&self.difft_engine);
+        let current_diff_gen = self.diff_generation;
         let cfg = self.config.clone();
         let fast_cfg = cfg.fast_config();
         let fast_provider = ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg);
@@ -934,6 +935,18 @@ impl App {
                     update,
                 });
             });
+            let engine_ignore_comments = difft_engine.ignore_comments();
+            let json_updates = difft_engine.ensure_json_for_ai(&bundle.changes, &mut diffs, &cancel_flag);
+            if !json_updates.is_empty() {
+                let _ = tx.send(BgMessage::DiffJsonReady {
+                    diff_generation: current_diff_gen,
+                    ignore_comments: engine_ignore_comments,
+                    updates: json_updates,
+                });
+            }
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
             let res = i18n::run_with_locale(&cfg.ui_language, || {
                 ai::run_with_ai_hooks(cancel_flag, Some(progress_cb), || {
                     let fast_ref = fast_provider.as_deref().unwrap_or(provider.as_ref());
@@ -997,12 +1010,14 @@ impl App {
             .ai_sessions
             .insert(provider_id.to_string(), sid.clone());
         self.active_ai_session_id = Some(sid.clone());
-        let _ = crate::config::save_project_session(
+        if let Err(err) = crate::config::save_project_session(
             self.vcs.repo_root(),
             self.vcs.scope_dir(),
             provider_id,
             Some(&sid),
-        );
+        ) {
+            self.status_message = format!("{}", err);
+        }
     }
 
     pub fn reset_ai_session(&mut self) {
@@ -1013,7 +1028,6 @@ impl App {
         self.ai_stage1_completed_gen = 0;
         self.ai_session_epoch += 1;
         self.ai_followup_generation += 1;
-        self.commit_generation += 1;
         self.clear_ai_runtime_flags();
         self.commit_msg_cache.clear();
         self.config.ai_sessions.remove(&provider_id);
@@ -1033,10 +1047,25 @@ impl App {
         self.trigger_ai_analysis(true);
     }
 
-    pub fn poll_background(&mut self) {
+    pub fn has_active_animation(&self) -> bool {
+        self.diff_loading
+            || self.ai_running
+            || self.ai_deep_running
+            || self.ai_followup_running
+            || self.commits_loading
+            || self.any_commit_msg_generating()
+            || self.commit_executing
+            || self.revert_executing
+            || self.pending_rerender_at.is_some()
+            || self.pending_commit_regen_at.is_some()
+    }
+
+    pub fn poll_background(&mut self) -> bool {
+        let mut changed = false;
         if let Some(deadline) = self.pending_rerender_at {
             if Instant::now() >= deadline {
                 self.pending_rerender_at = None;
+                changed = true;
                 if !self.bundle.changes.is_empty() && !self.diff_loading {
                     self.re_render_all_for_mode_or_width();
                 }
@@ -1045,11 +1074,12 @@ impl App {
         if let Some(deadline) = self.pending_commit_regen_at {
             if Instant::now() >= deadline {
                 self.pending_commit_regen_at = None;
+                changed = true;
                 if matches!(
                     self.overlay,
                     OverlayKind::CommitConfirm | OverlayKind::CommitDoubleConfirm
                 ) && !self.commit_editing_msg
-                    && (!self.commit_msg_dirty || !self.ext_commit_msg_dirty)
+                    && (!self.commit_main.dirty || !self.commit_ext.dirty)
                 {
                     self.regenerate_commit_message();
                 }
@@ -1061,6 +1091,7 @@ impl App {
                     if generation != self.diff_generation {
                         continue;
                     }
+                    changed = true;
                     self.diff_loading = false;
                     match result {
                         Ok((
@@ -1072,7 +1103,13 @@ impl App {
                             externals,
                         )) => {
                             self.bundle = bundle;
-                            self.difft_engine = engine;
+                            self.difft_engine = if engine.ignore_comments() != self.config.ignore_comments {
+                                DifftEngine::new(&self.config.difft_bin, self.config.ignore_comments)
+                                    .map(Arc::new)
+                                    .unwrap_or(engine)
+                            } else {
+                                engine
+                            };
                             self.rendered_diffs = rendered_diffs;
                             self.parsed_texts = parsed_texts;
                             self.path_to_index = path_to_index;
@@ -1080,9 +1117,11 @@ impl App {
                             self.selected_file_idx =
                                 (!self.rendered_diffs.is_empty()).then_some(0);
                             self.rebuild_tree_and_continuous();
+                            let desired_ignore = self.difft_engine.ignore_comments();
                             if self.rendered_diffs.iter().any(|r| {
                                 r.rendered_width != self.diff_pane_width
                                     || r.rendered_mode != self.display_mode
+                                    || r.rendered_ignore_comments != desired_ignore
                             }) {
                                 self.re_render_all_for_mode_or_width();
                             }
@@ -1119,23 +1158,96 @@ impl App {
                     diff_generation,
                     mode,
                     width,
-                    rendered_diffs,
-                    parsed_texts,
+                    ignore_comments,
+                    updates,
                 } => {
                     if generation != self.rerender_generation
                         || diff_generation != self.diff_generation
                         || mode != self.display_mode
                         || width != self.diff_pane_width
-                        || rendered_diffs.len() != self.bundle.changes.len()
-                        || parsed_texts.len() != self.bundle.changes.len()
+                        || ignore_comments != self.difft_engine.ignore_comments()
                     {
                         continue;
                     }
-                    self.rendered_diffs = rendered_diffs;
-                    self.parsed_texts = parsed_texts;
+                    changed = true;
+                    for (idx, mut r, t) in updates {
+                        if idx < self.rendered_diffs.len()
+                            && idx < self.parsed_texts.len()
+                            && self.rendered_diffs[idx].path == r.path
+                        {
+                            // Preserve JSON metadata filled lazily under the same ignore_comments setting.
+                            if r.json.is_none()
+                                && self.rendered_diffs[idx].json.is_some()
+                                && self.rendered_diffs[idx].json_ignore_comments
+                                    == r.json_ignore_comments
+                            {
+                                let cur = &self.rendered_diffs[idx];
+                                r.json = cur.json.clone();
+                                r.language = cur.language.clone();
+                                r.status = cur.status.clone();
+                                r.ai_summary_diff = cur.ai_summary_diff.clone();
+                                r.hunks_meta = crate::difft::build_hunks_meta(
+                                    &r.ansi_output,
+                                    &r.hunk_anchors,
+                                    r.json.as_ref(),
+                                );
+                            }
+                            self.rendered_diffs[idx] = r;
+                            self.parsed_texts[idx] = t;
+                        }
+                    }
                     self.rebuild_continuous_diff();
                     if !self.search_query.is_empty() {
                         self.recompute_search_matches();
+                    }
+                }
+                BgMessage::DiffJsonReady {
+                    diff_generation,
+                    ignore_comments,
+                    updates,
+                } => {
+                    if diff_generation != self.diff_generation
+                        || ignore_comments != self.difft_engine.ignore_comments()
+                    {
+                        continue;
+                    }
+                    let mut any_applied = false;
+                    for (_idx, path, json, summary, _stale_meta) in updates {
+                        let Some(&idx) = self.path_to_index.get(&path) else {
+                            continue;
+                        };
+                        if let Some(d) = self.rendered_diffs.get_mut(idx) {
+                            if d.path == path
+                                && (d.json.is_none()
+                                    || d.json_ignore_comments != ignore_comments)
+                            {
+                                // Only stamp JSON setting; ANSI setting stays owned by DiffReRendered.
+                                d.json_ignore_comments = ignore_comments;
+                                if let Some(ref j) = json {
+                                    if !j.language.is_empty() {
+                                        d.language = j.language.clone();
+                                    }
+                                    if !j.status.is_empty() {
+                                        d.status = j.status.clone();
+                                    }
+                                }
+                                d.hunks_meta = crate::difft::build_hunks_meta(
+                                    &d.ansi_output,
+                                    &d.hunk_anchors,
+                                    json.as_ref(),
+                                );
+                                d.ai_summary_diff = summary;
+                                d.json = json;
+                                any_applied = true;
+                            }
+                        }
+                    }
+                    if any_applied {
+                        changed = true;
+                        self.rebuild_continuous_diff();
+                        if !self.search_query.is_empty() {
+                            self.recompute_search_matches();
+                        }
                     }
                 }
                 BgMessage::AiAnalysisProgress { generation, update } => {
@@ -1144,6 +1256,7 @@ impl App {
                     {
                         continue;
                     }
+                    changed = true;
                     if let Some(stage) = apply_progress_update(
                         self.ai_started_at,
                         &mut self.ai_progress_stage,
@@ -1174,9 +1287,10 @@ impl App {
                     mut review,
                     session_id,
                 } => {
-                    if generation != self.ai_generation {
+                    if generation != self.ai_generation || session_epoch != self.ai_session_epoch {
                         continue;
                     }
+                    changed = true;
                     self.ai_running = false;
                     self.ai_deep_running = true;
                     self.ai_stage1_completed_gen = generation;
@@ -1209,9 +1323,10 @@ impl App {
                     provider_id,
                     result,
                 } => {
-                    if generation != self.ai_generation {
+                    if generation != self.ai_generation || session_epoch != self.ai_session_epoch {
                         continue;
                     }
+                    changed = true;
                     self.ai_running = false;
                     self.ai_deep_running = false;
                     self.ai_started_at = None;
@@ -1284,6 +1399,7 @@ impl App {
                     {
                         continue;
                     }
+                    changed = true;
                     self.ai_followup_running = false;
                     match answer {
                         Ok(out) => {
@@ -1313,6 +1429,7 @@ impl App {
                     }
                 }
                 BgMessage::CommitsLoaded(res) => {
+                    changed = true;
                     self.commits_loading = false;
                     match res {
                         Ok(commits) => {
@@ -1344,33 +1461,20 @@ impl App {
                     generation,
                     update,
                 } => {
-                    let (active_gen, is_gen) = if is_external {
-                        (self.ext_commit_generation, self.ext_commit_msg_generating)
-                    } else {
-                        (self.commit_generation, self.commit_msg_generating)
-                    };
-                    if generation != active_gen || !is_gen {
+                    let slot = self.commit_slot(is_external);
+                    if generation != slot.generation || !slot.generating {
                         continue;
                     }
-                    if is_external {
-                        apply_progress_update(
-                            self.ext_commit_started_at,
-                            &mut self.ext_commit_progress_stage,
-                            &mut self.ext_commit_stream_logs,
-                            &mut self.ext_commit_stream_thinking,
-                            &mut self.ext_commit_stream_text,
-                            update,
-                        );
-                    } else {
-                        apply_progress_update(
-                            self.commit_started_at,
-                            &mut self.commit_progress_stage,
-                            &mut self.commit_stream_logs,
-                            &mut self.commit_stream_thinking,
-                            &mut self.commit_stream_text,
-                            update,
-                        );
-                    }
+                    changed = true;
+                    let slot = self.commit_slot_mut(is_external);
+                    apply_progress_update(
+                        slot.started_at,
+                        &mut slot.progress_stage,
+                        &mut slot.stream_logs,
+                        &mut slot.stream_thinking,
+                        &mut slot.stream_text,
+                        update,
+                    );
                 }
                 BgMessage::CommitMsgGenerated {
                     is_external,
@@ -1378,41 +1482,32 @@ impl App {
                     cache_key,
                     result,
                 } => {
-                    let active_gen = if is_external {
-                        self.ext_commit_generation
-                    } else {
-                        self.commit_generation
-                    };
-                    if generation != active_gen {
+                    if generation != self.commit_slot(is_external).generation {
                         continue;
                     }
-                    if is_external {
-                        self.ext_commit_msg_generating = false;
-                        self.ext_commit_started_at = None;
-                    } else {
-                        self.commit_msg_generating = false;
-                        self.commit_started_at = None;
+                    changed = true;
+                    {
+                        let slot = self.commit_slot_mut(is_external);
+                        slot.generating = false;
+                        slot.started_at = None;
                     }
                     self.commit_hint_notice = None;
                     match result {
                         Ok(out) => {
                             if !out.text.trim().is_empty() {
                                 self.commit_msg_cache.insert(cache_key, out.text.clone());
-                                if is_external {
-                                    let editing_ext = self.commit_editing_msg
-                                        && self.commit_modal_focus
-                                            == CommitModalFocus::ExternalMessage;
-                                    if !self.ext_commit_msg_dirty && !editing_ext {
-                                        self.ext_commit_message = out.text;
-                                        self.ext_commit_msg_cursor = self.ext_commit_message.len();
-                                        self.sync_main_msg_from_external_if_needed();
-                                    }
+                                let target_focus = if is_external {
+                                    CommitModalFocus::ExternalMessage
                                 } else {
-                                    let editing_main = self.commit_editing_msg
-                                        && self.commit_modal_focus == CommitModalFocus::Message;
-                                    if !self.commit_msg_dirty && !editing_main {
-                                        self.commit_message = out.text;
-                                        self.commit_msg_cursor = self.commit_message.len();
+                                    CommitModalFocus::Message
+                                };
+                                let editing_slot =
+                                    self.commit_editing_msg && self.commit_modal_focus == target_focus;
+                                let slot = self.commit_slot_mut(is_external);
+                                if !slot.dirty && !editing_slot {
+                                    slot.set_message(out.text);
+                                    if is_external {
+                                        self.sync_main_msg_from_external_if_needed();
                                     }
                                 }
                             }
@@ -1430,6 +1525,7 @@ impl App {
                     }
                 }
                 BgMessage::CommitDone(outcome) => {
+                    changed = true;
                     self.commit_executing = false;
                     if let Some(err) = outcome.error {
                         if !outcome.committed_paths.is_empty() {
@@ -1475,6 +1571,7 @@ impl App {
                     }
                 }
                 BgMessage::RevertDone(outcome) => {
+                    changed = true;
                     self.revert_executing = false;
                     if let Some(err) = outcome.error {
                         if !outcome.reverted_paths.is_empty() {
@@ -1522,6 +1619,10 @@ impl App {
                 }
             }
         }
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     fn prune_uncommitted_paths(
@@ -1587,6 +1688,11 @@ impl App {
         self.bundle.changes = new_changes;
         self.rendered_diffs = new_rendered;
         self.parsed_texts = new_texts;
+        // Invalidate any in-flight width/mode rerenders whose sparse indices now target shifted paths.
+        self.rerender_generation += 1;
+        self.rerender_cancel_seq
+            .store(self.rerender_generation, Ordering::Relaxed);
+        self.pending_rerender_at = None;
 
         if self.bundle.changes.is_empty() {
             self.cancel_analysis_task();
@@ -1625,6 +1731,9 @@ impl App {
         }
 
         self.rebuild_tree_and_continuous();
+        if !self.bundle.changes.is_empty() {
+            self.re_render_all_for_mode_or_width();
+        }
         if self.tree_rows.is_empty() {
             self.tree_cursor = 0;
         } else {
@@ -1653,59 +1762,64 @@ impl App {
         }
         self.rerender_generation += 1;
         let rerender_gen = self.rerender_generation;
-        let diff_gen = self.diff_generation;
-        let engine = Arc::clone(&self.difft_engine);
-        let changes = self.bundle.changes.clone();
-        let mut rendered_diffs = self.rendered_diffs.clone();
+        self.rerender_cancel_seq.store(rerender_gen, Ordering::Relaxed);
         let mode = self.display_mode;
         let width = self.diff_pane_width;
+        let ignore_comments = self.difft_engine.ignore_comments();
+        let stale: Vec<(usize, crate::model::FileChange, FileDiffRendered)> = self
+            .bundle
+            .changes
+            .iter()
+            .zip(self.rendered_diffs.iter())
+            .enumerate()
+            .filter_map(|(idx, (ch, r))| {
+                (r.rendered_width != width
+                    || r.rendered_mode != mode
+                    || r.rendered_ignore_comments != ignore_comments)
+                    .then(|| (idx, ch.clone(), r.clone()))
+            })
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+
+        let rerender_seq = Arc::clone(&self.rerender_cancel_seq);
+        let diff_gen = self.diff_generation;
+        let engine = Arc::clone(&self.difft_engine);
         let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
-            let needs_any = rendered_diffs
-                .iter()
-                .any(|r| r.rendered_width != width || r.rendered_mode != mode);
-            if !needs_any {
-                return;
-            }
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .clamp(2, 8)
-                .min(changes.len().max(1));
-            let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            let slots: Vec<std::sync::Mutex<Option<FileDiffRendered>>> =
-                (0..changes.len()).map(|_| std::sync::Mutex::new(None)).collect();
-            std::thread::scope(|s| {
-                for _ in 0..workers {
-                    s.spawn(|| loop {
-                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= changes.len() {
-                            break;
-                        }
-                        let mut rendered = rendered_diffs[idx].clone();
-                        if rendered.rendered_width != width || rendered.rendered_mode != mode {
-                            let _ = engine.re_render_ansi(&changes[idx], &mut rendered, mode, width);
-                        }
-                        *slots[idx].lock().unwrap() = Some(rendered);
-                    });
-                }
-            });
-            rendered_diffs = slots
+                .clamp(2, 8);
+            let updates: Vec<(usize, FileDiffRendered, Text<'static>)> =
+                crate::parallel::run_bounded(&stale, workers, |(idx, ch, base_rendered)| {
+                    if rerender_seq.load(Ordering::Relaxed) != rerender_gen {
+                        return None;
+                    }
+                    let mut rendered = base_rendered.clone();
+                    let _ = engine.re_render_ansi(ch, &mut rendered, mode, width);
+                    if rerender_seq.load(Ordering::Relaxed) != rerender_gen {
+                        return None;
+                    }
+                    let parsed = ansi_to_ratatui_text(&rendered.ansi_output);
+                    Some((*idx, rendered, parsed))
+                })
                 .into_iter()
-                .map(|m| m.into_inner().unwrap().expect("rerender slot"))
+                .flatten()
                 .collect();
-            let parsed_texts: Vec<Text<'static>> = rendered_diffs
-                .iter()
-                .map(|r| ansi_to_ratatui_text(&r.ansi_output))
-                .collect();
+            if rerender_seq.load(Ordering::Relaxed) != rerender_gen || updates.len() != stale.len()
+            {
+                return;
+            }
             let _ = tx.send(BgMessage::DiffReRendered {
                 generation: rerender_gen,
                 diff_generation: diff_gen,
                 mode,
                 width,
-                rendered_diffs,
-                parsed_texts,
+                ignore_comments,
+                updates,
             });
         });
     }
@@ -1881,11 +1995,12 @@ impl App {
 
             let raw_ansi_lines: Vec<&str> = fd.ansi_output.lines().collect();
             let parsed_lines = &self.parsed_texts[change_idx].lines;
+            let mut ansi_scratch = String::new();
             let local_src_lines: Vec<Option<u32>> = (0..parsed_lines.len())
                 .map(|ly| {
                     raw_ansi_lines
                         .get(ly)
-                        .and_then(|raw| parse_source_line_from_ansi(raw))
+                        .and_then(|raw| parse_source_line_from_ansi_with_buf(raw, &mut ansi_scratch))
                 })
                 .collect();
 
@@ -2114,6 +2229,7 @@ impl App {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return;
         }
+        self.dirty = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
@@ -2144,18 +2260,14 @@ impl App {
         if sanitized.is_empty() {
             return;
         }
+        self.dirty = true;
         if self.overlay == OverlayKind::CommitConfirm && self.commit_editing_msg {
             let is_ext = self.commit_modal_focus == CommitModalFocus::ExternalMessage;
-            if is_ext {
+            {
+                let slot = self.commit_slot_mut(is_ext);
                 crate::ui::text_input::insert_clean_str(
-                    &mut self.ext_commit_message,
-                    &mut self.ext_commit_msg_cursor,
-                    &sanitized,
-                );
-            } else {
-                crate::ui::text_input::insert_clean_str(
-                    &mut self.commit_message,
-                    &mut self.commit_msg_cursor,
+                    &mut slot.message,
+                    &mut slot.cursor,
                     &sanitized,
                 );
             }
@@ -2248,27 +2360,12 @@ impl App {
                     }
                     KeyCode::Enter => {
                         self.overlay = OverlayKind::None;
-                        self.ai_session_epoch += 1;
-                        self.ai_followup_generation += 1;
-                        self.commit_generation += 1;
-                        self.clear_ai_runtime_flags();
-                        if self.ai_picker_cursor < self.available_providers.len() {
-                            let new_id =
-                                self.available_providers[self.ai_picker_cursor].id.clone();
-                            self.config.switch_provider(&new_id);
-                            self.active_ai_provider_id = new_id;
-                            self.trigger_ai_analysis(true);
+                        let new_id = if self.ai_picker_cursor < self.available_providers.len() {
+                            self.available_providers[self.ai_picker_cursor].id.clone()
                         } else {
-                            self.active_ai_provider_id = "none".to_string();
-                            self.resolved_ai_provider_id = None;
-                            self.active_ai_session_id = None;
-                            self.ai_generation += 1;
-                            self.ai_stage1_completed_gen = 0;
-                            self.ai_error = None;
-                            self.status_message =
-                                rust_i18n::t!("status.ai_turned_off", locale = self.locale())
-                                    .into_owned();
-                        }
+                            "none".to_string()
+                        };
+                        self.apply_ai_provider_change(&new_id, true);
                     }
                     _ => {}
                 }
@@ -2286,6 +2383,32 @@ impl App {
                 self.handle_revert_double_confirm_key(key);
             }
             OverlayKind::None => {}
+        }
+    }
+
+    fn apply_ai_provider_change(&mut self, provider_id: &str, trigger_analysis: bool) {
+        self.ai_session_epoch += 1;
+        self.ai_generation += 1;
+        self.ai_stage1_completed_gen = 0;
+        self.ai_followup_generation += 1;
+        self.commit_msg_cache.clear();
+        self.clear_ai_runtime_flags();
+        self.config.switch_provider(provider_id);
+        self.active_ai_provider_id = self.config.ai_provider.clone();
+        self.resolved_ai_provider_id = None;
+        self.active_ai_session_id = if self.config.reuse_session {
+            self.config.ai_sessions.get(&self.active_ai_provider_id).cloned()
+        } else {
+            None
+        };
+        if self.active_ai_provider_id.eq_ignore_ascii_case("none")
+            || self.active_ai_provider_id.eq_ignore_ascii_case("off")
+        {
+            self.ai_error = None;
+            self.status_message =
+                rust_i18n::t!("status.ai_turned_off", locale = self.locale()).into_owned();
+        } else if trigger_analysis {
+            self.trigger_ai_analysis(true);
         }
     }
 
@@ -2359,7 +2482,7 @@ impl App {
                         let new_loc = i18n::next_locale(&self.config.ui_language, forward);
                         self.config.ui_language = new_loc.clone();
                         self.config.ui_language_explicit = true;
-                        self.rebuild_tree_rows();
+                        self.rebuild_tree_and_continuous();
                         let disp = i18n::display_name(&new_loc);
                         self.status_message = rust_i18n::t!(
                             "status.settings_ui_lang_hint",
@@ -2398,8 +2521,7 @@ impl App {
                             cur_idx - 1
                         };
                         let new_id = choices[next_idx].clone();
-                        self.config.switch_provider(&new_id);
-                        self.active_ai_provider_id = new_id;
+                        self.apply_ai_provider_change(&new_id, false);
                         self.settings_ai_dirty = true;
                     }
                     3 => {
@@ -2508,12 +2630,12 @@ impl App {
         self.commit_executing = false;
         self.commit_error = None;
         self.commit_hint_notice = None;
-        self.commit_msg_dirty = false;
-        self.commit_msg_needs_regen = false;
-        self.ext_commit_message.clear();
-        self.ext_commit_msg_cursor = 0;
-        self.ext_commit_msg_dirty = false;
-        self.ext_commit_msg_needs_regen = false;
+        self.commit_main.dirty = false;
+        self.commit_main.needs_regen = false;
+        self.commit_ext.message.clear();
+        self.commit_ext.cursor = 0;
+        self.commit_ext.dirty = false;
+        self.commit_ext.needs_regen = false;
         if self.resolved_ai_provider_id.is_none() {
             let fast_cfg = self.config.fast_config();
             self.resolved_ai_provider_id =
@@ -2523,27 +2645,28 @@ impl App {
 
         let (main_paths, ext_paths, has_git_sub_sync) = self.commit_scope_parts();
         if !ext_paths.is_empty() {
-            self.ext_commit_message = ai::build_fallback_commit_message(
+            let fallback_ext = ai::build_fallback_commit_message(
                 &self.bundle,
                 &ext_paths,
                 self.ai_review.as_ref(),
             );
-            self.ext_commit_msg_cursor = self.ext_commit_message.len();
+            self.commit_ext.set_message(fallback_ext);
         }
         if !main_paths.is_empty() {
-            self.commit_message = ai::build_fallback_commit_message(
+            let fallback_main = ai::build_fallback_commit_message(
                 &self.bundle,
                 &main_paths,
                 self.ai_review.as_ref(),
             );
+            self.commit_main.set_message(fallback_main);
         } else if has_git_sub_sync {
             let subs = self.selected_submodule_names(&ext_paths);
-            self.commit_message =
-                Self::build_submodule_sync_commit_msg(&subs, &self.ext_commit_message);
+            let sync_msg =
+                Self::build_submodule_sync_commit_msg(&subs, &self.commit_ext.message);
+            self.commit_main.set_message(sync_msg);
         } else {
-            self.commit_message.clear();
+            self.commit_main.set_message(String::new());
         }
-        self.commit_msg_cursor = self.commit_message.len();
         self.overlay = OverlayKind::CommitConfirm;
         self.regenerate_commit_message_with_cache(false);
     }
@@ -2617,7 +2740,7 @@ impl App {
     }
 
     pub fn any_commit_msg_generating(&self) -> bool {
-        self.commit_msg_generating || self.ext_commit_msg_generating
+        self.commit_main.generating || self.commit_ext.generating
     }
 
     fn commit_scope_parts(&self) -> (Vec<String>, Vec<String>, bool) {
@@ -2674,34 +2797,28 @@ impl App {
 
     fn sync_main_msg_from_external_if_needed(&mut self) {
         let (main_paths, ext_paths, has_git_sub_sync) = self.commit_scope_parts();
-        if main_paths.is_empty() && has_git_sub_sync && !self.commit_msg_dirty {
+        if main_paths.is_empty() && has_git_sub_sync && !self.commit_main.dirty {
             let subs = self.selected_submodule_names(&ext_paths);
-            self.commit_message =
-                Self::build_submodule_sync_commit_msg(&subs, &self.ext_commit_message);
-            self.commit_msg_cursor = self.commit_message.len();
+            let msg = Self::build_submodule_sync_commit_msg(&subs, &self.commit_ext.message);
+            self.commit_main.set_message(msg);
         }
     }
 
     fn on_commit_selection_changed(&mut self) {
-        self.commit_generation += 1;
-        self.ext_commit_generation += 1;
-        self.cancel_commit_msg_task();
-        self.commit_msg_generating = false;
-        self.ext_commit_msg_generating = false;
-        self.pending_commit_regen_at = None;
+        self.stop_commit_slots();
         self.commit_hint_notice = None;
 
         let (main_paths, ext_paths, has_git_sub_sync) = self.commit_scope_parts();
         if main_paths.is_empty() && ext_paths.is_empty() {
             self.commit_error =
                 Some(rust_i18n::t!("commit.err_select_file", locale = self.locale()).into_owned());
-            self.commit_msg_needs_regen = false;
-            self.ext_commit_msg_needs_regen = false;
-            if !self.commit_msg_dirty {
-                self.commit_message.clear();
+            self.commit_main.needs_regen = false;
+            self.commit_ext.needs_regen = false;
+            if !self.commit_main.dirty {
+                self.commit_main.message.clear();
             }
-            if !self.ext_commit_msg_dirty {
-                self.ext_commit_message.clear();
+            if !self.commit_ext.dirty {
+                self.commit_ext.message.clear();
             }
             return;
         }
@@ -2716,62 +2833,60 @@ impl App {
         }
 
         if ext_paths.is_empty() {
-            self.ext_commit_msg_needs_regen = false;
-            if !self.ext_commit_msg_dirty {
-                self.ext_commit_message.clear();
+            self.commit_ext.needs_regen = false;
+            if !self.commit_ext.dirty {
+                self.commit_ext.message.clear();
             }
-        } else if !self.ext_commit_msg_dirty {
+        } else if !self.commit_ext.dirty {
             let key = self.build_commit_cache_key_for(true, &ext_paths, &fast_cfg);
             if let Some(cached) = self.commit_msg_cache.get(&key).cloned() {
-                self.ext_commit_msg_needs_regen = false;
-                self.ext_commit_progress_stage =
+                self.commit_ext.needs_regen = false;
+                self.commit_ext.progress_stage =
                     rust_i18n::t!("commit.cache_hit", locale = self.locale()).into_owned();
-                self.ext_commit_message = cached;
-                self.ext_commit_msg_cursor = self.ext_commit_message.len();
+                self.commit_ext.set_message(cached);
             } else {
-                self.ext_commit_message = ai::build_fallback_commit_message(
+                let fallback = ai::build_fallback_commit_message(
                     &self.bundle,
                     &ext_paths,
                     self.ai_review.as_ref(),
                 );
-                self.ext_commit_msg_cursor = self.ext_commit_message.len();
-                self.ext_commit_msg_needs_regen = has_provider;
+                self.commit_ext.set_message(fallback);
+                self.commit_ext.needs_regen = has_provider;
                 if has_provider {
                     need_debounce = true;
                 }
             }
         }
 
-        if !self.commit_msg_dirty {
+        if !self.commit_main.dirty {
             if !main_paths.is_empty() {
                 let key = self.build_commit_cache_key_for(false, &main_paths, &fast_cfg);
                 if let Some(cached) = self.commit_msg_cache.get(&key).cloned() {
-                    self.commit_msg_needs_regen = false;
-                    self.commit_progress_stage =
+                    self.commit_main.needs_regen = false;
+                    self.commit_main.progress_stage =
                         rust_i18n::t!("commit.cache_hit", locale = self.locale()).into_owned();
-                    self.commit_message = cached;
-                    self.commit_msg_cursor = self.commit_message.len();
+                    self.commit_main.set_message(cached);
                 } else {
-                    self.commit_message = ai::build_fallback_commit_message(
+                    let fallback = ai::build_fallback_commit_message(
                         &self.bundle,
                         &main_paths,
                         self.ai_review.as_ref(),
                     );
-                    self.commit_msg_cursor = self.commit_message.len();
-                    self.commit_msg_needs_regen = has_provider;
+                    self.commit_main.set_message(fallback);
+                    self.commit_main.needs_regen = has_provider;
                     if has_provider {
                         need_debounce = true;
                     }
                 }
             } else if has_git_sub_sync {
-                self.commit_msg_needs_regen = false;
+                self.commit_main.needs_regen = false;
                 let subs = self.selected_submodule_names(&ext_paths);
-                self.commit_message =
-                    Self::build_submodule_sync_commit_msg(&subs, &self.ext_commit_message);
-                self.commit_msg_cursor = self.commit_message.len();
+                let sync_msg =
+                    Self::build_submodule_sync_commit_msg(&subs, &self.commit_ext.message);
+                self.commit_main.set_message(sync_msg);
             } else {
-                self.commit_msg_needs_regen = false;
-                self.commit_message.clear();
+                self.commit_main.needs_regen = false;
+                self.commit_main.message.clear();
             }
         }
 
@@ -2784,25 +2899,16 @@ impl App {
     fn mark_commit_message_edited_slot(&mut self, is_external: bool) {
         self.pending_commit_regen_at = None;
         self.commit_hint_notice = None;
+        {
+            let slot = self.commit_slot_mut(is_external);
+            slot.dirty = true;
+            slot.needs_regen = false;
+            if slot.generating {
+                slot.stop_and_bump();
+            }
+        }
         if is_external {
-            self.ext_commit_msg_dirty = true;
-            self.ext_commit_msg_needs_regen = false;
-            if self.ext_commit_msg_generating {
-                self.ext_commit_generation += 1;
-                self.cancel_commit_msg_task_for(true);
-                self.ext_commit_msg_generating = false;
-                self.ext_commit_started_at = None;
-            }
             self.sync_main_msg_from_external_if_needed();
-        } else {
-            self.commit_msg_dirty = true;
-            self.commit_msg_needs_regen = false;
-            if self.commit_msg_generating {
-                self.commit_generation += 1;
-                self.cancel_commit_msg_task_for(false);
-                self.commit_msg_generating = false;
-                self.commit_started_at = None;
-            }
         }
     }
 
@@ -2817,8 +2923,8 @@ impl App {
             return;
         }
         let needs_main = !main_paths.is_empty() || has_git_sub_sync;
-        if (needs_main && self.commit_message.trim().is_empty())
-            || (!ext_paths.is_empty() && self.ext_commit_message.trim().is_empty())
+        if (needs_main && self.commit_main.message.trim().is_empty())
+            || (!ext_paths.is_empty() && self.commit_ext.message.trim().is_empty())
         {
             self.commit_error =
                 Some(rust_i18n::t!("commit.err_empty_msg", locale = self.locale()).into_owned());
@@ -2827,8 +2933,8 @@ impl App {
         self.commit_error = None;
         self.commit_hint_notice = None;
         self.pending_commit_regen_at = None;
-        if (self.commit_msg_needs_regen && !self.commit_msg_dirty)
-            || (self.ext_commit_msg_needs_regen && !self.ext_commit_msg_dirty)
+        if (self.commit_main.needs_regen && !self.commit_main.dirty)
+            || (self.commit_ext.needs_regen && !self.commit_ext.dirty)
         {
             self.regenerate_commit_message();
         }
@@ -2848,27 +2954,23 @@ impl App {
                 Some(rust_i18n::t!("commit.err_select_file", locale = self.locale()).into_owned());
             return;
         }
-        if !ext_paths.is_empty() && !self.ext_commit_msg_dirty {
+        if !ext_paths.is_empty() && !self.commit_ext.dirty {
             self.spawn_commit_msg_slot(true, ext_paths.clone(), bypass_cache);
         } else if ext_paths.is_empty() {
-            self.ext_commit_generation += 1;
-            self.cancel_commit_msg_task_for(true);
-            self.ext_commit_msg_generating = false;
-            self.ext_commit_msg_needs_regen = false;
+            self.commit_ext.stop_and_bump();
+            self.commit_ext.needs_regen = false;
         }
 
-        if !main_paths.is_empty() && !self.commit_msg_dirty {
+        if !main_paths.is_empty() && !self.commit_main.dirty {
             self.spawn_commit_msg_slot(false, main_paths, bypass_cache);
         } else if main_paths.is_empty() {
-            self.commit_generation += 1;
-            self.cancel_commit_msg_task_for(false);
-            self.commit_msg_generating = false;
-            self.commit_msg_needs_regen = false;
-            if has_git_sub_sync && !self.commit_msg_dirty {
+            self.commit_main.stop_and_bump();
+            self.commit_main.needs_regen = false;
+            if has_git_sub_sync && !self.commit_main.dirty {
                 let subs = self.selected_submodule_names(&ext_paths);
-                self.commit_message =
-                    Self::build_submodule_sync_commit_msg(&subs, &self.ext_commit_message);
-                self.commit_msg_cursor = self.commit_message.len();
+                let sync_msg =
+                    Self::build_submodule_sync_commit_msg(&subs, &self.commit_ext.message);
+                self.commit_main.set_message(sync_msg);
             }
         }
     }
@@ -2884,7 +2986,7 @@ impl App {
         } else if !main_paths.is_empty() {
             self.spawn_commit_msg_slot(false, main_paths, bypass_cache);
         } else if has_git_sub_sync {
-            self.commit_msg_dirty = false;
+            self.commit_main.dirty = false;
             self.sync_main_msg_from_external_if_needed();
         }
     }
@@ -2894,33 +2996,10 @@ impl App {
         let cache_key = self.build_commit_cache_key_for(is_external, &paths, &fast_cfg);
         if !bypass_cache {
             if let Some(cached) = self.commit_msg_cache.get(&cache_key).cloned() {
-                self.cancel_commit_msg_task_for(is_external);
                 let stage = rust_i18n::t!("commit.cache_hit", locale = self.locale()).into_owned();
+                self.commit_slot_mut(is_external).apply_cached(cached, stage);
                 if is_external {
-                    self.ext_commit_generation += 1;
-                    self.ext_commit_msg_generating = false;
-                    self.ext_commit_started_at = None;
-                    self.ext_commit_msg_dirty = false;
-                    self.ext_commit_msg_needs_regen = false;
-                    self.ext_commit_progress_stage = stage;
-                    self.ext_commit_stream_logs.clear();
-                    self.ext_commit_stream_thinking.clear();
-                    self.ext_commit_stream_text.clear();
-                    self.ext_commit_message = cached;
-                    self.ext_commit_msg_cursor = self.ext_commit_message.len();
                     self.sync_main_msg_from_external_if_needed();
-                } else {
-                    self.commit_generation += 1;
-                    self.commit_msg_generating = false;
-                    self.commit_started_at = None;
-                    self.commit_msg_dirty = false;
-                    self.commit_msg_needs_regen = false;
-                    self.commit_progress_stage = stage;
-                    self.commit_stream_logs.clear();
-                    self.commit_stream_thinking.clear();
-                    self.commit_stream_text.clear();
-                    self.commit_message = cached;
-                    self.commit_msg_cursor = self.commit_message.len();
                 }
                 self.commit_error = None;
                 return;
@@ -2930,23 +3009,19 @@ impl App {
         let Some(provider) = ai::resolve_provider(&self.active_ai_provider_id, &fast_cfg) else {
             let fallback =
                 ai::build_fallback_commit_message(&self.bundle, &paths, self.ai_review.as_ref());
+            {
+                let slot = self.commit_slot_mut(is_external);
+                slot.stop_and_bump();
+                slot.needs_regen = false;
+                slot.set_message(fallback);
+            }
             if is_external {
-                self.ext_commit_msg_generating = false;
-                self.ext_commit_msg_needs_regen = false;
-                self.ext_commit_message = fallback;
-                self.ext_commit_msg_cursor = self.ext_commit_message.len();
                 self.sync_main_msg_from_external_if_needed();
-            } else {
-                self.commit_msg_generating = false;
-                self.commit_msg_needs_regen = false;
-                self.commit_message = fallback;
-                self.commit_msg_cursor = self.commit_message.len();
             }
             return;
         };
         self.resolved_ai_provider_id = Some(provider.id().to_string());
 
-        self.cancel_commit_msg_task_for(is_external);
         let model_label = fast_cfg
             .ai_model
             .as_deref()
@@ -2958,32 +3033,7 @@ impl App {
             count = paths.len()
         )
         .into_owned();
-        let (current_gen, cancel_flag) = if is_external {
-            self.ext_commit_generation += 1;
-            self.ext_commit_msg_generating = true;
-            self.ext_commit_started_at = Some(Instant::now());
-            self.ext_commit_progress_stage = prep_stage;
-            self.ext_commit_stream_logs.clear();
-            self.ext_commit_stream_thinking.clear();
-            self.ext_commit_stream_text.clear();
-            self.ext_commit_msg_dirty = false;
-            self.ext_commit_msg_needs_regen = false;
-            (
-                self.ext_commit_generation,
-                Arc::clone(&self.ext_commit_cancel_flag),
-            )
-        } else {
-            self.commit_generation += 1;
-            self.commit_msg_generating = true;
-            self.commit_started_at = Some(Instant::now());
-            self.commit_progress_stage = prep_stage;
-            self.commit_stream_logs.clear();
-            self.commit_stream_thinking.clear();
-            self.commit_stream_text.clear();
-            self.commit_msg_dirty = false;
-            self.commit_msg_needs_regen = false;
-            (self.commit_generation, Arc::clone(&self.commit_cancel_flag))
-        };
+        let (current_gen, cancel_flag) = self.commit_slot_mut(is_external).begin_generation(prep_stage);
         self.commit_error = None;
 
         let bundle = self.bundle.clone();
@@ -3059,8 +3109,8 @@ impl App {
             return;
         }
         let needs_main = !main_paths.is_empty() || has_git_sub_sync;
-        if (needs_main && self.commit_message.trim().is_empty())
-            || (!ext_paths.is_empty() && self.ext_commit_message.trim().is_empty())
+        if (needs_main && self.commit_main.message.trim().is_empty())
+            || (!ext_paths.is_empty() && self.commit_ext.message.trim().is_empty())
         {
             self.commit_error =
                 Some(rust_i18n::t!("commit.err_empty_msg", locale = locale.as_str()).into_owned());
@@ -3070,8 +3120,8 @@ impl App {
         self.commit_executing = true;
         self.commit_error = None;
         let vcs = Arc::clone(&self.vcs);
-        let msg = self.commit_message.clone();
-        let ext_msg = (!ext_paths.is_empty()).then(|| self.ext_commit_message.clone());
+        let msg = self.commit_main.message.clone();
+        let ext_msg = (!ext_paths.is_empty()).then(|| self.commit_ext.message.clone());
         let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
@@ -3103,13 +3153,9 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.commit_editing_msg = false;
-                    let (needs, dirty) = if is_ext {
-                        (self.ext_commit_msg_needs_regen, self.ext_commit_msg_dirty)
-                    } else {
-                        (self.commit_msg_needs_regen, self.commit_msg_dirty)
-                    };
-                    if needs
-                        && !dirty
+                    let slot = self.commit_slot(is_ext);
+                    if slot.needs_regen
+                        && !slot.dirty
                         && self.pending_commit_regen_at.is_none()
                         && !self.any_commit_msg_generating()
                     {
@@ -3123,8 +3169,8 @@ impl App {
                     } else {
                         CommitModalFocus::Files
                     };
-                    if ((self.commit_msg_needs_regen && !self.commit_msg_dirty)
-                        || (self.ext_commit_msg_needs_regen && !self.ext_commit_msg_dirty))
+                    if ((self.commit_main.needs_regen && !self.commit_main.dirty)
+                        || (self.commit_ext.needs_regen && !self.commit_ext.dirty))
                         && self.pending_commit_regen_at.is_none()
                         && !self.any_commit_msg_generating()
                     {
@@ -3132,26 +3178,14 @@ impl App {
                     }
                 }
                 _ => {
-                    if is_ext {
-                        let prev = self.ext_commit_message.clone();
-                        if crate::ui::text_input::handle_key(
-                            &mut self.ext_commit_message,
-                            &mut self.ext_commit_msg_cursor,
-                            key,
-                        ) && self.ext_commit_message != prev
-                        {
-                            self.mark_commit_message_edited_slot(true);
-                        }
-                    } else {
-                        let prev_msg = self.commit_message.clone();
-                        if crate::ui::text_input::handle_key(
-                            &mut self.commit_message,
-                            &mut self.commit_msg_cursor,
-                            key,
-                        ) && self.commit_message != prev_msg
-                        {
-                            self.mark_commit_message_edited_slot(false);
-                        }
+                    let changed = {
+                        let slot = self.commit_slot_mut(is_ext);
+                        let prev = slot.message.clone();
+                        crate::ui::text_input::handle_key(&mut slot.message, &mut slot.cursor, key)
+                            && slot.message != prev
+                    };
+                    if changed {
+                        self.mark_commit_message_edited_slot(is_ext);
                     }
                 }
             }
@@ -3160,15 +3194,8 @@ impl App {
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.commit_generation += 1;
-                self.ext_commit_generation += 1;
-                self.pending_commit_regen_at = None;
-                self.commit_msg_generating = false;
-                self.ext_commit_msg_generating = false;
-                self.commit_started_at = None;
-                self.ext_commit_started_at = None;
+                self.stop_commit_slots();
                 self.commit_hint_notice = None;
-                self.cancel_commit_msg_task();
                 self.overlay = OverlayKind::None;
             }
             KeyCode::Tab => {
@@ -3288,26 +3315,26 @@ impl App {
                         && main_paths.is_empty());
                 if edit_ext {
                     self.commit_modal_focus = CommitModalFocus::ExternalMessage;
-                    self.ext_commit_msg_cursor = self.ext_commit_message.len();
+                    self.commit_ext.cursor = self.commit_ext.message.len();
                 } else {
                     self.commit_modal_focus = CommitModalFocus::Message;
-                    self.commit_msg_cursor = self.commit_message.len();
+                    self.commit_main.cursor = self.commit_main.message.len();
                 }
                 self.commit_editing_msg = true;
             }
             KeyCode::Char('g') => {
                 match self.commit_modal_focus {
                     CommitModalFocus::Message => {
-                        self.commit_msg_dirty = false;
+                        self.commit_main.dirty = false;
                         self.regenerate_commit_slot_with_cache(false, true);
                     }
                     CommitModalFocus::ExternalMessage => {
-                        self.ext_commit_msg_dirty = false;
+                        self.commit_ext.dirty = false;
                         self.regenerate_commit_slot_with_cache(true, true);
                     }
                     CommitModalFocus::Files => {
-                        self.commit_msg_dirty = false;
-                        self.ext_commit_msg_dirty = false;
+                        self.commit_main.dirty = false;
+                        self.commit_ext.dirty = false;
                         self.regenerate_commit_message_with_cache(true);
                     }
                 }
@@ -3318,11 +3345,11 @@ impl App {
             KeyCode::Enter => {
                 match self.commit_modal_focus {
                     CommitModalFocus::Message => {
-                        self.commit_msg_cursor = self.commit_message.len();
+                        self.commit_main.cursor = self.commit_main.message.len();
                         self.commit_editing_msg = true;
                     }
                     CommitModalFocus::ExternalMessage => {
-                        self.ext_commit_msg_cursor = self.ext_commit_message.len();
+                        self.commit_ext.cursor = self.commit_ext.message.len();
                         self.commit_editing_msg = true;
                     }
                     CommitModalFocus::Files => {
@@ -3348,13 +3375,7 @@ impl App {
                 if !self.any_commit_msg_generating() {
                     return;
                 }
-                self.commit_generation += 1;
-                self.ext_commit_generation += 1;
-                self.cancel_commit_msg_task();
-                self.commit_msg_generating = false;
-                self.ext_commit_msg_generating = false;
-                self.commit_started_at = None;
-                self.ext_commit_started_at = None;
+                self.stop_commit_slots();
                 self.commit_hint_notice = None;
                 self.execute_commit_confirm();
             }
@@ -4043,6 +4064,14 @@ impl App {
         else {
             return;
         };
+        if self.selected_file_idx == Some(cidx)
+            && matches!(
+                self.tree_rows.get(self.tree_cursor),
+                Some(TreeRow::FileItem { change_idx, .. }) if *change_idx == cidx
+            )
+        {
+            return;
+        }
         self.selected_file_idx = Some(cidx);
         if let Some(pos) = self.tree_rows.iter().position(|r| {
             matches!(r, TreeRow::FileItem { change_idx, .. } if *change_idx == cidx)
@@ -4111,11 +4140,10 @@ impl App {
                 self.path_to_index = new_path_map;
                 // Invalidate in-flight width/mode rerenders and cached commit messages for the old file set
                 self.rerender_generation += 1;
+                self.rerender_cancel_seq
+                    .store(self.rerender_generation, Ordering::Relaxed);
                 self.pending_rerender_at = None;
-                self.commit_generation += 1;
-                self.cancel_commit_msg_task();
-                self.commit_msg_generating = false;
-                self.pending_commit_regen_at = None;
+                self.stop_commit_slots();
                 self.commit_msg_cache.clear();
 
                 for p in &removed_paths {
@@ -4141,6 +4169,9 @@ impl App {
                     )
                 };
                 self.rebuild_tree_and_continuous();
+                if !self.bundle.changes.is_empty() {
+                    self.re_render_all_for_mode_or_width();
+                }
                 if let Some(idx) = self.selected_file_idx {
                     self.jump_continuous_to_file(idx);
                 }
@@ -4242,11 +4273,7 @@ impl App {
     }
 
     fn step_n_or_hunk(&mut self, forward: bool) {
-        let has_issues = self
-            .ai_review
-            .as_ref()
-            .is_some_and(|ai| !collect_ai_tree_issues(ai).is_empty());
-        if !has_issues || !self.step_finding(forward) {
+        if !self.step_finding(forward) {
             self.jump_hunk(forward);
         }
     }
@@ -4528,7 +4555,7 @@ impl App {
                         self.config.ui_language = loc.clone();
                         self.config.ui_language_explicit = true;
                         self.config.review_language = loc.clone();
-                        self.rebuild_tree_rows();
+                        self.rebuild_tree_and_continuous();
                         let disp = i18n::display_name(&loc);
                         self.status_message = rust_i18n::t!(
                             "status.lang_both_updated",
@@ -4558,7 +4585,7 @@ impl App {
                     if let Some(loc) = i18n::resolve_locale(arg) {
                         self.config.ui_language = loc.clone();
                         self.config.ui_language_explicit = true;
-                        self.rebuild_tree_rows();
+                        self.rebuild_tree_and_continuous();
                         let disp = i18n::display_name(&loc);
                         self.status_message = rust_i18n::t!(
                             "status.ui_lang_updated",
@@ -4590,16 +4617,8 @@ impl App {
             }
             "ai" => {
                 if let Some(p) = parts.get(1) {
-                    self.ai_session_epoch += 1;
-                    self.ai_generation += 1;
-                    self.ai_stage1_completed_gen = 0;
-                    self.ai_followup_generation += 1;
-                    self.commit_generation += 1;
-                    self.clear_ai_runtime_flags();
-                    self.config.switch_provider(p);
-                    self.active_ai_provider_id = self.config.ai_provider.clone();
                     self.user_forced_flat_tree = false;
-                    self.trigger_ai_analysis(true);
+                    self.apply_ai_provider_change(p, true);
                 } else {
                     self.available_providers = ai::detect_available_providers(&self.config);
                     self.ai_picker_cursor = 0;
@@ -4800,7 +4819,8 @@ impl Drop for App {
     fn drop(&mut self) {
         self.ai_cancel_flag.store(true, Ordering::Relaxed);
         self.ai_followup_cancel_flag.store(true, Ordering::Relaxed);
-        self.commit_cancel_flag.store(true, Ordering::Relaxed);
+        self.commit_main.cancel_flag.store(true, Ordering::Relaxed);
+        self.commit_ext.cancel_flag.store(true, Ordering::Relaxed);
     }
 }
 
@@ -4809,12 +4829,14 @@ fn render_all_files(
     bundle: &DiffBundle,
     mode: DifftDisplayMode,
     width: u16,
+    need_json: bool,
 ) -> anyhow::Result<(
     Vec<FileDiffRendered>,
     Vec<Text<'static>>,
     HashMap<String, usize>,
 )> {
-    let rendered_diffs = engine.render_changes_bounded(&bundle.changes, mode, width)?;
+    let rendered_diffs =
+        engine.render_changes_bounded_with_options(&bundle.changes, mode, width, need_json)?;
     let mut parsed_texts = Vec::with_capacity(rendered_diffs.len());
     let mut path_to_index = HashMap::with_capacity(rendered_diffs.len());
     for (i, r) in rendered_diffs.iter().enumerate() {
@@ -5051,7 +5073,7 @@ fn collect_ai_tree_issues(ai: &AiReviewResult) -> Vec<TreeIssueEntry> {
         });
     }
     for (ord, ha) in ai.hunks.iter().enumerate() {
-        if ha.risk_level <= RiskLevel::Medium
+        if ha.risk_level.is_elevated()
             && (!ha.title.trim().is_empty() || !ha.analysis.trim().is_empty())
         {
             out.push(TreeIssueEntry {
@@ -5080,7 +5102,7 @@ pub fn count_file_tree_issues(ai: &AiReviewResult, file_path: &str) -> usize {
         .iter()
         .filter(|ha| {
             ha.file == file_path
-                && ha.risk_level <= RiskLevel::Medium
+                && ha.risk_level.is_elevated()
                 && (!ha.title.trim().is_empty() || !ha.analysis.trim().is_empty())
         })
         .count();

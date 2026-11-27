@@ -15,6 +15,8 @@ pub struct IgnoreMatcher {
     /// Ordered from lowest precedence (repo root) to highest precedence (scope_dir).
     layers: Vec<Gitignore>,
     primary_file: PathBuf,
+    vcs_root_raw: PathBuf,
+    vcs_root_canon: PathBuf,
     fingerprint: String,
 }
 
@@ -90,7 +92,10 @@ impl IgnoreMatcher {
                 Err(err) => {
                     let looks_like_toml = raw.lines().any(|l| {
                         let t = l.trim();
-                        t == "[ai]" || t == "[diff]" || t == "[ignore]"
+                        matches!(
+                            t,
+                            "[ai]" | "[diff]" | "[ignore]" | "[ui]" | "[[custom_ai]]"
+                        )
                     });
                     if looks_like_toml {
                         eprintln!(
@@ -118,6 +123,8 @@ impl IgnoreMatcher {
         Self {
             layers,
             primary_file: scope_canon.join(IGNORE_FILE_NAME),
+            vcs_root_raw: vcs_root.to_path_buf(),
+            vcs_root_canon,
             fingerprint,
         }
     }
@@ -150,6 +157,9 @@ impl IgnoreMatcher {
     pub fn is_ignored(&self, base_dir: &Path, rel_path: &str) -> bool {
         if self.layers.is_empty() {
             return false;
+        }
+        if base_dir == self.vcs_root_raw || base_dir == self.vcs_root_canon {
+            return self.is_ignored_canon(&self.vcs_root_canon, rel_path);
         }
         let base_canon =
             std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());

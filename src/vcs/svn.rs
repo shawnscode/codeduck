@@ -157,18 +157,19 @@ impl SvnBackend {
         }
     }
 
-    fn svn_cat_optional(&self, target: &str) -> Option<Vec<u8>> {
-        let peg = Self::svn_peg_target(target);
+    fn svn_cat_at_peg(&self, target: &str, peg_rev: &str) -> Result<Vec<u8>> {
+        // Append peg revision directly (SVN splits at the last `@`, so `@` in filenames stays literal).
+        let peg_target = format!("{}@{}", target, peg_rev);
         let output = Command::new("svn")
-            .args(["cat", "--non-interactive", "--", &peg])
+            .args(["cat", "--non-interactive", "--", &peg_target])
             .current_dir(&self.scope_dir)
             .output()
-            .ok()?;
-        if output.status.success() {
-            Some(output.stdout)
-        } else {
-            None
+            .with_context(|| format!("Failed to execute `svn cat` for {}", peg_target))?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("`svn cat` failed for {}: {}", peg_target, err.trim());
         }
+        Ok(output.stdout)
     }
 
     fn svn_cat_rev_optional(&self, rev: &str, path_or_url: &str) -> Option<Vec<u8>> {
@@ -208,6 +209,26 @@ impl SvnBackend {
             .or_else(|| rev.trim().strip_prefix('R'))
             .unwrap_or(rev.trim())
             .to_string()
+    }
+
+    fn validate_rev(rev: &str) -> Result<String> {
+        let cleaned = Self::normalize_rev(rev);
+        if cleaned.is_empty() {
+            bail!("SVN revision cannot be empty");
+        }
+        if cleaned.starts_with('-')
+            || cleaned.contains('@')
+            || cleaned.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            bail!("Invalid SVN revision `{}`", rev);
+        }
+        let valid = cleaned.chars().all(|c| c.is_ascii_digit())
+            || matches!(cleaned.as_str(), "HEAD" | "BASE" | "COMMITTED" | "PREV")
+            || (cleaned.starts_with('{') && cleaned.ends_with('}') && cleaned.len() > 2);
+        if !valid {
+            bail!("Invalid SVN revision `{}`", rev);
+        }
+        Ok(cleaned)
     }
 
     fn percent_decode_utf8(input: &str) -> String {
@@ -493,7 +514,6 @@ impl SvnBackend {
             let props = props.clone();
             let copied = *copied;
 
-            let abs_path = self.scope_dir.join(&rel_path);
             let old_content = match &kind {
                 ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Replaced => {
                     self.svn_cat_rev_optional("BASE", &rel_path)
@@ -511,7 +531,10 @@ impl SvnBackend {
                 | ChangeKind::Renamed { .. }
                     if !is_dir =>
                 {
-                    std::fs::read(&abs_path).ok()
+                    crate::vcs::read_worktree_svn_special_safe(
+                        &self.scope_dir,
+                        Path::new(&rel_path),
+                    )
                 }
                 _ => None,
             };
@@ -566,7 +589,7 @@ impl SvnBackend {
     ) -> Result<DiffBundle> {
         let rev_range = format!("{}:{}", old_rev, new_rev);
         let url_peg = format!("{}@{}", self.wc_url, new_rev);
-        let xml_bytes = self.run_svn(&["diff", "--summarize", "--xml", "-r", &rev_range, &url_peg])?;
+        let xml_bytes = self.run_svn(&["diff", "--summarize", "--xml", "-r", &rev_range, "--", &url_peg])?;
         let xml = String::from_utf8(xml_bytes).context("Invalid UTF-8 from `svn diff --summarize --xml`")?;
         let doc = roxmltree::Document::parse(&xml).context("Failed to parse `svn diff --summarize --xml`")?;
 
@@ -610,49 +633,66 @@ impl SvnBackend {
         }
 
         let rev_range_ref = rev_range.as_str();
-        let results = run_bounded(&raw_entries, 8, |(raw_url, display_path, is_dir, props, kind)| {
-            let old_content = if !*is_dir && old_rev != "0" && *kind != ChangeKind::Added {
-                self.svn_cat_optional(&format!("{}@{}", raw_url, old_rev))
-            } else {
-                None
-            };
+        let results: Vec<Result<Option<FileChange>>> =
+            run_bounded(&raw_entries, 8, |(raw_url, display_path, is_dir, props, kind)| {
+                let old_content = if !*is_dir && old_rev != "0" && *kind != ChangeKind::Added {
+                    match kind {
+                        // A replaced path may have changed kind (e.g. dir -> file) in `old_rev`.
+                        ChangeKind::Replaced => self.svn_cat_at_peg(raw_url, old_rev).ok(),
+                        _ => Some(self.svn_cat_at_peg(raw_url, old_rev)?),
+                    }
+                } else {
+                    None
+                };
 
-            let new_content = if !*is_dir && *kind != ChangeKind::Deleted {
-                self.svn_cat_optional(&format!("{}@{}", raw_url, new_rev))
-            } else {
-                None
-            };
+                let new_content = if !*is_dir && *kind != ChangeKind::Deleted {
+                    match kind {
+                        ChangeKind::Replaced => self.svn_cat_at_peg(raw_url, new_rev).ok(),
+                        _ => Some(self.svn_cat_at_peg(raw_url, new_rev)?),
+                    }
+                } else {
+                    None
+                };
 
-            let prop_changes = if props != "none" {
-                let prop_target = format!("{}@{}", raw_url, new_rev);
-                self.svn_prop_diff(&["-r", rev_range_ref], &prop_target)
-            } else {
-                None
-            };
+                let prop_changes = if props != "none" {
+                    let prop_target = format!("{}@{}", raw_url, new_rev);
+                    self.svn_prop_diff(&["-r", rev_range_ref], &prop_target)
+                } else {
+                    None
+                };
 
-            if *is_dir && prop_changes.is_none() {
-                return None;
+                if *is_dir && prop_changes.is_none() {
+                    return Ok(None);
+                }
+
+                let is_binary = old_content.as_deref().is_some_and(looks_binary)
+                    || new_content.as_deref().is_some_and(looks_binary);
+                let old_size = old_content.as_ref().map(|b| b.len());
+                let new_size = new_content.as_ref().map(|b| b.len());
+
+                Ok(Some(FileChange {
+                    path: display_path.clone(),
+                    old_path: None,
+                    kind: if *is_dir {
+                        ChangeKind::PropertyOnly
+                    } else {
+                        kind.clone()
+                    },
+                    is_binary,
+                    old_content,
+                    new_content,
+                    old_size,
+                    new_size,
+                    prop_changes,
+                }))
+            });
+
+        let mut changes = Vec::new();
+        for res in results {
+            if let Some(ch) = res? {
+                changes.push(ch);
             }
-
-            let is_binary = old_content.as_deref().is_some_and(looks_binary)
-                || new_content.as_deref().is_some_and(looks_binary);
-            let old_size = old_content.as_ref().map(|b| b.len());
-            let new_size = new_content.as_ref().map(|b| b.len());
-
-            Some(FileChange {
-                path: display_path.clone(),
-                old_path: None,
-                kind: if *is_dir { ChangeKind::PropertyOnly } else { kind.clone() },
-                is_binary,
-                old_content,
-                new_content,
-                old_size,
-                new_size,
-                prop_changes,
-            })
-        });
-
-        let mut changes: Vec<FileChange> = results.into_iter().flatten().collect();
+        }
         changes.sort_by(|a, b| a.path.cmp(&b.path));
 
         Ok(DiffBundle {
@@ -671,29 +711,7 @@ fn run_bounded<T: Sync, R: Send>(
     max_workers: usize,
     worker: impl Fn(&T) -> R + Sync,
 ) -> Vec<R> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let worker_cnt = items.len().min(max_workers.max(1));
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<R>>> =
-        (0..items.len()).map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|s| {
-        for _ in 0..worker_cnt {
-            s.spawn(|| loop {
-                let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if idx >= items.len() {
-                    break;
-                }
-                let res = worker(&items[idx]);
-                *slots[idx].lock().unwrap() = Some(res);
-            });
-        }
-    });
-    slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().expect("slot populated"))
-        .collect()
+    crate::parallel::run_bounded(items, max_workers, worker)
 }
 
 impl SvnBackend {
@@ -788,7 +806,7 @@ impl VcsBackend for SvnBackend {
         match target {
             DiffTarget::Uncommitted => self.collect_uncommitted(ignore),
             DiffTarget::Commit(rev) => {
-                let rev_clean = Self::normalize_rev(rev);
+                let rev_clean = Self::validate_rev(rev)?;
                 let rev_num: u64 = rev_clean
                     .parse()
                     .with_context(|| format!("Invalid SVN revision number: {}", rev))?;
@@ -800,8 +818,8 @@ impl VcsBackend for SvnBackend {
                 self.collect_revision_range(&prev_rev, &rev_clean, target.clone(), info, ignore)
             }
             DiffTarget::Range { from, to } => {
-                let from_clean = Self::normalize_rev(from);
-                let to_clean = Self::normalize_rev(to);
+                let from_clean = Self::validate_rev(from)?;
+                let to_clean = Self::validate_rev(to)?;
                 self.collect_revision_range(&from_clean, &to_clean, target.clone(), None, ignore)
             }
         }
@@ -1081,15 +1099,30 @@ impl VcsBackend for SvnBackend {
             return make_err("No files selected to revert".to_string());
         }
 
-        // Expand any paired old_path for renamed entries so `svn mv` restores cleanly.
+        // Expand any paired old_path for renamed entries via lightweight `svn status -q --xml`
+        // so `svn mv` restores cleanly without reading full file contents.
         let mut expanded_paths = paths.to_vec();
         let selected_set: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
-        if let Ok(bundle) = self.collect_uncommitted(None) {
-            for ch in bundle.changes {
-                if selected_set.contains(ch.path.as_str()) {
-                    if let Some(old_p) = ch.old_path {
-                        if !expanded_paths.contains(&old_p) {
-                            expanded_paths.push(old_p);
+        if let Ok(xml_bytes) = self.run_svn_in(&self.scope_dir, &["status", "-q", "--xml", "."]) {
+            if let Ok(xml) = std::str::from_utf8(&xml_bytes) {
+                if let Ok(doc) = roxmltree::Document::parse(xml) {
+                    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+                        let Some(raw_path) = entry.attribute("path") else {
+                            continue;
+                        };
+                        let rel_path = self.url_to_display_path(raw_path);
+                        if !selected_set.contains(rel_path.as_str()) {
+                            continue;
+                        }
+                        if let Some(moved_from) = entry
+                            .children()
+                            .find(|n| n.has_tag_name("wc-status"))
+                            .and_then(|wc| wc.attribute("moved-from"))
+                        {
+                            let old_p = self.url_to_display_path(moved_from);
+                            if !old_p.is_empty() && !expanded_paths.contains(&old_p) {
+                                expanded_paths.push(old_p);
+                            }
                         }
                     }
                 }

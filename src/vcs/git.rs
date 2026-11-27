@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
 use crate::ignore::IgnoreMatcher;
@@ -43,7 +43,7 @@ impl GitBackend {
 
     fn run_git_in(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
         let output = Command::new("git")
-            .args(["-c", "core.quotepath=false"])
+            .args(["--literal-pathspecs", "-c", "core.quotepath=false"])
             .args(args)
             .current_dir(dir)
             .output()
@@ -55,26 +55,178 @@ impl GitBackend {
         Ok(output.stdout)
     }
 
-    fn git_show_optional_in(&self, dir: &Path, spec: &str) -> Option<Vec<u8>> {
-        let output = Command::new("git")
-            .args(["-c", "core.quotepath=false", "show", spec])
-            .current_dir(dir)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            Some(output.stdout)
-        } else {
-            None
-        }
+    fn strict_utf8_path(bytes: &[u8], context_cmd: &str) -> Result<String> {
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Non-UTF-8 path emitted by `{}` cannot be addressed safely: {:?}",
+                    context_cmd,
+                    String::from_utf8_lossy(bytes)
+                )
+            })
     }
 
-    fn has_head_in(&self, dir: &Path) -> bool {
-        Command::new("git")
-            .args(["rev-parse", "--verify", "HEAD"])
+    fn git_cat_file_batch_in(
+        &self,
+        dir: &Path,
+        shas: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let mut blobs = HashMap::new();
+        if shas.is_empty() {
+            return Ok(blobs);
+        }
+        let mut unique = Vec::with_capacity(shas.len());
+        let mut seen = HashSet::with_capacity(shas.len());
+        for s in shas {
+            if seen.insert(s.as_str()) {
+                unique.push(s.as_str());
+            }
+        }
+        let mut child = Command::new("git")
+            .args([
+                "--literal-pathspecs",
+                "-c",
+                "core.quotepath=false",
+                "cat-file",
+                "--batch",
+            ])
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn `git cat-file --batch`")?;
+
+        let mut stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let err_handle = std::thread::spawn(move || {
+            let mut err_buf = Vec::new();
+            if let Some(mut s) = stderr {
+                let _ = s.read_to_end(&mut err_buf);
+            }
+            err_buf
+        });
+
+        let mut parse_err: Option<anyhow::Error> = None;
+        std::thread::scope(|s| {
+            let writer_handle = s.spawn(move || -> std::io::Result<()> {
+                if let Some(mut sin) = stdin.take() {
+                    for sha in unique {
+                        writeln!(sin, "{}", sha)?;
+                    }
+                    sin.flush()?;
+                }
+                Ok(())
+            });
+
+            if let Some(sout) = stdout {
+                let mut reader = BufReader::new(sout);
+                let mut header_buf = Vec::with_capacity(128);
+                loop {
+                    header_buf.clear();
+                    match reader.read_until(b'\n', &mut header_buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            parse_err = Some(anyhow::anyhow!("Failed reading `git cat-file --batch`: {}", e));
+                            break;
+                        }
+                    }
+                    let header = String::from_utf8_lossy(&header_buf);
+                    let trimmed = header.trim_end_matches(['\r', '\n']);
+                    if trimmed.ends_with(" missing") {
+                        continue;
+                    }
+                    let mut parts = trimmed.split_whitespace();
+                    let Some(sha) = parts.next() else {
+                        parse_err = Some(anyhow::anyhow!("Malformed `git cat-file --batch` header: {}", trimmed));
+                        break;
+                    };
+                    let Some(_obj_type) = parts.next() else {
+                        parse_err = Some(anyhow::anyhow!("Malformed `git cat-file --batch` header: {}", trimmed));
+                        break;
+                    };
+                    let Some(size_str) = parts.next() else {
+                        parse_err = Some(anyhow::anyhow!("Malformed `git cat-file --batch` header: {}", trimmed));
+                        break;
+                    };
+                    let Ok(size) = size_str.parse::<usize>() else {
+                        parse_err = Some(anyhow::anyhow!("Invalid `git cat-file --batch` size: {}", size_str));
+                        break;
+                    };
+                    let mut data = vec![0u8; size];
+                    if let Err(e) = reader.read_exact(&mut data) {
+                        parse_err = Some(anyhow::anyhow!("Truncated `git cat-file --batch` blob {}: {}", sha, e));
+                        break;
+                    }
+                    let mut nl = [0u8; 1];
+                    match reader.read_exact(&mut nl) {
+                        Ok(()) if nl == [b'\n'] => {}
+                        Ok(()) => {
+                            parse_err = Some(anyhow::anyhow!(
+                                "Expected trailing newline after `git cat-file --batch` blob {}",
+                                sha
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            parse_err = Some(anyhow::anyhow!(
+                                "Truncated delimiter after `git cat-file --batch` blob {}: {}",
+                                sha,
+                                e
+                            ));
+                            break;
+                        }
+                    }
+                    blobs.insert(sha.to_string(), data);
+                }
+            }
+            let _ = writer_handle.join();
+        });
+
+        let status = child.wait().context("Failed waiting for `git cat-file --batch`")?;
+        let err_bytes = err_handle.join().unwrap_or_default();
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
+        if !status.success() {
+            bail!(
+                "`git cat-file --batch` failed: {}",
+                String::from_utf8_lossy(&err_bytes).trim()
+            );
+        }
+        Ok(blobs)
+    }
+
+    fn head_exists_in(&self, dir: &Path) -> Result<bool> {
+        let out = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
             .current_dir(dir)
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .with_context(|| format!("Failed to inspect HEAD in {}", dir.display()))?;
+        if out.status.success() {
+            return Ok(true);
+        }
+        // On an unborn branch (`git init` with 0 commits), `rev-parse --verify --quiet HEAD`
+        // exits 1 silently while `symbolic-ref --quiet HEAD` succeeds.
+        if out.stderr.is_empty() {
+            let sym = Command::new("git")
+                .args(["symbolic-ref", "--quiet", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .with_context(|| format!("Failed to inspect symbolic HEAD in {}", dir.display()))?;
+            if sym.status.success() {
+                return Ok(false);
+            }
+        }
+        bail!(
+            "Failed to resolve HEAD in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
     }
 
     fn resolve_head_in(&self, dir: &Path) -> Option<String> {
@@ -141,15 +293,126 @@ impl GitBackend {
         (!norm.is_empty()).then_some(norm)
     }
 
-    /// Discover initialized submodule prefixes (including nested `--recursive` submodules)
-    /// relative to `self.repo_root`, constrained to `self.scope_dir` and `ignore`.
-    fn initialized_submodules(&self, ignore: Option<&IgnoreMatcher>) -> Vec<String> {
-        if !self.repo_root.join(".gitmodules").is_file() {
-            return Vec::new();
+    fn collect_index_gitlink_state_in(
+        &self,
+        dir: &Path,
+        prefix: &str,
+    ) -> Result<(Vec<String>, HashSet<String>)> {
+        let mut seen_gl = HashSet::new();
+        let mut links = Vec::new();
+        let mut non_gitlinks = HashSet::new();
+        let stage_out = self
+            .run_git_in(dir, &["ls-files", "--stage", "-z"])
+            .with_context(|| format!("Failed to inspect staged gitlinks in {}", dir.display()))?;
+        for rec in stage_out.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let Some(tab_pos) = rec.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let meta = std::str::from_utf8(&rec[..tab_pos]).unwrap_or("");
+            let path = Self::strict_utf8_path(&rec[tab_pos + 1..], "git ls-files --stage -z")?;
+            let full = Self::prefix_path(prefix, &path);
+            if meta.starts_with("160000 ") {
+                if seen_gl.insert(full.clone()) {
+                    links.push(full);
+                }
+            } else {
+                non_gitlinks.insert(full);
+            }
         }
-        let Ok(out) = self.run_git(&["submodule", "status", "--recursive"]) else {
-            return Vec::new();
-        };
+        if self.head_exists_in(dir)? {
+            let head_out = self
+                .run_git_in(dir, &["ls-tree", "-r", "-z", "HEAD"])
+                .with_context(|| format!("Failed to inspect HEAD gitlinks in {}", dir.display()))?;
+            for rec in head_out.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                let Some(tab_pos) = rec.iter().position(|&b| b == b'\t') else {
+                    continue;
+                };
+                let meta = std::str::from_utf8(&rec[..tab_pos]).unwrap_or("");
+                if meta.starts_with("160000 ") {
+                    let path =
+                        Self::strict_utf8_path(&rec[tab_pos + 1..], "git ls-tree -r -z HEAD")?;
+                    let full = Self::prefix_path(prefix, &path);
+                    if seen_gl.insert(full.clone()) {
+                        links.push(full);
+                    }
+                }
+            }
+        }
+        Ok((links, non_gitlinks))
+    }
+
+    fn verify_no_unresolved_gitlinks(
+        &self,
+        paths: &[String],
+        subs: &[String],
+    ) -> Result<()> {
+        let (mut gitlinks, mut non_gitlinks) =
+            self.collect_index_gitlink_state_in(&self.repo_root, "")?;
+        for sub in subs {
+            let sub_dir = self.repo_root.join(sub);
+            if sub_dir.join(".git").exists() {
+                let (sub_gl, sub_non_gl) = self.collect_index_gitlink_state_in(&sub_dir, sub)?;
+                gitlinks.extend(sub_gl);
+                non_gitlinks.extend(sub_non_gl);
+            }
+        }
+        let sub_set: HashSet<&str> = subs.iter().map(String::as_str).collect();
+        for p in paths {
+            let norm = p.trim_start_matches("./");
+            if non_gitlinks.contains(norm) {
+                // Explicitly tracked as a non-gitlink entry in the owning repo index (e.g.,
+                // submodule converted into regular directory and staged in the parent index).
+                continue;
+            }
+            let mut anc_opt = std::path::Path::new(norm).parent();
+            while let Some(anc) = anc_opt {
+                if !anc.as_os_str().is_empty() {
+                    let anc_str = anc.to_string_lossy();
+                    let anc_norm = anc_str.replace('\\', "/");
+                    if !sub_set.contains(anc_norm.as_str())
+                        && self.repo_root.join(anc).join(".git").exists()
+                    {
+                        bail!(
+                            "Path `{}` lies inside embedded git repository `{}` whose submodule metadata cannot be resolved safely",
+                            p,
+                            anc_norm
+                        );
+                    }
+                }
+                anc_opt = anc.parent();
+            }
+            for gl in &gitlinks {
+                let prefix = format!("{}/", gl);
+                if norm.starts_with(&prefix) {
+                    // Must be owned by an initialized submodule strictly beneath (or equal to) `gl`,
+                    // otherwise removing `.gitmodules` or staging deletion would misroute `gl/...`.
+                    let owned_by_init_sub = sub_set.contains(gl.as_str())
+                        || subs
+                            .iter()
+                            .any(|s| s.starts_with(&prefix) && norm.starts_with(&format!("{}/", s)));
+                    if !owned_by_init_sub {
+                        bail!(
+                            "Path `{}` belongs to index gitlink `{}` whose submodule metadata cannot be resolved safely",
+                            p,
+                            gl
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Discover initialized submodule prefixes (including nested `--recursive` submodules)
+    /// relative to `self.repo_root`, constrained to `self.scope_dir` and `ignore`,
+    /// propagating command errors instead of silently falling back to the parent repo.
+    fn initialized_submodules_checked(&self, ignore: Option<&IgnoreMatcher>) -> Result<Vec<String>> {
+        if !self.repo_root.join(".gitmodules").is_file() {
+            return Ok(Vec::new());
+        }
+        let out = self
+            .run_git(&["submodule", "status", "--recursive"])
+            .context("Failed to enumerate initialized git submodules")?;
         let text = String::from_utf8_lossy(&out);
         let mut subs = Vec::new();
         let mut seen = HashSet::new();
@@ -179,7 +442,12 @@ impl GitBackend {
                 subs.push(rel);
             }
         }
-        subs
+        Ok(subs)
+    }
+
+    fn initialized_submodules(&self, ignore: Option<&IgnoreMatcher>) -> Vec<String> {
+        self.initialized_submodules_checked(ignore)
+            .unwrap_or_default()
     }
 
     fn validate_rev(rev: &str) -> Result<&str> {
@@ -259,27 +527,24 @@ impl GitBackend {
         changes: &mut Vec<FileChange>,
         seen: &mut HashSet<String>,
     ) -> Result<()> {
-        let has_head = self.has_head_in(repo_dir);
+        let has_head = self.head_exists_in(repo_dir)?;
 
         if has_head {
             let out = self.run_git_in(
                 scan_dir,
-                &["diff", "--raw", "--no-abbrev", "-M", "HEAD", "--", "."],
+                &["diff", "--raw", "-z", "--no-abbrev", "-M", "HEAD", "--", "."],
             )?;
-            let text = String::from_utf8_lossy(&out);
-            for line in text.lines() {
-                if let Some(fc) = self.parse_raw_diff_line(
-                    repo_dir,
-                    prefix,
-                    line,
-                    Some("HEAD"),
-                    None,
-                    skip_dirty_subs,
-                    ignore,
-                )? {
-                    if seen.insert(fc.path.clone()) {
-                        changes.push(fc);
-                    }
+            for fc in self.build_changes_from_raw_z(
+                repo_dir,
+                prefix,
+                &out,
+                Some("HEAD"),
+                None,
+                skip_dirty_subs,
+                ignore,
+            )? {
+                if seen.insert(fc.path.clone()) {
+                    changes.push(fc);
                 }
             }
         }
@@ -292,7 +557,7 @@ impl GitBackend {
             if entry_bytes.len() < 4 {
                 continue;
             }
-            let entry = String::from_utf8_lossy(entry_bytes);
+            let entry = Self::strict_utf8_path(entry_bytes, "git status -z")?;
             let mut chars = entry.chars();
             let x = chars.next().unwrap_or(' ');
             let y = chars.next().unwrap_or(' ');
@@ -300,7 +565,9 @@ impl GitBackend {
             let inner_path: String = chars.collect();
             // In `-z` format, R/C entries emit a second NUL-terminated token for orig_path; consume it.
             if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
-                let _ = iter.next();
+                if let Some(orig_bytes) = iter.next() {
+                    let _ = Self::strict_utf8_path(orig_bytes, "git status -z")?;
+                }
             }
             if inner_path.is_empty() {
                 continue;
@@ -317,10 +584,12 @@ impl GitBackend {
                     continue;
                 }
                 let abs = repo_dir.join(&inner_path);
-                if abs.is_dir() {
+                let meta = std::fs::symlink_metadata(&abs).ok();
+                if meta.as_ref().is_some_and(|m| m.is_dir()) {
                     continue;
                 }
-                let new_content = std::fs::read(&abs).ok();
+                let new_content =
+                    crate::vcs::read_worktree_file_safe(repo_dir, Path::new(&inner_path));
                 let is_binary = new_content.as_deref().is_some_and(looks_binary);
                 let new_size = new_content.as_ref().map(|b| b.len());
                 seen.insert(path.clone());
@@ -340,125 +609,201 @@ impl GitBackend {
         Ok(())
     }
 
-    fn parse_raw_diff_line(
+    fn build_changes_from_raw_z(
         &self,
         repo_dir: &Path,
         prefix: &str,
-        line: &str,
+        raw_out: &[u8],
         old_rev: Option<&str>,
         new_rev: Option<&str>,
         skip_dirty_subs: &HashSet<String>,
         ignore: Option<&IgnoreMatcher>,
-    ) -> Result<Option<FileChange>> {
-        let Some((meta, rest)) = line.split_once('\t') else {
-            return Ok(None);
-        };
-        let meta_fields: Vec<&str> = meta.trim_start_matches(':').split_whitespace().collect();
-        if meta_fields.len() < 5 {
-            return Ok(None);
-        }
-        let (old_mode, new_mode, old_sha, new_sha, status) = (
-            meta_fields[0],
-            meta_fields[1],
-            meta_fields[2],
-            meta_fields[3],
-            meta_fields[4],
-        );
-
-        let parts: Vec<&str> = rest.split('\t').collect();
-        if parts.is_empty() {
-            return Ok(None);
+    ) -> Result<Vec<FileChange>> {
+        struct PendingEntry {
+            path: String,
+            old_path: Option<String>,
+            inner_path: String,
+            kind: ChangeKind,
+            old_mode: String,
+            new_mode: String,
+            old_sha: String,
+            new_sha: String,
+            eff_new_sha: Option<String>,
         }
 
-        let (kind, inner_old_path, inner_path) = if status.starts_with('R') && parts.len() >= 2 {
-            let from = Self::prefix_path(prefix, parts[0]);
-            (
-                ChangeKind::Renamed { from },
-                Some(parts[0].to_string()),
-                parts[1].to_string(),
-            )
-        } else if status.starts_with('C') && parts.len() >= 2 {
-            (ChangeKind::Added, None, parts[1].to_string())
-        } else if status.starts_with('A') {
-            (ChangeKind::Added, None, parts[0].to_string())
-        } else if status.starts_with('D') {
-            (ChangeKind::Deleted, None, parts[0].to_string())
-        } else {
-            (ChangeKind::Modified, None, parts[0].to_string())
-        };
+        let mut pending = Vec::new();
+        let mut needed_shas = Vec::new();
+        let mut iter = raw_out.split(|&b| b == 0);
 
-        let path = Self::prefix_path(prefix, &inner_path);
-        let old_path = inner_old_path.as_deref().map(|p| Self::prefix_path(prefix, p));
+        while let Some(meta_bytes) = iter.next() {
+            if meta_bytes.is_empty() {
+                continue;
+            }
+            let meta = String::from_utf8_lossy(meta_bytes);
+            let meta_trimmed = meta.trim_start();
+            let Some(after_colon) = meta_trimmed.strip_prefix(':') else {
+                continue;
+            };
+            let meta_fields: Vec<&str> = after_colon.split_whitespace().collect();
+            if meta_fields.len() < 5 {
+                continue;
+            }
+            let (old_mode, new_mode, old_sha, new_sha, status) = (
+                meta_fields[0],
+                meta_fields[1],
+                meta_fields[2],
+                meta_fields[3],
+                meta_fields[4],
+            );
 
-        if ignore.is_some_and(|m| m.is_ignored(&self.repo_root, &path)) {
-            return Ok(None);
-        }
-
-        let is_gitlink = old_mode == "160000" || new_mode == "160000";
-        let eff_new_sha = if is_gitlink && new_mode == "160000" {
-            if new_rev.is_some() || !Self::is_zero_sha(new_sha) {
-                Some(new_sha.to_string())
+            let Some(p1_bytes) = iter.next() else {
+                break;
+            };
+            let p1 = Self::strict_utf8_path(p1_bytes, "git diff --raw -z")?;
+            let (kind, inner_old_path, inner_path) = if status.starts_with('R') {
+                let Some(p2_bytes) = iter.next() else {
+                    break;
+                };
+                let p2 = Self::strict_utf8_path(p2_bytes, "git diff --raw -z")?;
+                let from = Self::prefix_path(prefix, &p1);
+                (ChangeKind::Renamed { from }, Some(p1), p2)
+            } else if status.starts_with('C') {
+                let Some(p2_bytes) = iter.next() else {
+                    break;
+                };
+                let p2 = Self::strict_utf8_path(p2_bytes, "git diff --raw -z")?;
+                (ChangeKind::Added, None, p2)
+            } else if status.starts_with('A') {
+                (ChangeKind::Added, None, p1)
+            } else if status.starts_with('D') {
+                (ChangeKind::Deleted, None, p1)
             } else {
-                let sub_dir = repo_dir.join(&inner_path);
-                self.resolve_head_in(&sub_dir)
-            }
-        } else {
-            None
-        };
+                (ChangeKind::Modified, None, p1)
+            };
 
-        // When scanning uncommitted changes inside initialized submodules, a dirty worktree whose
-        // checked-out commit pointer has not changed shows up in the parent as a 160000 entry with
-        // matching SHAs; skip that redundant parent entry since its inner files are expanded directly.
-        if new_rev.is_none()
-            && old_mode == "160000"
-            && new_mode == "160000"
-            && skip_dirty_subs.contains(&inner_path)
-            && !Self::is_zero_sha(old_sha)
-            && eff_new_sha.as_deref() == Some(old_sha)
-        {
-            return Ok(None);
+            let path = Self::prefix_path(prefix, &inner_path);
+            let old_path = inner_old_path.as_deref().map(|p| Self::prefix_path(prefix, p));
+
+            if ignore.is_some_and(|m| m.is_ignored(&self.repo_root, &path)) {
+                continue;
+            }
+
+            let is_gitlink = old_mode == "160000" || new_mode == "160000";
+            let eff_new_sha = if is_gitlink && new_mode == "160000" {
+                if new_rev.is_some() || !Self::is_zero_sha(new_sha) {
+                    Some(new_sha.to_string())
+                } else {
+                    self.resolve_head_in(&repo_dir.join(&inner_path))
+                }
+            } else {
+                None
+            };
+
+            // Skip redundant parent gitlink entry when inner submodule files are scanned directly.
+            if new_rev.is_none()
+                && old_mode == "160000"
+                && new_mode == "160000"
+                && skip_dirty_subs.contains(&inner_path)
+                && !Self::is_zero_sha(old_sha)
+                && eff_new_sha.as_deref() == Some(old_sha)
+            {
+                continue;
+            }
+
+            if !matches!(kind, ChangeKind::Added)
+                && old_mode != "160000"
+                && old_rev.is_some()
+                && !Self::is_zero_sha(old_sha)
+            {
+                needed_shas.push(old_sha.to_string());
+            }
+            if !matches!(kind, ChangeKind::Deleted)
+                && new_mode != "160000"
+                && new_rev.is_some()
+                && !Self::is_zero_sha(new_sha)
+            {
+                needed_shas.push(new_sha.to_string());
+            }
+
+            pending.push(PendingEntry {
+                path,
+                old_path,
+                inner_path,
+                kind,
+                old_mode: old_mode.to_string(),
+                new_mode: new_mode.to_string(),
+                old_sha: old_sha.to_string(),
+                new_sha: new_sha.to_string(),
+                eff_new_sha,
+            });
         }
 
-        let old_content = match (&kind, old_rev) {
-            (ChangeKind::Added, _) => None,
-            _ if old_mode == "160000" && !Self::is_zero_sha(old_sha) => {
-                Some(Self::gitlink_placeholder(old_sha))
-            }
-            (_, Some(rev)) => {
-                let p = inner_old_path.as_deref().unwrap_or(&inner_path);
-                self.git_show_optional_in(repo_dir, &format!("{}:{}", rev, p))
-            }
-            (_, None) => None,
-        };
+        let blobs = self.git_cat_file_batch_in(repo_dir, &needed_shas)?;
+        let mut changes = Vec::with_capacity(pending.len());
+        for item in pending {
+            let old_content = match (&item.kind, old_rev) {
+                (ChangeKind::Added, _) => None,
+                _ if item.old_mode == "160000" && !Self::is_zero_sha(&item.old_sha) => {
+                    Some(Self::gitlink_placeholder(&item.old_sha))
+                }
+                (_, Some(_)) if !Self::is_zero_sha(&item.old_sha) => Some(
+                    blobs
+                        .get(&item.old_sha)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Missing git blob {} for old side of {}",
+                                item.old_sha,
+                                item.path
+                            )
+                        })?,
+                ),
+                _ => None,
+            };
 
-        let new_content = match (&kind, new_rev) {
-            (ChangeKind::Deleted, _) => None,
-            _ if new_mode == "160000" => {
-                eff_new_sha
+            let new_content = match (&item.kind, new_rev) {
+                (ChangeKind::Deleted, _) => None,
+                _ if item.new_mode == "160000" => item
+                    .eff_new_sha
                     .as_deref()
                     .filter(|s| !Self::is_zero_sha(s))
-                    .map(Self::gitlink_placeholder)
-            }
-            (_, Some(rev)) => self.git_show_optional_in(repo_dir, &format!("{}:{}", rev, inner_path)),
-            (_, None) => std::fs::read(repo_dir.join(&inner_path)).ok(),
-        };
+                    .map(Self::gitlink_placeholder),
+                (_, Some(_)) if !Self::is_zero_sha(&item.new_sha) => Some(
+                    blobs
+                        .get(&item.new_sha)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Missing git blob {} for new side of {}",
+                                item.new_sha,
+                                item.path
+                            )
+                        })?,
+                ),
+                (_, None) => {
+                    crate::vcs::read_worktree_file_safe(repo_dir, Path::new(&item.inner_path))
+                }
+                _ => None,
+            };
 
-        let is_binary = old_content.as_deref().is_some_and(looks_binary)
-            || new_content.as_deref().is_some_and(looks_binary);
-        let old_size = old_content.as_ref().map(|b| b.len());
-        let new_size = new_content.as_ref().map(|b| b.len());
+            let is_binary = old_content.as_deref().is_some_and(looks_binary)
+                || new_content.as_deref().is_some_and(looks_binary);
+            let old_size = old_content.as_ref().map(|b| b.len());
+            let new_size = new_content.as_ref().map(|b| b.len());
 
-        Ok(Some(FileChange {
-            path,
-            old_path,
-            kind,
-            is_binary,
-            old_content,
-            new_content,
-            old_size,
-            new_size,
-            prop_changes: None,
-        }))
+            changes.push(FileChange {
+                path: item.path,
+                old_path: item.old_path,
+                kind: item.kind,
+                is_binary,
+                old_content,
+                new_content,
+                old_size,
+                new_size,
+                prop_changes: None,
+            });
+        }
+        Ok(changes)
     }
 
     fn fetch_commit_info(&self, rev: &str) -> Option<CommitInfo> {
@@ -509,6 +854,7 @@ impl VcsBackend for GitBackend {
                     "diff-tree",
                     "--no-commit-id",
                     "--raw",
+                    "-z",
                     "--no-abbrev",
                     "-r",
                     "-M",
@@ -517,24 +863,18 @@ impl VcsBackend for GitBackend {
                     "--root",
                     valid_rev,
                 ])?;
-                let text = String::from_utf8_lossy(&out);
                 let parent_rev = format!("{}^", valid_rev);
                 let has_parent = self.run_git(&["rev-parse", "--verify", &parent_rev]).is_ok();
                 let empty_subs = HashSet::new();
-                let mut changes = Vec::new();
-                for line in text.lines() {
-                    if let Some(fc) = self.parse_raw_diff_line(
-                        &self.repo_root,
-                        "",
-                        line,
-                        if has_parent { Some(parent_rev.as_str()) } else { None },
-                        Some(valid_rev),
-                        &empty_subs,
-                        ignore,
-                    )? {
-                        changes.push(fc);
-                    }
-                }
+                let mut changes = self.build_changes_from_raw_z(
+                    &self.repo_root,
+                    "",
+                    &out,
+                    if has_parent { Some(parent_rev.as_str()) } else { None },
+                    Some(valid_rev),
+                    &empty_subs,
+                    ignore,
+                )?;
                 changes.sort_by(|a, b| a.path.cmp(&b.path));
                 Ok(DiffBundle {
                     vcs: VcsKind::Git,
@@ -551,27 +891,22 @@ impl VcsBackend for GitBackend {
                 let out = self.run_git(&[
                     "diff",
                     "--raw",
+                    "-z",
                     "--no-abbrev",
                     "-M",
                     valid_from,
                     valid_to,
                 ])?;
-                let text = String::from_utf8_lossy(&out);
                 let empty_subs = HashSet::new();
-                let mut changes = Vec::new();
-                for line in text.lines() {
-                    if let Some(fc) = self.parse_raw_diff_line(
-                        &self.repo_root,
-                        "",
-                        line,
-                        Some(valid_from),
-                        Some(valid_to),
-                        &empty_subs,
-                        ignore,
-                    )? {
-                        changes.push(fc);
-                    }
-                }
+                let mut changes = self.build_changes_from_raw_z(
+                    &self.repo_root,
+                    "",
+                    &out,
+                    Some(valid_from),
+                    Some(valid_to),
+                    &empty_subs,
+                    ignore,
+                )?;
                 changes.sort_by(|a, b| a.path.cmp(&b.path));
                 Ok(DiffBundle {
                     vcs: VcsKind::Git,
@@ -689,9 +1024,19 @@ impl VcsBackend for GitBackend {
             return make_err("No files selected to commit".to_string());
         }
 
+        let subs = match self.initialized_submodules_checked(None) {
+            Ok(s) => s,
+            Err(e) => return make_err(format!("{:#}", e)),
+        };
+        if let Err(e) = self.verify_no_unresolved_gitlinks(paths, &subs) {
+            return make_err(format!("{:#}", e));
+        }
         let selected_set: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
-        let rename_old_map = self.collect_rename_old_map(&selected_set);
-        let mut groups = self.group_paths_by_submodule(paths);
+        let rename_old_map = match self.collect_rename_old_map_with_subs(&selected_set, &subs) {
+            Ok(m) => m,
+            Err(e) => return make_err(format!("{:#}", e)),
+        };
+        let mut groups = Self::group_paths_by_submodule_with_subs(paths, &subs);
         let has_ext = groups.keys().any(|k| !k.is_empty());
         // In Git, committing inside a submodule advances its HEAD and dirty-updates its parent
         // gitlink pointer, so main/parent repo always needs a commit message whenever `has_ext`.
@@ -768,7 +1113,7 @@ impl VcsBackend for GitBackend {
                 }
             }
             for gl in extra_gitlinks {
-                let changed_in_parent = !self.has_head_in(&repo_dir)
+                let changed_in_parent = self.head_exists_in(&repo_dir).ok() == Some(false)
                     || self
                         .run_git_in(&repo_dir, &["status", "--porcelain", "--", &gl])
                         .map(|o| !String::from_utf8_lossy(&o).trim().is_empty())
@@ -864,9 +1209,19 @@ impl VcsBackend for GitBackend {
             return make_err("No files selected to revert".to_string());
         }
 
+        let subs = match self.initialized_submodules_checked(None) {
+            Ok(s) => s,
+            Err(e) => return make_err(format!("{:#}", e)),
+        };
+        if let Err(e) = self.verify_no_unresolved_gitlinks(paths, &subs) {
+            return make_err(format!("{:#}", e));
+        }
         let selected_set: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
-        let rename_old_map = self.collect_rename_old_map(&selected_set);
-        let groups = self.group_paths_by_submodule(paths);
+        let rename_old_map = match self.collect_rename_old_map_with_subs(&selected_set, &subs) {
+            Ok(m) => m,
+            Err(e) => return make_err(format!("{:#}", e)),
+        };
+        let groups = Self::group_paths_by_submodule_with_subs(paths, &subs);
         let multi_or_ext = groups.len() > 1 || groups.keys().any(|k| !k.is_empty());
 
         let mut outputs = Vec::new();
@@ -946,8 +1301,11 @@ impl VcsBackend for GitBackend {
 }
 
 impl GitBackend {
-    fn group_paths_by_submodule(&self, paths: &[String]) -> BTreeMap<String, Vec<(String, String)>> {
-        let mut subs = self.initialized_submodules(None);
+    fn group_paths_by_submodule_with_subs(
+        paths: &[String],
+        subs_in: &[String],
+    ) -> BTreeMap<String, Vec<(String, String)>> {
+        let mut subs = subs_in.to_vec();
         subs.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -971,18 +1329,69 @@ impl GitBackend {
         groups
     }
 
-    fn collect_rename_old_map(&self, selected: &HashSet<&str>) -> HashMap<String, String> {
+    fn collect_rename_old_map_with_subs(
+        &self,
+        selected: &HashSet<&str>,
+        subs: &[String],
+    ) -> Result<HashMap<String, String>> {
         let mut map = HashMap::new();
-        if let Ok(bundle) = self.collect_uncommitted(None) {
-            for ch in bundle.changes {
-                if selected.contains(ch.path.as_str()) {
-                    if let Some(old_p) = ch.old_path {
-                        map.insert(ch.path, old_p);
-                    }
+        if selected.is_empty() {
+            return Ok(map);
+        }
+        let scan_dir = |repo_dir: &Path, prefix: &str, out: &mut HashMap<String, String>| -> Result<()> {
+            if !self.head_exists_in(repo_dir)? {
+                return Ok(());
+            }
+            let raw = self.run_git_in(
+                repo_dir,
+                &[
+                    "diff",
+                    "--raw",
+                    "-z",
+                    "--no-abbrev",
+                    "-M",
+                    "--diff-filter=R",
+                    "HEAD",
+                    "--",
+                    ".",
+                ],
+            )?;
+            let mut iter = raw.split(|&b| b == 0);
+            while let Some(meta_bytes) = iter.next() {
+                if meta_bytes.is_empty() {
+                    continue;
+                }
+                let meta = String::from_utf8_lossy(meta_bytes);
+                if !meta.trim_start().starts_with(':') {
+                    continue;
+                }
+                let Some(old_bytes) = iter.next() else {
+                    break;
+                };
+                let Some(new_bytes) = iter.next() else {
+                    break;
+                };
+                let inner_old = Self::strict_utf8_path(old_bytes, "git diff --raw -z")?;
+                let inner_new = Self::strict_utf8_path(new_bytes, "git diff --raw -z")?;
+                let full_new = Self::prefix_path(prefix, &inner_new);
+                if selected.contains(full_new.as_str()) {
+                    out.insert(full_new, Self::prefix_path(prefix, &inner_old));
+                }
+            }
+            Ok(())
+        };
+
+        scan_dir(&self.repo_root, "", &mut map)?;
+        for sub in subs {
+            let sub_prefix = format!("{}/", sub);
+            if selected.iter().any(|p| p.starts_with(&sub_prefix)) {
+                let sub_dir = self.repo_root.join(sub);
+                if sub_dir.join(".git").exists() {
+                    scan_dir(&sub_dir, sub, &mut map)?;
                 }
             }
         }
-        map
+        Ok(map)
     }
 
     fn strip_repo_prefix(prefix: &str, full_path: &str) -> String {
@@ -1025,21 +1434,42 @@ impl GitBackend {
         inner_paths: &[String],
         msg_path: &str,
     ) -> Result<String> {
-        let add_paths: Vec<String> = inner_paths
-            .iter()
-            .filter(|p| {
-                repo_dir.join(p).exists()
-                    || self
-                        .run_git_in(repo_dir, &["ls-files", "--error-unmatch", "--", p])
-                        .is_ok()
-            })
-            .cloned()
-            .collect();
+        let mut add_paths: Vec<String> = Vec::with_capacity(inner_paths.len());
+        let mut missing_paths: Vec<&str> = Vec::new();
+        for p in inner_paths {
+            if std::fs::symlink_metadata(repo_dir.join(p)).is_ok() {
+                add_paths.push(p.clone());
+            } else {
+                missing_paths.push(p.as_str());
+            }
+        }
+        if !missing_paths.is_empty() {
+            let mut ls_cmd = Command::new("git");
+            ls_cmd
+                .args(["--literal-pathspecs", "-c", "core.quotepath=false", "ls-files", "-z", "--"])
+                .current_dir(repo_dir);
+            for p in &missing_paths {
+                ls_cmd.arg(p);
+            }
+            if let Ok(out) = ls_cmd.output() {
+                if out.status.success() {
+                    let mut tracked = HashSet::new();
+                    for raw in out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                        tracked.insert(Self::strict_utf8_path(raw, "git ls-files -z")?);
+                    }
+                    for p in missing_paths {
+                        if tracked.contains(p) {
+                            add_paths.push(p.to_string());
+                        }
+                    }
+                }
+            }
+        }
 
         if !add_paths.is_empty() {
             let mut add_cmd = Command::new("git");
             add_cmd
-                .args(["-c", "core.quotepath=false", "add", "-A", "--"])
+                .args(["--literal-pathspecs", "-c", "core.quotepath=false", "add", "-A", "--"])
                 .current_dir(repo_dir);
             for p in &add_paths {
                 add_cmd.arg(p);
@@ -1053,7 +1483,15 @@ impl GitBackend {
 
         let mut commit_cmd = Command::new("git");
         commit_cmd
-            .args(["-c", "core.quotepath=false", "commit", "-F", msg_path, "--"])
+            .args([
+                "--literal-pathspecs",
+                "-c",
+                "core.quotepath=false",
+                "commit",
+                "-F",
+                msg_path,
+                "--",
+            ])
             .current_dir(repo_dir);
         for p in inner_paths {
             commit_cmd.arg(p);
@@ -1086,15 +1524,19 @@ impl GitBackend {
         inner_paths: &[String],
         rename_old_map: &HashMap<String, String>,
     ) -> Result<()> {
-        let has_head = self.has_head_in(repo_dir);
+        let has_head = self.head_exists_in(repo_dir)?;
         let mut head_restore_paths: Vec<String> = Vec::new();
         let mut remove_new_paths: Vec<String> = Vec::new();
 
         for p in inner_paths {
             let in_head = if has_head {
-                self.run_git_in(repo_dir, &["ls-tree", "-r", "--name-only", "HEAD", "--", p])
-                    .map(|out| !String::from_utf8_lossy(&out).trim().is_empty())
-                    .unwrap_or(false)
+                let out = self
+                    .run_git_in(
+                        repo_dir,
+                        &["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", p],
+                    )
+                    .with_context(|| format!("Failed to check whether `{}` exists in HEAD", p))?;
+                !out.is_empty()
             } else {
                 false
             };
@@ -1119,16 +1561,31 @@ impl GitBackend {
             if has_head {
                 let mut reset_cmd = Command::new("git");
                 reset_cmd
-                    .args(["-c", "core.quotepath=false", "reset", "-q", "HEAD", "--"])
+                    .args([
+                        "--literal-pathspecs",
+                        "-c",
+                        "core.quotepath=false",
+                        "reset",
+                        "-q",
+                        "HEAD",
+                        "--",
+                    ])
                     .current_dir(repo_dir);
                 for p in &remove_new_paths {
                     reset_cmd.arg(p);
                 }
-                let _ = reset_cmd.output();
+                let out = reset_cmd
+                    .output()
+                    .context("Failed to execute `git reset` during revert")?;
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    bail!("`git reset` failed during revert: {}", err.trim());
+                }
             } else {
                 let mut rm_cmd = Command::new("git");
                 rm_cmd
                     .args([
+                        "--literal-pathspecs",
                         "-c",
                         "core.quotepath=false",
                         "rm",
@@ -1141,24 +1598,17 @@ impl GitBackend {
                 for p in &remove_new_paths {
                     rm_cmd.arg(p);
                 }
-                let _ = rm_cmd.output();
+                let out = rm_cmd
+                    .output()
+                    .context("Failed to execute `git rm --cached` during revert")?;
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    bail!("`git rm --cached` failed during revert: {}", err.trim());
+                }
             }
 
             for p in &remove_new_paths {
-                let rel = Path::new(p);
-                if rel.is_absolute()
-                    || rel
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    bail!("Unsafe path to revert: {}", p);
-                }
-                let abs = repo_dir.join(rel);
-                if abs.is_file() || abs.is_symlink() {
-                    std::fs::remove_file(&abs).with_context(|| {
-                        format!("Failed to remove added/untracked file {}", abs.display())
-                    })?;
-                }
+                crate::vcs::remove_worktree_file_safe(repo_dir, Path::new(p))?;
             }
         }
 
@@ -1166,6 +1616,7 @@ impl GitBackend {
             let mut restore_cmd = Command::new("git");
             restore_cmd
                 .args([
+                    "--literal-pathspecs",
                     "-c",
                     "core.quotepath=false",
                     "restore",

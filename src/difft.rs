@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tempfile::TempDir;
 
 use crate::model::{
@@ -46,6 +46,10 @@ impl DifftEngine {
             new_root,
             next_pair_id: AtomicU64::new(1),
         })
+    }
+
+    pub fn ignore_comments(&self) -> bool {
+        self.ignore_comments
     }
 
     pub fn check_available(difft_bin: &str) -> Result<String> {
@@ -99,34 +103,106 @@ impl DifftEngine {
         mode: DifftDisplayMode,
         width: u16,
     ) -> Result<Vec<FileDiffRendered>> {
+        self.render_changes_bounded_with_options(changes, mode, width, true)
+    }
+
+    pub fn render_changes_bounded_with_options(
+        &self,
+        changes: &[FileChange],
+        mode: DifftDisplayMode,
+        width: u16,
+        need_json: bool,
+    ) -> Result<Vec<FileDiffRendered>> {
         if changes.is_empty() {
             return Ok(Vec::new());
         }
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .clamp(2, 8)
-            .min(changes.len());
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let slots: Vec<std::sync::Mutex<Option<Result<FileDiffRendered>>>> =
-            (0..changes.len()).map(|_| std::sync::Mutex::new(None)).collect();
-        std::thread::scope(|s| {
-            for _ in 0..workers {
-                s.spawn(|| loop {
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= changes.len() {
-                        break;
-                    }
-                    let res = self.render_file(&changes[idx], mode, width);
-                    *slots[idx].lock().unwrap() = Some(res);
-                });
-            }
-        });
-        let mut rendered = Vec::with_capacity(changes.len());
-        for slot in slots {
-            rendered.push(slot.into_inner().unwrap().expect("render slot populated")?);
+            .clamp(2, 8);
+        crate::parallel::run_bounded(changes, workers, |ch| {
+            self.render_file_with_options(ch, mode, width, need_json)
+        })
+        .into_iter()
+        .collect()
+    }
+
+    /// Lazily populate Difftastic AST JSON metadata for diffs rendered with `need_json = false`.
+    /// Respects `cancel_flag` and returns computed updates so callers can persist them back to UI state.
+    pub fn ensure_json_for_ai(
+        &self,
+        changes: &[FileChange],
+        diffs: &mut [FileDiffRendered],
+        cancel_flag: &AtomicBool,
+    ) -> Vec<(usize, String, Option<DifftJsonOutput>, String, Vec<HunkMeta>)> {
+        let targets: Vec<usize> = changes
+            .iter()
+            .zip(diffs.iter())
+            .enumerate()
+            .filter_map(|(idx, (ch, d))| {
+                let max_bytes = ch
+                    .old_content
+                    .as_ref()
+                    .map_or(0, |b| b.len())
+                    .max(ch.new_content.as_ref().map_or(0, |b| b.len()));
+                (!ch.is_binary
+                    && ch.kind != ChangeKind::PropertyOnly
+                    && ((d.json.is_none() && (max_bytes <= 262_144 || d.json_ignore_comments != self.ignore_comments))
+                        || d.json_ignore_comments != self.ignore_comments))
+                    .then_some(idx)
+            })
+            .collect();
+        if targets.is_empty() || cancel_flag.load(Ordering::Relaxed) {
+            return Vec::new();
         }
-        Ok(rendered)
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8);
+        let updates = crate::parallel::run_bounded(&targets, workers, |&idx| {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return None;
+            }
+            let ch = &changes[idx];
+            let d = &diffs[idx];
+            let max_bytes = ch
+                .old_content
+                .as_ref()
+                .map_or(0, |b| b.len())
+                .max(ch.new_content.as_ref().map_or(0, |b| b.len()));
+            let pair = (max_bytes <= 262_144).then(|| self.write_pair(ch).ok()).flatten();
+            let json = match &pair {
+                Some((old_file, new_file, _)) => {
+                    self.run_json(old_file, new_file, &ch.path).ok().flatten()
+                }
+                None => None,
+            };
+            let hunks_meta = build_hunks_meta(&d.ansi_output, &d.hunk_anchors, json.as_ref());
+            let current_ansi = (d.rendered_ignore_comments == self.ignore_comments)
+                .then_some(d.ansi_output.as_str());
+            let old_new_files = pair.as_ref().map(|(o, n, _)| (o.as_path(), n.as_path()));
+            let summary = self.summarize_for_ai(ch, json.as_ref(), current_ansi, old_new_files);
+            Some((idx, ch.path.clone(), json, summary, hunks_meta))
+        });
+        let mut applied = Vec::new();
+        for (idx, path, json, summary, hunks_meta) in updates.into_iter().flatten() {
+            if let Some(d) = diffs.get_mut(idx) {
+                d.json_ignore_comments = self.ignore_comments;
+                if let Some(ref j) = json {
+                    if !j.language.is_empty() {
+                        d.language = j.language.clone();
+                    }
+                    if !j.status.is_empty() {
+                        d.status = j.status.clone();
+                    }
+                }
+                d.hunks_meta = hunks_meta.clone();
+                d.ai_summary_diff = summary.clone();
+                d.json = json.clone();
+                applied.push((idx, path, json, summary, hunks_meta));
+            }
+        }
+        applied
     }
 
     pub fn render_file(
@@ -134,6 +210,16 @@ impl DifftEngine {
         change: &FileChange,
         mode: DifftDisplayMode,
         width: u16,
+    ) -> Result<FileDiffRendered> {
+        self.render_file_with_options(change, mode, width, true)
+    }
+
+    pub fn render_file_with_options(
+        &self,
+        change: &FileChange,
+        mode: DifftDisplayMode,
+        width: u16,
+        need_json: bool,
     ) -> Result<FileDiffRendered> {
         if change.is_binary {
             let old_len = change.old_byte_len();
@@ -149,6 +235,8 @@ impl DifftEngine {
                 ansi_output,
                 rendered_width: width,
                 rendered_mode: mode,
+                rendered_ignore_comments: self.ignore_comments,
+                json_ignore_comments: self.ignore_comments,
                 json: None,
                 hunk_anchors: vec![0],
                 hunks_meta: vec![HunkMeta {
@@ -183,6 +271,8 @@ impl DifftEngine {
                 ansi_output,
                 rendered_width: width,
                 rendered_mode: mode,
+                rendered_ignore_comments: self.ignore_comments,
+                json_ignore_comments: self.ignore_comments,
                 json: None,
                 hunk_anchors: vec![0],
                 hunks_meta: vec![HunkMeta {
@@ -201,8 +291,8 @@ impl DifftEngine {
             .as_ref()
             .map_or(0, |b| b.len())
             .max(change.new_content.as_ref().map_or(0, |b| b.len()));
-        // Skip JSON AST parse for huge generated files (>256KB) since difft uses line-oriented mode anyway
-        let json = if max_bytes <= 262_144 {
+        // Skip JSON AST parse for huge generated files (>256KB) or when AI is disabled
+        let json = if need_json && max_bytes <= 262_144 {
             self.run_json(&old_file, &new_file, &change.path).ok().flatten()
         } else {
             None
@@ -226,7 +316,12 @@ impl DifftEngine {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("{:?}", change.kind));
 
-        let ai_summary_diff = build_ai_structural_diff(change, json.as_ref());
+        let ai_summary_diff = self.summarize_for_ai(
+            change,
+            json.as_ref(),
+            Some(&ansi_output),
+            Some((&old_file, &new_file)),
+        );
 
         Ok(FileDiffRendered {
             path: change.path.clone(),
@@ -235,6 +330,8 @@ impl DifftEngine {
             ansi_output,
             rendered_width: width,
             rendered_mode: mode,
+            rendered_ignore_comments: self.ignore_comments,
+            json_ignore_comments: self.ignore_comments,
             json,
             hunk_anchors,
             hunks_meta,
@@ -252,6 +349,8 @@ impl DifftEngine {
         if change.is_binary || change.kind == ChangeKind::PropertyOnly {
             existing.rendered_mode = mode;
             existing.rendered_width = width;
+            existing.rendered_ignore_comments = self.ignore_comments;
+            existing.json_ignore_comments = self.ignore_comments;
             return Ok(());
         }
         let (old_file, new_file, _pair_guard) = self.write_pair(change)?;
@@ -259,12 +358,42 @@ impl DifftEngine {
         if let Some(prop_diff) = &change.prop_changes {
             ansi_output.push_str(&format!("\n\x1b[1;36m--- SVN Properties ---\x1b[0m\n{}", prop_diff));
         }
+        let json_ignore_changed = existing.json_ignore_comments != self.ignore_comments;
+        let ansi_ignore_changed = existing.rendered_ignore_comments != self.ignore_comments;
+        if json_ignore_changed && existing.json.is_some() {
+            let max_bytes = change
+                .old_content
+                .as_ref()
+                .map_or(0, |b| b.len())
+                .max(change.new_content.as_ref().map_or(0, |b| b.len()));
+            existing.json = if max_bytes <= 262_144 {
+                self.run_json(&old_file, &new_file, &change.path).ok().flatten()
+            } else {
+                None
+            };
+            existing.ai_summary_diff = self.summarize_for_ai(
+                change,
+                existing.json.as_ref(),
+                Some(&ansi_output),
+                Some((&old_file, &new_file)),
+            );
+            existing.json_ignore_comments = self.ignore_comments;
+        } else if (json_ignore_changed || ansi_ignore_changed) && existing.json.is_none() {
+            existing.ai_summary_diff = self.summarize_for_ai(
+                change,
+                None,
+                Some(&ansi_output),
+                Some((&old_file, &new_file)),
+            );
+            existing.json_ignore_comments = self.ignore_comments;
+        }
         let hunk_anchors = extract_hunk_anchors(&ansi_output);
         existing.hunks_meta = build_hunks_meta(&ansi_output, &hunk_anchors, existing.json.as_ref());
         existing.hunk_anchors = hunk_anchors;
         existing.ansi_output = ansi_output;
         existing.rendered_width = width;
         existing.rendered_mode = mode;
+        existing.rendered_ignore_comments = self.ignore_comments;
         Ok(())
     }
 
@@ -416,8 +545,9 @@ pub fn extract_hunk_anchors(ansi_output: &str) -> Vec<usize> {
     anchors
 }
 
-pub fn strip_ansi_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+pub fn strip_ansi_into(s: &str, out: &mut String) {
+    out.clear();
+    out.reserve(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
@@ -434,6 +564,11 @@ pub fn strip_ansi_escapes(s: &str) -> String {
             out.push(c);
         }
     }
+}
+
+pub fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::new();
+    strip_ansi_into(s, &mut out);
     out
 }
 
@@ -472,7 +607,23 @@ fn parse_gutter_token(s: &str) -> Option<(Option<u32>, &str)> {
 }
 
 pub fn parse_source_line_from_ansi(ansi_line: &str) -> Option<u32> {
-    let plain = strip_ansi_escapes(ansi_line);
+    if !ansi_line.contains('\x1b') {
+        return parse_source_line_from_plain(ansi_line);
+    }
+    let mut buf = String::new();
+    strip_ansi_into(ansi_line, &mut buf);
+    parse_source_line_from_plain(&buf)
+}
+
+pub fn parse_source_line_from_ansi_with_buf(ansi_line: &str, scratch: &mut String) -> Option<u32> {
+    if !ansi_line.contains('\x1b') {
+        return parse_source_line_from_plain(ansi_line);
+    }
+    strip_ansi_into(ansi_line, scratch);
+    parse_source_line_from_plain(scratch)
+}
+
+fn parse_source_line_from_plain(plain: &str) -> Option<u32> {
     let trimmed_start = plain.trim_start_matches(' ');
     let leading_ws = plain.len() - trimmed_start.len();
 
@@ -525,7 +676,7 @@ pub fn parse_source_line_from_ansi(ansi_line: &str) -> Option<u32> {
     rhs_inline_candidate.or(lhs_fallback)
 }
 
-fn build_hunks_meta(
+pub(crate) fn build_hunks_meta(
     ansi_output: &str,
     hunk_anchors: &[usize],
     json: Option<&DifftJsonOutput>,
@@ -562,13 +713,14 @@ fn build_hunks_meta(
         })
         .unwrap_or_default();
 
+    let mut ansi_scratch = String::new();
     hunk_anchors
         .iter()
         .enumerate()
         .map(|(i, &anchor)| {
             let line_num = ansi_lines
                 .get(anchor)
-                .and_then(|l| parse_source_line_from_ansi(l));
+                .and_then(|l| parse_source_line_from_ansi_with_buf(l, &mut ansi_scratch));
 
             let matched_chunk = if let Some(ln) = line_num {
                 json_ranges
@@ -603,6 +755,105 @@ fn build_hunks_meta(
 
 /// Build a compact, high-signal structural diff snippet for AI review using Difftastic JSON chunks
 /// paired with the actual source lines.
+impl DifftEngine {
+    /// Summarize a file diff for AI while honoring `self.ignore_comments` even if AST JSON
+    /// was empty or unavailable (falling back to comment-ignored Difftastic plain output).
+    pub(crate) fn summarize_for_ai(
+        &self,
+        change: &FileChange,
+        json: Option<&DifftJsonOutput>,
+        current_ansi: Option<&str>,
+        old_new_files: Option<(&Path, &Path)>,
+    ) -> String {
+        fn is_text_fallback_label(label: &str) -> bool {
+            let trimmed = label.trim();
+            trimmed == "Text" || trimmed.starts_with("Text (") || trimmed.contains("exceeded DFT_")
+        }
+
+        if self.ignore_comments {
+            if let Some(j) = json {
+                if is_text_fallback_label(&j.language) {
+                    let mut out = format!(
+                        "=== File: {} [{}] (Language: {}) ===\n",
+                        change.path,
+                        change.kind.short_badge(),
+                        j.language
+                    );
+                    if let Some(old_p) = &change.old_path {
+                        out.push_str(&format!("Moved/Copied from: {}\n", old_p));
+                    }
+                    out.push_str("(Comment-ignored syntactic diff unavailable; Difftastic fell back to text mode)\n");
+                    return out;
+                }
+            }
+        }
+        if let Some(j) = json {
+            if !j.chunks.is_empty() || j.status.eq_ignore_ascii_case("unchanged") {
+                return build_ai_structural_diff(change, Some(j));
+            }
+        }
+        if !self.ignore_comments {
+            return build_ai_structural_diff(change, json);
+        }
+        let lang = json
+            .map(|j| j.language.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Text");
+        let mut out = format!(
+            "=== File: {} [{}] (Language: {}) ===\n",
+            change.path,
+            change.kind.short_badge(),
+            lang
+        );
+        if let Some(old_p) = &change.old_path {
+            out.push_str(&format!("Moved/Copied from: {}\n", old_p));
+        }
+        let max_bytes = change
+            .old_content
+            .as_ref()
+            .map_or(0, |b| b.len())
+            .max(change.new_content.as_ref().map_or(0, |b| b.len()));
+        if max_bytes > 262_144 {
+            out.push_str("(Comment-ignored syntactic diff unavailable; file exceeds Difftastic byte limit)\n");
+            return out;
+        }
+        let ansi_opt = match current_ansi {
+            Some(a) => Some(a.to_string()),
+            None => match old_new_files {
+                Some((old_f, new_f)) => self
+                    .run_ansi(old_f, new_f, DifftDisplayMode::Inline, 120, &change.path)
+                    .ok(),
+                None => None,
+            },
+        };
+        if let Some(ansi) = ansi_opt {
+            let plain = strip_ansi_escapes(&ansi);
+            let lines: Vec<&str> = plain.lines().filter(|l| !l.trim().is_empty()).collect();
+            let fell_back_to_text = lines.first().is_some_and(|hdr| {
+                is_text_fallback_label(hdr) || hdr.contains(" --- Text")
+            });
+            if fell_back_to_text {
+                out.push_str("(Comment-ignored syntactic diff unavailable; Difftastic fell back to text mode)\n");
+            } else if lines.is_empty() {
+                out.push_str("(No non-comment changes)\n");
+            } else {
+                for line in lines.iter().take(120) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                if lines.len() > 120 {
+                    out.push_str(&format!("... ({} more lines omitted)\n", lines.len() - 120));
+                }
+            }
+        } else {
+            out.push_str("(Comment-ignored diff unavailable)\n");
+        }
+        out
+    }
+}
+
+/// Format rich AST chunk diff context from difftastic JSON + original file contents,
+/// providing AI with clear AST token delta notes paired with the actual source lines.
 pub fn build_ai_structural_diff(change: &FileChange, json: Option<&DifftJsonOutput>) -> String {
     if change.is_binary {
         return format!(
@@ -642,6 +893,10 @@ pub fn build_ai_structural_diff(change: &FileChange, json: Option<&DifftJsonOutp
     }
 
     if let Some(j) = json {
+        if j.chunks.is_empty() && j.status.eq_ignore_ascii_case("unchanged") {
+            out.push_str("(No syntactic changes)\n");
+            return out;
+        }
         if !j.chunks.is_empty() {
             for (chunk_idx, chunk) in j.chunks.iter().enumerate() {
                 if chunk_idx >= 25 {

@@ -785,7 +785,7 @@ where
         Err(e) => return Err(e),
     };
 
-    stage1.overall_risk = stage1.overall_risk.min(stage2.overall_risk);
+    stage1.overall_risk = stage1.overall_risk.max_risk(stage2.overall_risk);
     if !stage2.files.is_empty() {
         stage1.files = stage2.files;
     }
@@ -1157,43 +1157,136 @@ Rules:
     prompt
 }
 
-fn scan_balanced_json_object(s: &str) -> Option<&str> {
-    for (start, ch) in s.char_indices() {
-        if ch != '{' {
-            continue;
+/// Iterate candidate balanced `{ ... }` slices inside arbitrary text in a single linear pass,
+/// avoiding O(N²) re-scanning on both nested JSON objects and unclosed `{` sequences.
+struct JsonObjectScanner<'a> {
+    s: &'a str,
+    pos: usize,
+    pending: std::collections::VecDeque<(&'a str, serde_json::Value)>,
+    remaining_inner_budget: usize,
+}
+
+impl<'a> JsonObjectScanner<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            s,
+            pos: 0,
+            pending: std::collections::VecDeque::new(),
+            remaining_inner_budget: s.len().saturating_mul(4).max(8192),
         }
-        let mut depth = 0i32;
-        let mut in_string = false;
-        let mut escape = false;
-        for (rel_idx, c) in s[start..].char_indices() {
-            if in_string {
-                if escape {
-                    escape = false;
-                } else if c == '\\' {
-                    escape = true;
-                } else if c == '"' {
-                    in_string = false;
+    }
+
+    fn queue_valid_inner_spans(
+        &mut self,
+        inner_valid: Vec<(usize, usize)>,
+        fragment_len: usize,
+    ) {
+        // Bound cumulative bytes parsed per fragment and across the whole input so `d` sequential
+        // invalid fragments cannot re-spend full-input budget (`Θ(d³)`), while using `continue`
+        // so oversized invalid wrappers do not skip smaller valid siblings later in the fragment.
+        let mut frag_budget = fragment_len
+            .saturating_mul(2)
+            .max(512)
+            .min(self.remaining_inner_budget);
+        let mut kept: Vec<(usize, usize, serde_json::Value)> = Vec::new();
+        for (is, ie) in inner_valid {
+            let span_len = ie.saturating_sub(is);
+            if span_len > frag_budget || span_len > self.remaining_inner_budget {
+                continue;
+            }
+            frag_budget -= span_len;
+            self.remaining_inner_budget -= span_len;
+            if let Some(val) = parse_json_lenient(&self.s[is..ie]) {
+                while kept
+                    .last()
+                    .is_some_and(|(ks, ke, _)| *ks >= is && *ke <= ie)
+                {
+                    kept.pop();
+                }
+                kept.push((is, ie, val));
+            }
+        }
+        for (is, ie, val) in kept {
+            self.pending.push_back((&self.s[is..ie], val));
+        }
+    }
+
+    fn next_object(&mut self) -> Option<(&'a str, serde_json::Value)> {
+        if let Some(item) = self.pending.pop_front() {
+            return Some(item);
+        }
+        while self.pos < self.s.len() {
+            let rel_open = self.s[self.pos..].find('{')?;
+            let start = self.pos + rel_open;
+            let mut stack = vec![start];
+            let mut in_string = false;
+            let mut escape = false;
+            let mut inner_valid: Vec<(usize, usize)> = Vec::new();
+            let mut top_result: Option<(usize, serde_json::Value)> = None;
+            let mut balanced_end: Option<usize> = None;
+
+            for (rel_idx, c) in self.s[start + 1..].char_indices() {
+                let abs_idx = start + 1 + rel_idx;
+                if in_string {
+                    if escape {
+                        escape = false;
+                    } else if c == '\\' {
+                        escape = true;
+                    } else if c == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => in_string = true,
+                    '{' => stack.push(abs_idx),
+                    '}' => {
+                        if let Some(open_idx) = stack.pop() {
+                            let end_idx = abs_idx + c.len_utf8();
+                            if stack.is_empty() {
+                                balanced_end = Some(end_idx);
+                                if let Some(val) = parse_json_lenient(&self.s[open_idx..end_idx]) {
+                                    top_result = Some((end_idx, val));
+                                }
+                                break;
+                            } else {
+                                inner_valid.push((open_idx, end_idx));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some((end_idx, val)) = top_result {
+                self.pos = end_idx;
+                return Some((&self.s[start..end_idx], val));
+            }
+            if let Some(end_idx) = balanced_end {
+                // Balanced top-level braces failed JSON parse; jump strictly past `end_idx` and
+                // inspect the already-delimited inner spans within the fragment's byte budget.
+                self.pos = end_idx;
+                self.queue_valid_inner_spans(inner_valid, end_idx.saturating_sub(start));
+                if let Some(item) = self.pending.pop_front() {
+                    return Some(item);
                 }
                 continue;
             }
-            match c {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let candidate = &s[start..start + rel_idx + c.len_utf8()];
-                        if parse_json_lenient(candidate).is_some() {
-                            return Some(candidate);
-                        }
-                        break;
-                    }
-                }
-                _ => {}
+            // Hit EOF with unclosed `{` on stack: consume to end in one pass while surfacing
+            // any balanced inner JSON objects cleanly.
+            let rem_len = self.s.len().saturating_sub(start);
+            self.pos = self.s.len();
+            self.queue_valid_inner_spans(inner_valid, rem_len);
+            if let Some(item) = self.pending.pop_front() {
+                return Some(item);
             }
         }
+        None
     }
-    None
+}
+
+fn scan_balanced_json_object(s: &str) -> Option<&str> {
+    JsonObjectScanner::new(s).next_object().map(|(slice, _)| slice)
 }
 
 /// Remove trailing commas before `}` or `]` outside JSON string literals.
@@ -1234,6 +1327,9 @@ fn strip_trailing_commas(s: &str) -> String {
 fn parse_json_lenient(s: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         return Some(v);
+    }
+    if !s.contains(',') {
+        return None;
     }
     let cleaned = strip_trailing_commas(s);
     serde_json::from_str::<serde_json::Value>(&cleaned).ok()
@@ -1307,15 +1403,40 @@ fn unwrap_review_object<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json
     if is_review_json_object(val) {
         return val.as_object();
     }
-    let obj = val.as_object()?;
-    for wrapper_key in ["review", "data", "result", "response"] {
-        if let Some(inner) = obj.get(wrapper_key) {
-            if is_review_json_object(inner) {
-                return inner.as_object();
+    // Search wrapper keys recursively (e.g. `data.result`) as well as any nested review objects.
+    let mut best: Option<(usize, &'a serde_json::Map<String, serde_json::Value>)> = None;
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(val);
+    while let Some(cur) = queue.pop_front() {
+        match cur {
+            serde_json::Value::Object(obj) => {
+                if is_review_json_object(cur) {
+                    let score = review_object_richness_score(obj, 0);
+                    if best.is_none_or(|(b, _)| score > b) {
+                        best = Some((score, obj));
+                    }
+                    continue;
+                }
+                for key in ["review", "data", "result", "response"] {
+                    if let Some(inner) = obj.get(key) {
+                        queue.push_back(inner);
+                    }
+                }
+                for (k, v) in obj {
+                    if !matches!(k.as_str(), "review" | "data" | "result" | "response") {
+                        queue.push_back(v);
+                    }
+                }
             }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    queue.push_back(item);
+                }
+            }
+            _ => {}
         }
     }
-    None
+    best.map(|(_, obj)| obj)
 }
 
 fn review_object_richness_score(obj: &serde_json::Map<String, serde_json::Value>, byte_len: usize) -> usize {
@@ -1339,46 +1460,15 @@ fn find_best_review_json_value(s: &str) -> Option<serde_json::Value> {
     }
 
     let mut best: Option<(usize, serde_json::Value)> = None;
-    for (start, ch) in s.char_indices() {
-        if ch != '{' {
-            continue;
-        }
-        let mut depth = 0i32;
-        let mut in_string = false;
-        let mut escape = false;
-        for (rel_idx, c) in s[start..].char_indices() {
-            if in_string {
-                if escape {
-                    escape = false;
-                } else if c == '\\' {
-                    escape = true;
-                } else if c == '"' {
-                    in_string = false;
-                }
-                continue;
-            }
-            match c {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let candidate = &s[start..start + rel_idx + c.len_utf8()];
-                        if let Some(val) = parse_json_lenient(candidate) {
-                            if let Some(obj) = unwrap_review_object(&val) {
-                                let score = review_object_richness_score(obj, candidate.len());
-                                if best
-                                    .as_ref()
-                                    .is_none_or(|(best_score, _)| score >= *best_score)
-                                {
-                                    best = Some((score, serde_json::Value::Object(obj.clone())));
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-                _ => {}
+    let mut scanner = JsonObjectScanner::new(s);
+    while let Some((candidate, val)) = scanner.next_object() {
+        if let Some(obj) = unwrap_review_object(&val) {
+            let score = review_object_richness_score(obj, candidate.len());
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score >= *best_score)
+            {
+                best = Some((score, serde_json::Value::Object(obj.clone())));
             }
         }
     }

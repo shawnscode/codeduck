@@ -154,7 +154,7 @@ fn diff_cache_file(
         DiffTarget::Commit(r) => format!("commit:{}", r),
         DiffTarget::Range { from, to } => format!("range:{}..{}", from, to),
     };
-    let key = hash_key(&[&kind, &id, &scope, &target_str, ignore_fp]);
+    let key = hash_key(&["v2", &kind, &id, &scope, &target_str, ignore_fp]);
     Some(base.join("history_diffs").join(format!("{}.json", key)))
 }
 
@@ -289,6 +289,313 @@ fn prune_cache_dir(dir: &Path, max_files: usize, max_total_bytes: u64) {
     }
 }
 
+#[cfg(unix)]
+mod unix_worktree {
+    use anyhow::{Context, Result, bail};
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    fn path_to_cstr(p: &std::ffi::OsStr) -> Result<CString> {
+        CString::new(p.as_bytes()).map_err(|_| anyhow::anyhow!("Embedded NUL byte in path"))
+    }
+
+    /// Pin `base_dir` and step through every intermediate component atomically with
+    /// `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` so parent directories cannot be swapped
+    /// for symlinks between validation and use.
+    fn open_parent_dir_nofollow(base_dir: &Path, rel_path: &Path) -> Result<Option<(OwnedFd, CString)>> {
+        let mut normal_comps: Vec<std::ffi::OsString> = Vec::new();
+        for comp in rel_path.components() {
+            match comp {
+                std::path::Component::Normal(seg) => normal_comps.push(seg.to_os_string()),
+                std::path::Component::CurDir => {}
+                _ => bail!("Unsafe path outside worktree root: {}", rel_path.display()),
+            }
+        }
+        if normal_comps.is_empty() {
+            return Ok(None);
+        }
+
+        let base_cstr = path_to_cstr(base_dir.as_os_str())?;
+        let base_raw = unsafe {
+            libc::open(
+                base_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if base_raw < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(err).with_context(|| {
+                format!("Failed to open worktree root {}", base_dir.display())
+            });
+        }
+        let mut cur_fd = unsafe { OwnedFd::from_raw_fd(base_raw) };
+
+        let last_idx = normal_comps.len() - 1;
+        for seg in &normal_comps[..last_idx] {
+            let seg_cstr = path_to_cstr(seg.as_os_str())?;
+            let next_raw = unsafe {
+                libc::openat(
+                    cur_fd.as_raw_fd(),
+                    seg_cstr.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_raw < 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::ENOENT) => return Ok(None),
+                    Some(libc::ELOOP) | Some(libc::ENOTDIR) => bail!(
+                        "Refusing to traverse symlink or non-directory ancestor in worktree path {}",
+                        rel_path.display()
+                    ),
+                    _ => {
+                        return Err(err).with_context(|| {
+                            format!("Failed to open worktree parent segment in {}", rel_path.display())
+                        });
+                    }
+                }
+            }
+            cur_fd = unsafe { OwnedFd::from_raw_fd(next_raw) };
+        }
+
+        let leaf_cstr = path_to_cstr(normal_comps[last_idx].as_os_str())?;
+        Ok(Some((cur_fd, leaf_cstr)))
+    }
+
+    pub(crate) fn read_file_safe(
+        base_dir: &Path,
+        rel_path: &Path,
+        svn_link_prefix: bool,
+    ) -> Option<Vec<u8>> {
+        let (parent_fd, leaf_cstr) = open_parent_dir_nofollow(base_dir, rel_path).ok().flatten()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_cstr.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let ftype = st.st_mode & libc::S_IFMT;
+        if ftype == libc::S_IFLNK {
+            let mut cap = 1024usize;
+            loop {
+                let mut buf = vec![0u8; cap];
+                let n = unsafe {
+                    libc::readlinkat(
+                        parent_fd.as_raw_fd(),
+                        leaf_cstr.as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    return None;
+                }
+                let n = n as usize;
+                if n < cap || cap >= 65_536 {
+                    buf.truncate(n);
+                    if svn_link_prefix {
+                        let mut out = Vec::with_capacity(5 + buf.len());
+                        out.extend_from_slice(b"link ");
+                        out.extend_from_slice(&buf);
+                        return Some(out);
+                    }
+                    return Some(buf);
+                }
+                cap *= 2;
+            }
+        }
+        if ftype != libc::S_IFREG {
+            return None;
+        }
+        let file_raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if file_raw < 0 {
+            return None;
+        }
+        let file_fd = unsafe { OwnedFd::from_raw_fd(file_raw) };
+        let mut file = std::fs::File::from(file_fd);
+        let fmeta = file.metadata().ok()?;
+        if !fmeta.is_file()
+            || fmeta.dev() != (st.st_dev as u64)
+            || fmeta.ino() != (st.st_ino as u64)
+        {
+            return None;
+        }
+        let mut buf = Vec::with_capacity(fmeta.len() as usize);
+        file.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    pub(crate) fn remove_file_safe(base_dir: &Path, rel_path: &Path) -> Result<()> {
+        let Some((parent_fd, leaf_cstr)) = open_parent_dir_nofollow(base_dir, rel_path)? else {
+            return Ok(());
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_cstr.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+            return Err(err).with_context(|| {
+                format!("Failed to inspect {} before revert removal", rel_path.display())
+            });
+        }
+        let ftype = st.st_mode & libc::S_IFMT;
+        if ftype == libc::S_IFREG || ftype == libc::S_IFLNK {
+            if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_cstr.as_ptr(), 0) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(());
+                }
+                return Err(err).with_context(|| {
+                    format!("Failed to unlink added/untracked file {}", rel_path.display())
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+mod fallback_worktree {
+    use anyhow::{Context, Result, bail};
+    use std::path::{Path, PathBuf};
+
+    fn resolve_worktree_path_safe(
+        base_dir: &Path,
+        rel_path: &Path,
+    ) -> Result<Option<(PathBuf, std::fs::Metadata)>> {
+        let mut normal_comps: Vec<std::ffi::OsString> = Vec::new();
+        for comp in rel_path.components() {
+            match comp {
+                std::path::Component::Normal(seg) => normal_comps.push(seg.to_os_string()),
+                std::path::Component::CurDir => {}
+                _ => bail!("Unsafe path outside worktree root: {}", rel_path.display()),
+            }
+        }
+        if normal_comps.is_empty() {
+            return Ok(None);
+        }
+        let mut cur = base_dir.to_path_buf();
+        let last_idx = normal_comps.len() - 1;
+        for (idx, seg) in normal_comps.into_iter().enumerate() {
+            cur.push(&seg);
+            let meta = match std::fs::symlink_metadata(&cur) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to inspect worktree path {}", cur.display())
+                    });
+                }
+            };
+            if idx < last_idx && (meta.file_type().is_symlink() || !meta.is_dir()) {
+                bail!(
+                    "Refusing to traverse symlink or non-directory ancestor in worktree path {}",
+                    rel_path.display()
+                );
+            }
+        }
+        let meta = std::fs::symlink_metadata(&cur)?;
+        Ok(Some((cur, meta)))
+    }
+
+    pub(crate) fn read_file_safe(
+        base_dir: &Path,
+        rel_path: &Path,
+        svn_link_prefix: bool,
+    ) -> Option<Vec<u8>> {
+        let (abs, meta) = resolve_worktree_path_safe(base_dir, rel_path).ok().flatten()?;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&abs).ok()?;
+            let bytes = target.to_string_lossy().into_owned().into_bytes();
+            if svn_link_prefix {
+                let mut out = Vec::with_capacity(5 + bytes.len());
+                out.extend_from_slice(b"link ");
+                out.extend_from_slice(&bytes);
+                return Some(out);
+            }
+            return Some(bytes);
+        }
+        meta.is_file().then(|| std::fs::read(&abs).ok()).flatten()
+    }
+
+    pub(crate) fn remove_file_safe(base_dir: &Path, rel_path: &Path) -> Result<()> {
+        let Some((abs, meta)) = resolve_worktree_path_safe(base_dir, rel_path)? else {
+            return Ok(());
+        };
+        if meta.is_file() || meta.file_type().is_symlink() {
+            std::fs::remove_file(&abs).with_context(|| {
+                format!("Failed to remove added/untracked file {}", abs.display())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Read a worktree entry without following symlinks on either ancestor directories or the leaf.
+/// Symlinks return raw link target bytes (matching Git `120000` blobs).
+pub(crate) fn read_worktree_file_safe(base_dir: &Path, rel_path: &Path) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        unix_worktree::read_file_safe(base_dir, rel_path, false)
+    }
+    #[cfg(not(unix))]
+    {
+        fallback_worktree::read_file_safe(base_dir, rel_path, false)
+    }
+}
+
+/// SVN variant representing symlinks in SVN's `svn:special` format (`link <target>`).
+pub(crate) fn read_worktree_svn_special_safe(base_dir: &Path, rel_path: &Path) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        unix_worktree::read_file_safe(base_dir, rel_path, true)
+    }
+    #[cfg(not(unix))]
+    {
+        fallback_worktree::read_file_safe(base_dir, rel_path, true)
+    }
+}
+
+/// Remove a leaf file or symlink strictly underneath `base_dir` without traversing symlinked ancestors.
+pub(crate) fn remove_worktree_file_safe(base_dir: &Path, rel_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        unix_worktree::remove_file_safe(base_dir, rel_path)
+    }
+    #[cfg(not(unix))]
+    {
+        fallback_worktree::remove_file_safe(base_dir, rel_path)
+    }
+}
+
 /// Collect changes for `target`, caching immutable commit/range bundles on disk.
 /// `DiffTarget::Uncommitted` is never cached. Binary byte payloads are stripped before caching
 /// while preserving `old_size`/`new_size`.
@@ -320,25 +627,40 @@ pub fn collect_changes_cached(
         }
     }
 
-    let bundle = vcs.collect_changes_filtered(target, ignore)?;
+    // Fetch using the exact resolved immutable target so cache key and fetched bytes always match.
+    let fetch_target = immutable.as_ref().unwrap_or(target);
+    let mut bundle = vcs.collect_changes_filtered(fetch_target, ignore)?;
+    bundle.target = target.clone();
+
     if let Some(p) = &cache_path {
         const MAX_CACHED_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
-        let mut cache_bundle = bundle.clone();
-        for ch in &mut cache_bundle.changes {
-            if ch.is_binary {
-                if ch.old_size.is_none() {
-                    ch.old_size = ch.old_content.as_ref().map(|b| b.len());
+        let est_text_bytes: usize = bundle
+            .changes
+            .iter()
+            .filter(|ch| !ch.is_binary)
+            .map(|ch| {
+                ch.old_content.as_ref().map_or(0, Vec::len)
+                    + ch.new_content.as_ref().map_or(0, Vec::len)
+            })
+            .sum();
+        if est_text_bytes <= MAX_CACHED_BUNDLE_BYTES {
+            let mut cache_bundle = bundle.clone();
+            for ch in &mut cache_bundle.changes {
+                if ch.is_binary {
+                    if ch.old_size.is_none() {
+                        ch.old_size = ch.old_content.as_ref().map(|b| b.len());
+                    }
+                    if ch.new_size.is_none() {
+                        ch.new_size = ch.new_content.as_ref().map(|b| b.len());
+                    }
+                    ch.old_content = None;
+                    ch.new_content = None;
                 }
-                if ch.new_size.is_none() {
-                    ch.new_size = ch.new_content.as_ref().map(|b| b.len());
-                }
-                ch.old_content = None;
-                ch.new_content = None;
             }
-        }
-        if let Ok(json) = serde_json::to_vec(&cache_bundle) {
-            if json.len() <= MAX_CACHED_BUNDLE_BYTES {
-                let _ = atomic_write_cache(p, &json, 128, 128 * 1024 * 1024);
+            if let Ok(json) = serde_json::to_vec(&cache_bundle) {
+                if json.len() <= MAX_CACHED_BUNDLE_BYTES {
+                    let _ = atomic_write_cache(p, &json, 128, 128 * 1024 * 1024);
+                }
             }
         }
     }
