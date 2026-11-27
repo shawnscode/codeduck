@@ -4,9 +4,16 @@ Vim-style terminal code review TUI powered by **Difftastic (`difft`)**, **Rust**
 
 ## Screenshots
 
-| Inline AI Review & Issue Tree | Grouped Commit & Live Message Generation |
-| --- | --- |
-| ![Inline AI Review](assets/review-inline-ai.png) | ![Grouped Commit Modal](assets/commit-modal.png) |
+<table>
+  <tr>
+    <th width="50%">Inline AI Review &amp; Issue Tree</th>
+    <th width="50%">Grouped Commit &amp; Live Message Generation</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/review-inline-ai.png" alt="Inline AI Review" width="100%" /></td>
+    <td align="center"><img src="assets/commit-modal.png" alt="Grouped Commit Modal" width="100%" /></td>
+  </tr>
+</table>
 
 ## Features
 
