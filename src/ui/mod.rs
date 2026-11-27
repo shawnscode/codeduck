@@ -10,6 +10,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::i18n;
@@ -1232,24 +1233,172 @@ fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
+fn commit_msg_box_title<'a>(
+    locale: &str,
+    has_split: bool,
+    is_external: bool,
+    editing: bool,
+    generating: bool,
+    needs_regen: bool,
+    dirty: bool,
+) -> String {
+    let key = if !has_split {
+        if editing {
+            "commit.msg_editing"
+        } else if generating {
+            "commit.msg_generating"
+        } else if needs_regen && !dirty {
+            "commit.msg_pending"
+        } else {
+            "commit.msg_ready"
+        }
+    } else if is_external {
+        if editing {
+            "commit.msg_ext_editing"
+        } else if generating {
+            "commit.msg_ext_generating"
+        } else if needs_regen && !dirty {
+            "commit.msg_ext_pending"
+        } else {
+            "commit.msg_ext_ready"
+        }
+    } else if editing {
+        "commit.msg_main_editing"
+    } else if generating {
+        "commit.msg_main_generating"
+    } else if needs_regen && !dirty {
+        "commit.msg_main_pending"
+    } else {
+        "commit.msg_main_ready"
+    };
+    t!(key, locale = locale).into_owned()
+}
+
+struct CommitMsgRenderParams<'a> {
+    title: String,
+    message: &'a str,
+    cursor: usize,
+    focused: bool,
+    editing: bool,
+    generating: bool,
+    started_at: Option<Instant>,
+    progress_stage: &'a str,
+    stream_logs: &'a [String],
+    stream_thinking: &'a str,
+    stream_text: &'a str,
+    provider_id: &'a str,
+}
+
+fn render_commit_msg_box(
+    frame: &mut Frame,
+    locale: &str,
+    area: Rect,
+    params: CommitMsgRenderParams<'_>,
+) {
+    let has_stream = !params.editing
+        && (params.generating
+            || !params.stream_logs.is_empty()
+            || !params.stream_thinking.is_empty()
+            || !params.stream_text.is_empty());
+    let msg_lines: Vec<Line<'static>> = if params.editing {
+        vec![Line::from(text_input::format_with_cursor(
+            params.message,
+            params.cursor,
+            area.width.saturating_sub(4) as usize,
+        ))]
+    } else {
+        let mut lines = vec![Line::from(Span::styled(
+            params.message.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        if has_stream {
+            append_stream_progress_lines(
+                locale,
+                &mut lines,
+                params.generating,
+                params.started_at,
+                params.provider_id,
+                params.progress_stage,
+                params.stream_logs,
+                params.stream_thinking,
+                params.stream_text,
+                2,
+                2,
+                3,
+            );
+        }
+        lines
+    };
+    let msg_widget = Paragraph::new(msg_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
+                .border_style(if params.editing {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    pane_border_style(params.focused)
+                })
+                .title(params.title),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(msg_widget, area);
+}
+
 fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     use crate::ui::app::CommitListRow;
 
-    let has_commit_stream = !app.commit_editing_msg
+    let selected_cnt = app.commit_files.iter().filter(|f| f.included).count();
+    let ext_cnt = app
+        .commit_files
+        .iter()
+        .filter(|f| f.included && f.is_external)
+        .count();
+    let main_cnt = selected_cnt.saturating_sub(ext_cnt);
+    let has_ext = ext_cnt > 0;
+    let is_git = matches!(app.bundle.vcs, crate::model::VcsKind::Git);
+    let has_main_box = !has_ext || main_cnt > 0 || is_git;
+
+    let main_has_stream = !(app.commit_editing_msg
+        && app.commit_modal_focus == CommitModalFocus::Message)
         && (app.commit_msg_generating
             || !app.commit_stream_logs.is_empty()
             || !app.commit_stream_thinking.is_empty()
             || !app.commit_stream_text.is_empty());
-    let msg_box_height = if app.commit_msg_generating {
-        9
-    } else if has_commit_stream {
-        7
+    let ext_has_stream = !(app.commit_editing_msg
+        && app.commit_modal_focus == CommitModalFocus::ExternalMessage)
+        && (app.ext_commit_msg_generating
+            || !app.ext_commit_stream_logs.is_empty()
+            || !app.ext_commit_stream_thinking.is_empty()
+            || !app.ext_commit_stream_text.is_empty());
+
+    let main_box_h: u16 = if !has_main_box {
+        0
+    } else if app.commit_msg_generating {
+        if has_ext { 7 } else { 9 }
+    } else if main_has_stream {
+        if has_ext { 5 } else { 7 }
+    } else if has_ext {
+        3
+    } else {
+        4
+    };
+    let ext_box_h: u16 = if !has_ext {
+        0
+    } else if app.ext_commit_msg_generating {
+        if has_main_box { 7 } else { 9 }
+    } else if ext_has_stream {
+        if has_main_box { 5 } else { 7 }
+    } else if has_main_box {
+        3
     } else {
         4
     };
     let footer_h: u16 = if app.commit_error.is_some() { 2 } else { 1 };
     let desired_list_h = (app.commit_rows.len() as u16 + 2).clamp(5, 22);
-    let desired_h = 2 + desired_list_h + msg_box_height + footer_h;
+    let desired_h = 2 + desired_list_h + main_box_h + ext_box_h + footer_h;
     let popup = modal_step1_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
@@ -1262,23 +1411,22 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
+    let mut constraints = vec![Constraint::Min(5)];
+    if has_main_box {
+        constraints.push(Constraint::Length(main_box_h));
+    }
+    if has_ext {
+        constraints.push(Constraint::Length(ext_box_h));
+    }
+    constraints.push(Constraint::Length(footer_h));
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),                 // Grouped file selection list
-            Constraint::Length(msg_box_height), // Single-sentence editable commit message + AI stream output
-            Constraint::Length(footer_h),       // Error (optional) + action bar
-        ])
+        .constraints(constraints)
         .split(inner);
+    let footer_sec = sections[sections.len() - 1];
 
     // 1. Grouped file selection list
     let files_focused = app.commit_modal_focus == CommitModalFocus::Files && !app.commit_editing_msg;
-    let selected_cnt = app.commit_files.iter().filter(|f| f.included).count();
-    let ext_cnt = app
-        .commit_files
-        .iter()
-        .filter(|f| f.included && f.is_external)
-        .count();
     let list_inner_w = sections[0].width.saturating_sub(4) as usize;
     let file_items: Vec<ListItem> = app
         .commit_rows
@@ -1383,67 +1531,79 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_stateful_widget(file_list, sections[0], &mut file_state);
 
-    // 2. Commit message box (single sentence)
-    let msg_focused = app.commit_modal_focus == CommitModalFocus::Message || app.commit_editing_msg;
-    let msg_title = if app.commit_editing_msg {
-        t!("commit.msg_editing", locale = locale).into_owned()
-    } else if app.commit_msg_generating {
-        t!("commit.msg_generating", locale = locale).into_owned()
-    } else if app.commit_msg_needs_regen && !app.commit_msg_dirty {
-        t!("commit.msg_pending", locale = locale).into_owned()
-    } else {
-        t!("commit.msg_ready", locale = locale).into_owned()
-    };
-
-    let msg_lines: Vec<Line<'static>> = if app.commit_editing_msg {
-        vec![Line::from(text_input::format_with_cursor(
-            &app.commit_message,
-            app.commit_msg_cursor,
-            sections[1].width.saturating_sub(4) as usize,
-        ))]
-    } else {
-        let mut lines = vec![Line::from(Span::styled(
-            app.commit_message.clone(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ))];
-        if has_commit_stream {
-            let prov = app
-                .resolved_ai_provider_id
-                .as_deref()
-                .unwrap_or(&app.active_ai_provider_id);
-            append_stream_progress_lines(
-                locale,
-                &mut lines,
-                app.commit_msg_generating,
-                app.commit_started_at,
-                prov,
-                &app.commit_progress_stage,
-                &app.commit_stream_logs,
-                &app.commit_stream_thinking,
-                &app.commit_stream_text,
-                2,
-                2,
-                3,
-            );
-        }
-        lines
-    };
-    let msg_widget = Paragraph::new(msg_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(Padding::horizontal(1))
-                .border_style(if app.commit_editing_msg {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    pane_border_style(msg_focused)
-                })
-                .title(msg_title),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(msg_widget, sections[1]);
+    // 2. Commit message box(es)
+    let prov = app
+        .resolved_ai_provider_id
+        .as_deref()
+        .unwrap_or(&app.active_ai_provider_id);
+    let mut sec_idx = 1;
+    if has_main_box {
+        let editing_main =
+            app.commit_editing_msg && app.commit_modal_focus == CommitModalFocus::Message;
+        let focused_main = app.commit_modal_focus == CommitModalFocus::Message;
+        let main_title = commit_msg_box_title(
+            locale,
+            has_ext,
+            false,
+            editing_main,
+            app.commit_msg_generating,
+            app.commit_msg_needs_regen,
+            app.commit_msg_dirty,
+        );
+        render_commit_msg_box(
+            frame,
+            locale,
+            sections[sec_idx],
+            CommitMsgRenderParams {
+                title: main_title,
+                message: &app.commit_message,
+                cursor: app.commit_msg_cursor,
+                focused: focused_main,
+                editing: editing_main,
+                generating: app.commit_msg_generating,
+                started_at: app.commit_started_at,
+                progress_stage: &app.commit_progress_stage,
+                stream_logs: &app.commit_stream_logs,
+                stream_thinking: &app.commit_stream_thinking,
+                stream_text: &app.commit_stream_text,
+                provider_id: prov,
+            },
+        );
+        sec_idx += 1;
+    }
+    if has_ext {
+        let editing_ext =
+            app.commit_editing_msg && app.commit_modal_focus == CommitModalFocus::ExternalMessage;
+        let focused_ext = app.commit_modal_focus == CommitModalFocus::ExternalMessage;
+        let ext_title = commit_msg_box_title(
+            locale,
+            true,
+            true,
+            editing_ext,
+            app.ext_commit_msg_generating,
+            app.ext_commit_msg_needs_regen,
+            app.ext_commit_msg_dirty,
+        );
+        render_commit_msg_box(
+            frame,
+            locale,
+            sections[sec_idx],
+            CommitMsgRenderParams {
+                title: ext_title,
+                message: &app.ext_commit_message,
+                cursor: app.ext_commit_msg_cursor,
+                focused: focused_ext,
+                editing: editing_ext,
+                generating: app.ext_commit_msg_generating,
+                started_at: app.ext_commit_started_at,
+                progress_stage: &app.ext_commit_progress_stage,
+                stream_logs: &app.ext_commit_stream_logs,
+                stream_thinking: &app.ext_commit_stream_thinking,
+                stream_text: &app.ext_commit_stream_text,
+                provider_id: prov,
+            },
+        );
+    }
 
     // 3. Footer (error only if any + action bar)
     let mut footer_lines = Vec::new();
@@ -1453,13 +1613,68 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
+    let step1_key = if has_ext && has_main_box {
+        "commit.step1_actions_split"
+    } else {
+        "commit.step1_actions"
+    };
     footer_lines.push(Line::from(Span::styled(
-        t!("commit.step1_actions", locale = locale).into_owned(),
+        t!(step1_key, locale = locale).into_owned(),
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )));
     frame.render_widget(
         Paragraph::new(footer_lines).wrap(Wrap { trim: false }),
-        sections[2],
+        footer_sec,
+    );
+}
+
+fn render_double_confirm_msg_box(
+    frame: &mut Frame,
+    locale: &str,
+    area: Rect,
+    title: String,
+    message: &str,
+    generating: bool,
+    started_at: Option<Instant>,
+    progress_stage: &str,
+    stream_logs: &[String],
+    stream_thinking: &str,
+    stream_text: &str,
+    provider_id: &str,
+) {
+    let mut msg_lines = vec![Line::from(Span::styled(
+        message.trim().to_string(),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if generating {
+        append_stream_progress_lines(
+            locale,
+            &mut msg_lines,
+            true,
+            started_at,
+            provider_id,
+            progress_stage,
+            stream_logs,
+            stream_thinking,
+            stream_text,
+            1,
+            1,
+            2,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(msg_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(title),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -1468,24 +1683,56 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let selected_files: Vec<_> = app.commit_files.iter().filter(|f| f.included).collect();
     let main_cnt = selected_files.iter().filter(|f| !f.is_external).count();
     let ext_cnt = selected_files.iter().filter(|f| f.is_external).count();
+    let has_ext = ext_cnt > 0;
+    let is_git = matches!(app.bundle.vcs, crate::model::VcsKind::Git);
+    let has_main_box = !has_ext || main_cnt > 0 || is_git;
 
-    let mut repo_buckets: std::collections::BTreeMap<String, usize> =
+    let mut ext_buckets: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    let mut main_file_cnt = 0usize;
     let mut exts = app.cached_external_prefixes.clone();
     exts.sort_by_key(|b| std::cmp::Reverse(b.len()));
     let main_repo_label = t!("commit.main_repo", locale = locale);
     for f in &selected_files {
         let norm = f.path.trim_start_matches("./");
-        if let Some(ext) = exts
-            .iter()
-            .find(|e| norm == **e || norm.starts_with(&format!("{}/", e)))
-        {
-            *repo_buckets
+        if let Some(ext) = exts.iter().find(|e| {
+            if is_git {
+                norm.starts_with(&format!("{}/", e))
+            } else {
+                norm == **e || norm.starts_with(&format!("{}/", e))
+            }
+        }) {
+            *ext_buckets
                 .entry(format!("external[{}]", ext))
                 .or_default() += 1;
         } else {
-            *repo_buckets.entry(main_repo_label.to_string()).or_default() += 1;
+            main_file_cnt += 1;
         }
+    }
+
+    let mut repo_buckets: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (k, v) in &ext_buckets {
+        repo_buckets.insert(k.clone(), *v);
+    }
+    if main_file_cnt > 0 || (is_git && !ext_buckets.is_empty()) {
+        let main_key = if is_git && !ext_buckets.is_empty() {
+            t!(
+                "commit.git_submodule_sync_note",
+                locale = locale,
+                main = main_repo_label,
+                count = ext_buckets.len()
+            )
+            .into_owned()
+        } else {
+            main_repo_label.to_string()
+        };
+        let shown_cnt = if is_git && !ext_buckets.is_empty() && main_file_cnt == 0 {
+            ext_buckets.len()
+        } else {
+            main_file_cnt
+        };
+        repo_buckets.insert(main_key, shown_cnt);
     }
 
     let scope_detail = if ext_cnt > 0 {
@@ -1556,8 +1803,25 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         0
     };
     let top_line_cnt = top_lines.len().min(6) as u16;
-    let msg_box_h: u16 = if app.commit_msg_generating { 7 } else { 4 };
-    let desired_h = 2 + top_line_cnt + msg_box_h + status_h + 1;
+    let main_msg_h: u16 = if !has_main_box {
+        0
+    } else if app.commit_msg_generating {
+        6
+    } else if has_ext {
+        3
+    } else {
+        4
+    };
+    let ext_msg_h: u16 = if !has_ext {
+        0
+    } else if app.ext_commit_msg_generating {
+        6
+    } else if has_main_box {
+        3
+    } else {
+        4
+    };
+    let desired_h = 2 + top_line_cnt + main_msg_h + ext_msg_h + status_h + 1;
     let popup = modal_step2_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
@@ -1570,14 +1834,19 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
+    let mut constraints = vec![Constraint::Min(3)];
+    if has_main_box {
+        constraints.push(Constraint::Length(main_msg_h));
+    }
+    if has_ext {
+        constraints.push(Constraint::Length(ext_msg_h));
+    }
+    constraints.push(Constraint::Length(status_h));
+    constraints.push(Constraint::Length(1));
+
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),            // Scope & group summary
-            Constraint::Length(msg_box_h), // Framed commit message + AI stream
-            Constraint::Length(status_h),  // Active status / error / hint only
-            Constraint::Length(1),         // Fixed action bar
-        ])
+        .constraints(constraints)
         .split(inner);
 
     frame.render_widget(
@@ -1585,49 +1854,59 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         sections[0],
     );
 
-    let msg_title = if app.commit_msg_generating {
-        t!("commit.confirm_msg_generating", locale = locale).into_owned()
-    } else {
-        t!("commit.confirm_msg", locale = locale).into_owned()
-    };
-    let mut msg_lines = vec![Line::from(Span::styled(
-        app.commit_message.trim().to_string(),
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    if app.commit_msg_generating {
-        let prov = app
-            .resolved_ai_provider_id
-            .as_deref()
-            .unwrap_or(&app.active_ai_provider_id);
-        append_stream_progress_lines(
+    let prov = app
+        .resolved_ai_provider_id
+        .as_deref()
+        .unwrap_or(&app.active_ai_provider_id);
+    let mut sec_idx = 1;
+    if has_main_box {
+        let main_title_key = match (has_ext, app.commit_msg_generating) {
+            (false, true) => "commit.confirm_msg_generating",
+            (false, false) => "commit.confirm_msg",
+            (true, true) => "commit.confirm_msg_main_generating",
+            (true, false) => "commit.confirm_msg_main",
+        };
+        render_double_confirm_msg_box(
+            frame,
             locale,
-            &mut msg_lines,
-            true,
+            sections[sec_idx],
+            t!(main_title_key, locale = locale).into_owned(),
+            &app.commit_message,
+            app.commit_msg_generating,
             app.commit_started_at,
-            prov,
             &app.commit_progress_stage,
             &app.commit_stream_logs,
             &app.commit_stream_thinking,
             &app.commit_stream_text,
-            1,
-            1,
-            2,
+            prov,
         );
+        sec_idx += 1;
     }
-    frame.render_widget(
-        Paragraph::new(msg_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .padding(Padding::horizontal(1))
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(msg_title),
-            )
-            .wrap(Wrap { trim: false }),
-        sections[1],
-    );
+    if has_ext {
+        let ext_title_key = if app.ext_commit_msg_generating {
+            "commit.confirm_msg_ext_generating"
+        } else {
+            "commit.confirm_msg_ext"
+        };
+        render_double_confirm_msg_box(
+            frame,
+            locale,
+            sections[sec_idx],
+            t!(ext_title_key, locale = locale).into_owned(),
+            &app.ext_commit_message,
+            app.ext_commit_msg_generating,
+            app.ext_commit_started_at,
+            &app.ext_commit_progress_stage,
+            &app.ext_commit_stream_logs,
+            &app.ext_commit_stream_thinking,
+            &app.ext_commit_stream_text,
+            prov,
+        );
+        sec_idx += 1;
+    }
+
+    let status_sec = sections[sec_idx];
+    let actions_sec = sections[sec_idx + 1];
 
     if status_h > 0 {
         let status_widget = if app.commit_executing {
@@ -1650,20 +1929,18 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Paragraph::new(Line::raw(""))
         };
-        frame.render_widget(status_widget.wrap(Wrap { trim: false }), sections[2]);
+        frame.render_widget(status_widget.wrap(Wrap { trim: false }), status_sec);
     }
 
     let action_bar = Line::from(Span::styled(
-        if app.commit_msg_generating {
+        if app.any_commit_msg_generating() {
             t!("commit.step2_actions_wait", locale = locale).into_owned()
         } else {
             t!("commit.step2_actions", locale = locale).into_owned()
         },
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(Paragraph::new(action_bar), sections[3]);
+    frame.render_widget(Paragraph::new(action_bar), actions_sec);
 }
 
 fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {

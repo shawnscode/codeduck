@@ -88,6 +88,15 @@ pub trait VcsBackend: Send + Sync {
             },
         }
     }
+    fn commit_files_with_external_message(
+        &self,
+        paths: &[String],
+        message: &str,
+        external_message: Option<&str>,
+    ) -> CommitOutcome {
+        let _ = external_message;
+        self.commit_files_detailed(paths, message)
+    }
     fn revert_files(&self, paths: &[String]) -> Result<String>;
     fn revert_files_detailed(&self, paths: &[String]) -> RevertOutcome {
         match self.revert_files(paths) {

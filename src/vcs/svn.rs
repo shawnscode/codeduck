@@ -14,9 +14,47 @@ pub struct SvnBackend {
     scope_dir: PathBuf,
     wc_url: String,
     repo_root_url: String,
+    repo_uuid: String,
 }
 
 impl SvnBackend {
+    fn parse_info_repo_identity(xml: &str) -> (String, String, String, Option<PathBuf>) {
+        let Ok(doc) = roxmltree::Document::parse(xml) else {
+            return (String::new(), String::new(), String::new(), None);
+        };
+        let Some(entry) = doc.descendants().find(|n| n.has_tag_name("entry")) else {
+            return (String::new(), String::new(), String::new(), None);
+        };
+        let wc_root = entry
+            .descendants()
+            .find(|n| n.has_tag_name("wcroot-abspath"))
+            .and_then(|n| n.text())
+            .map(PathBuf::from)
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+        let wc_url = entry
+            .descendants()
+            .find(|n| n.has_tag_name("url"))
+            .and_then(|n| n.text())
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string();
+        let repo_root_url = entry
+            .descendants()
+            .find(|n| n.has_tag_name("root"))
+            .and_then(|n| n.text())
+            .unwrap_or(&wc_url)
+            .trim_end_matches('/')
+            .to_string();
+        let repo_uuid = entry
+            .descendants()
+            .find(|n| n.has_tag_name("uuid"))
+            .and_then(|n| n.text())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        (wc_url, repo_root_url, repo_uuid, wc_root)
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
         let scope_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let output = Command::new("svn")
@@ -31,42 +69,18 @@ impl SvnBackend {
         }
 
         let xml = String::from_utf8(output.stdout).context("Invalid UTF-8 from `svn info --xml`")?;
-        let doc = roxmltree::Document::parse(&xml).context("Failed to parse `svn info --xml`")?;
-
-        let entry = doc
-            .descendants()
-            .find(|n| n.has_tag_name("entry"))
-            .context("Missing <entry> in `svn info --xml`")?;
-
-        let wc_root = entry
-            .descendants()
-            .find(|n| n.has_tag_name("wcroot-abspath"))
-            .and_then(|n| n.text())
-            .map(PathBuf::from)
-            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-            .unwrap_or_else(|| scope_dir.clone());
-
-        let wc_url = entry
-            .descendants()
-            .find(|n| n.has_tag_name("url"))
-            .and_then(|n| n.text())
-            .unwrap_or("")
-            .trim_end_matches('/')
-            .to_string();
-
-        let repo_root_url = entry
-            .descendants()
-            .find(|n| n.has_tag_name("root"))
-            .and_then(|n| n.text())
-            .unwrap_or(&wc_url)
-            .trim_end_matches('/')
-            .to_string();
+        let (wc_url, repo_root_url, repo_uuid, wc_root_opt) = Self::parse_info_repo_identity(&xml);
+        if wc_url.is_empty() && repo_root_url.is_empty() {
+            bail!("Missing <entry> in `svn info --xml`");
+        }
+        let wc_root = wc_root_opt.unwrap_or_else(|| scope_dir.clone());
 
         Ok(Self {
             wc_root,
             scope_dir,
             wc_url,
             repo_root_url,
+            repo_uuid,
         })
     }
 
@@ -683,10 +697,40 @@ fn run_bounded<T: Sync, R: Send>(
 }
 
 impl SvnBackend {
-    fn group_paths_by_external(&self, paths: &[String]) -> BTreeMap<String, Vec<(String, String)>> {
-        // Group targets by external working copy prefix vs main working copy,
-        // because SVN commands cannot span separate repository UUIDs in a single invocation.
-        let mut externals = self.discover_externals(None);
+    fn repo_identity_in(&self, dir: &Path) -> Option<(String, String)> {
+        if !dir.exists() {
+            return None;
+        }
+        let xml_bytes = self.run_svn_in(dir, &["info", "--non-interactive", "--xml"]).ok()?;
+        let xml = std::str::from_utf8(&xml_bytes).ok()?;
+        let (_, root_url, uuid, _) = Self::parse_info_repo_identity(xml);
+        if root_url.is_empty() && uuid.is_empty() {
+            None
+        } else {
+            Some((root_url, uuid))
+        }
+    }
+
+    fn is_same_repo_as_main(&self, dir: &Path) -> bool {
+        let Some((ext_root, ext_uuid)) = self.repo_identity_in(dir) else {
+            return false;
+        };
+        (!self.repo_uuid.is_empty() && ext_uuid == self.repo_uuid)
+            || (!self.repo_root_url.is_empty() && ext_root == self.repo_root_url)
+    }
+
+    fn discover_split_externals(&self, ignore: Option<&IgnoreMatcher>) -> Vec<String> {
+        self.discover_externals(ignore)
+            .into_iter()
+            .filter(|ext| !self.is_same_repo_as_main(&self.scope_dir.join(ext)))
+            .collect()
+    }
+
+    fn group_paths_by_external_list(
+        &self,
+        paths: &[String],
+        mut externals: Vec<String>,
+    ) -> BTreeMap<String, Vec<(String, String)>> {
         externals.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -706,6 +750,16 @@ impl SvnBackend {
             }
         }
         groups
+    }
+
+    fn group_paths_by_external(&self, paths: &[String]) -> BTreeMap<String, Vec<(String, String)>> {
+        self.group_paths_by_external_list(paths, self.discover_externals(None))
+    }
+
+    /// Group commit targets, merging externals whose SVN repository matches main WC's
+    /// repository (`uuid` or root URL) into `""` (single atomic commit).
+    fn group_paths_for_commit(&self, paths: &[String]) -> BTreeMap<String, Vec<(String, String)>> {
+        self.group_paths_by_external_list(paths, self.discover_split_externals(None))
     }
 }
 
@@ -816,7 +870,7 @@ impl VcsBackend for SvnBackend {
     }
 
     fn external_prefixes(&self) -> Vec<String> {
-        self.discover_externals(None)
+        self.discover_split_externals(None)
     }
 
     fn commit_files(&self, paths: &[String], message: &str) -> Result<String> {
@@ -845,6 +899,15 @@ impl VcsBackend for SvnBackend {
         paths: &[String],
         message: &str,
     ) -> crate::vcs::CommitOutcome {
+        self.commit_files_with_external_message(paths, message, None)
+    }
+
+    fn commit_files_with_external_message(
+        &self,
+        paths: &[String],
+        message: &str,
+        external_message: Option<&str>,
+    ) -> crate::vcs::CommitOutcome {
         let make_err = |err: String| crate::vcs::CommitOutcome {
             committed_paths: Vec::new(),
             failed_paths: paths.to_vec(),
@@ -854,20 +917,38 @@ impl VcsBackend for SvnBackend {
         if paths.is_empty() {
             return make_err("No files selected to commit".to_string());
         }
-        if message.trim().is_empty() {
+
+        let groups = self.group_paths_for_commit(paths);
+        let needs_main = groups.contains_key("");
+        let has_ext = groups.keys().any(|k| !k.is_empty());
+        let eff_ext_msg = external_message
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| message.trim());
+
+        if needs_main && message.trim().is_empty() {
             return make_err("Commit message cannot be empty".to_string());
         }
-
-        let mut msg_file = match NamedTempFile::new() {
-            Ok(f) => f,
-            Err(e) => return make_err(format!("Failed to create temp commit message file: {}", e)),
-        };
-        if let Err(e) = msg_file.write_all(message.as_bytes()) {
-            return make_err(format!("Failed to write temp commit message file: {}", e));
+        if has_ext && eff_ext_msg.is_empty() {
+            return make_err("External commit message cannot be empty".to_string());
         }
-        let msg_path = msg_file.path().to_string_lossy().to_string();
 
-        let groups = self.group_paths_by_external(paths);
+        let write_temp = |content: &str| -> Result<NamedTempFile> {
+            let mut f = NamedTempFile::new().context("Failed to create temp commit message file")?;
+            f.write_all(content.as_bytes())
+                .context("Failed to write temp commit message file")?;
+            Ok(f)
+        };
+        let main_msg_file = match write_temp(if message.trim().is_empty() { eff_ext_msg } else { message }) {
+            Ok(f) => f,
+            Err(e) => return make_err(format!("{:#}", e)),
+        };
+        let ext_msg_file = match write_temp(eff_ext_msg) {
+            Ok(f) => f,
+            Err(e) => return make_err(format!("{:#}", e)),
+        };
+        let main_msg_path = main_msg_file.path().to_string_lossy().to_string();
+        let ext_msg_path = ext_msg_file.path().to_string_lossy().to_string();
 
         let mut outputs = Vec::new();
         let mut errors = Vec::new();
@@ -886,6 +967,11 @@ impl VcsBackend for SvnBackend {
             } else {
                 format!("external[{}]", prefix)
             };
+            let msg_path = if prefix.is_empty() {
+                &main_msg_path
+            } else {
+                &ext_msg_path
+            };
             let mut cmd = Command::new("svn");
             cmd.args([
                 "commit",
@@ -893,7 +979,7 @@ impl VcsBackend for SvnBackend {
                 "--depth",
                 "empty",
                 "-F",
-                &msg_path,
+                msg_path,
                 "--",
             ])
             .current_dir(&work_dir);
