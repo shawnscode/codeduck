@@ -540,6 +540,319 @@ fn extract_codex_thread_id(jsonl: &str) -> Option<String> {
     None
 }
 
+#[derive(Default)]
+struct AgyStreamState {
+    conversation_id: Option<String>,
+    result_response: Option<String>,
+    text_buf: String,
+    last_step_key: String,
+    saw_events: bool,
+    status: Option<String>,
+    error_detail: Option<String>,
+    last_step_desc: Option<String>,
+}
+
+fn process_agy_stream_line(line: &str, state: &mut AgyStreamState) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    state.saw_events = true;
+    match v.get("event").and_then(|e| e.as_str()) {
+        Some("init") => {
+            if let Some(cid) = v.get("conversation_id").and_then(|s| s.as_str()) {
+                state.conversation_id = Some(cid.to_string());
+            }
+            let model = v
+                .get("init")
+                .and_then(|i| i.get("model"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("agy");
+            let short_cid: String = state
+                .conversation_id
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(8)
+                .collect();
+            let locale = crate::i18n::current_thread_locale();
+            emit_progress(AiProgressUpdate::Stage(
+                rust_i18n::t!(
+                    "ai.cli_connected",
+                    locale = locale.as_str(),
+                    model = model,
+                    cid = short_cid
+                )
+                .into_owned(),
+            ));
+        }
+        Some("step_update") => {
+            if let Some(su) = v.get("step_update") {
+                if let Some(cid) = su.get("conversation_id").and_then(|s| s.as_str()) {
+                    if !cid.trim().is_empty() {
+                        state.conversation_id = Some(cid.to_string());
+                    }
+                }
+                if let Some(stype) = su.get("step_type").and_then(|s| s.as_str()) {
+                    let st_state = su.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                    let sidx = su.get("step_index").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let tool_name = su.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
+                    state.last_step_desc = Some(if tool_name.is_empty() {
+                        format!("{}:{}", stype, st_state)
+                    } else {
+                        format!("{}:{}:{}", stype, tool_name, st_state)
+                    });
+                    let step_key = if stype == "tool" {
+                        format!("{}:{}:{}", sidx, stype, st_state)
+                    } else {
+                        format!("{}:{}", sidx, stype)
+                    };
+                    if step_key != state.last_step_key {
+                        state.last_step_key = step_key;
+                        let locale = crate::i18n::current_thread_locale();
+                        match stype {
+                            "user_input" => {
+                                emit_progress(AiProgressUpdate::Stage(
+                                    rust_i18n::t!(
+                                        "ai.waiting_response",
+                                        locale = locale.as_str()
+                                    )
+                                    .into_owned(),
+                                ));
+                            }
+                            "planner_response" | "thought" | "thinking" => {
+                                emit_progress(AiProgressUpdate::Stage(
+                                    rust_i18n::t!("ai.thinking", locale = locale.as_str())
+                                        .into_owned(),
+                                ));
+                            }
+                            "agent_response" => {
+                                emit_progress(AiProgressUpdate::Stage(
+                                    rust_i18n::t!(
+                                        "ai.streaming_output",
+                                        locale = locale.as_str()
+                                    )
+                                    .into_owned(),
+                                ));
+                            }
+                            "tool" if st_state == "ACTIVE" => {
+                                let tname = if tool_name.is_empty() {
+                                    "tool"
+                                } else {
+                                    tool_name
+                                };
+                                let params = su
+                                    .get("tool_info")
+                                    .and_then(|ti| ti.get("parameters"));
+                                let target = params
+                                    .and_then(|p| {
+                                        ["Path", "TargetFile", "AbsolutePath", "Query", "Pattern", "DirectoryPath", "SearchDirectory"]
+                                            .iter()
+                                            .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                                    })
+                                    .unwrap_or("");
+                                let label = if target.is_empty() {
+                                    rust_i18n::t!(
+                                        "ai.calling_tool",
+                                        locale = locale.as_str(),
+                                        tool = tname
+                                    )
+                                    .into_owned()
+                                } else {
+                                    let short_target: String = target
+                                        .chars()
+                                        .rev()
+                                        .take(48)
+                                        .collect::<Vec<_>>()
+                                        .into_iter()
+                                        .rev()
+                                        .collect();
+                                    format!("{}: {}", tname, short_target)
+                                };
+                                emit_progress(AiProgressUpdate::Stage(label));
+                            }
+                            "tool" => {}
+                            other => {
+                                emit_progress(AiProgressUpdate::Stage(
+                                    rust_i18n::t!(
+                                        "ai.exec_step",
+                                        locale = locale.as_str(),
+                                        step = other,
+                                        state = st_state
+                                    )
+                                    .into_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                for key in ["thinking_delta", "thought", "reasoning_delta"] {
+                    if let Some(td) = su.get(key).and_then(|s| s.as_str()) {
+                        if !td.is_empty() {
+                            emit_progress(AiProgressUpdate::ThinkingDelta(td.to_string()));
+                        }
+                    }
+                }
+                if let Some(delta) = su.get("text_delta").and_then(|s| s.as_str()) {
+                    if !delta.is_empty() {
+                        state.text_buf.push_str(delta);
+                        emit_progress(AiProgressUpdate::TextDelta(delta.to_string()));
+                    }
+                }
+                if let Some(err) = su.get("error").and_then(|e| e.as_str()) {
+                    if !err.trim().is_empty() {
+                        state.error_detail = Some(err.trim().to_string());
+                    }
+                }
+            }
+        }
+        Some("error") => {
+            if let Some(err) = v
+                .get("error")
+                .and_then(|e| e.as_str().or_else(|| e.get("message").and_then(|m| m.as_str())))
+                .or_else(|| v.get("message").and_then(|m| m.as_str()))
+            {
+                if !err.trim().is_empty() {
+                    state.error_detail = Some(err.trim().to_string());
+                }
+            }
+        }
+        Some("result") => {
+            if let Some(res) = v.get("result") {
+                if let Some(cid) = res.get("conversation_id").and_then(|s| s.as_str()) {
+                    if !cid.trim().is_empty() {
+                        state.conversation_id = Some(cid.to_string());
+                    }
+                }
+                if let Some(st) = res.get("status").and_then(|s| s.as_str()) {
+                    if !st.trim().is_empty() {
+                        state.status = Some(st.trim().to_string());
+                    }
+                }
+                if let Some(err) = res
+                    .get("error")
+                    .and_then(|e| e.as_str().or_else(|| e.get("message").and_then(|m| m.as_str())))
+                    .or_else(|| res.get("error_message").and_then(|m| m.as_str()))
+                {
+                    if !err.trim().is_empty() {
+                        state.error_detail = Some(err.trim().to_string());
+                    }
+                }
+                if let Some(resp) = res.get("response").and_then(|r| r.as_str()) {
+                    if !resp.trim().is_empty() {
+                        state.result_response = Some(resp.to_string());
+                    }
+                }
+                let dur = res.get("duration_seconds").and_then(|d| d.as_f64());
+                let in_tok = res
+                    .get("usage")
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|n| n.as_u64());
+                let out_tok = res
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|n| n.as_u64());
+                if let (Some(d), Some(it), Some(ot)) = (dur, in_tok, out_tok) {
+                    let locale = crate::i18n::current_thread_locale();
+                    emit_progress(AiProgressUpdate::LogLine(
+                        rust_i18n::t!(
+                            "ai.cli_done",
+                            locale = locale.as_str(),
+                            dur = format!("{:.1}", d),
+                            in_tok = it,
+                            out_tok = ot
+                        )
+                        .into_owned(),
+                    ));
+                }
+                let is_err = res
+                    .get("is_error")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false)
+                    || res.get("error").is_some()
+                    || state
+                        .status
+                        .as_deref()
+                        .is_some_and(|s| !s.eq_ignore_ascii_case("SUCCESS"));
+                if !is_err
+                    && (state.result_response.is_some() || !state.text_buf.trim().is_empty())
+                {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn finalize_agy_output(
+    raw: String,
+    state: AgyStreamState,
+    want_json_envelope: bool,
+    json_mode: bool,
+    fallback_sid: Option<&str>,
+) -> Result<AiPromptOutput> {
+    let sid = state
+        .conversation_id
+        .or_else(|| fallback_sid.map(|s| s.to_string()));
+    if want_json_envelope {
+        if let Some(resp) = state.result_response {
+            let text = if json_mode && !resp.contains('{') && state.text_buf.contains('{') {
+                state.text_buf
+            } else {
+                resp
+            };
+            return Ok(AiPromptOutput {
+                text,
+                session_id: sid,
+            });
+        }
+        if !state.text_buf.trim().is_empty() {
+            return Ok(AiPromptOutput {
+                text: state.text_buf,
+                session_id: sid,
+            });
+        }
+        if state.saw_events {
+            bail!(
+                "agy returned no text (status={}, step={}, err={})",
+                state.status.as_deref().unwrap_or("unknown"),
+                state.last_step_desc.as_deref().unwrap_or("none"),
+                state.error_detail.as_deref().unwrap_or("none")
+            );
+        }
+        // Backwards-compatible fallback for single-JSON or mock CLI outputs
+        let trimmed = raw.trim();
+        let parsed_val = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
+            crate::ai::extract_json_block(trimmed)
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+        });
+        if let Some(v) = parsed_val {
+            let fallback_inner_sid = v
+                .get("conversation_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+                .or(sid.clone());
+            if let Some(inner) = v.get("response").and_then(|r| r.as_str()) {
+                if !inner.trim().is_empty() {
+                    return Ok(AiPromptOutput {
+                        text: inner.to_string(),
+                        session_id: fallback_inner_sid,
+                    });
+                }
+            }
+        }
+    }
+    Ok(AiPromptOutput {
+        text: raw,
+        session_id: sid,
+    })
+}
+
 pub struct AgyCliProvider {
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -592,253 +905,15 @@ impl AiProvider for AgyCliProvider {
         }
         args.push(&prompt_arg);
 
-        let mut stream_sid: Option<String> = None;
-        let mut stream_result: Option<String> = None;
-        let mut stream_text_buf = String::new();
-        let mut last_step_key = String::new();
-
+        let mut state = AgyStreamState::default();
         let raw = run_with_stdin_streaming("agy", &args, "", work_dir, self.timeout_secs, |line| {
             if !want_json_envelope {
                 return false;
             }
-            let trimmed = line.trim();
-            if !trimmed.starts_with('{') {
-                return false;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
-                return false;
-            };
-            match v.get("event").and_then(|e| e.as_str()) {
-                Some("init") => {
-                    if let Some(cid) = v.get("conversation_id").and_then(|s| s.as_str()) {
-                        stream_sid = Some(cid.to_string());
-                    }
-                    let model = v
-                        .get("init")
-                        .and_then(|i| i.get("model"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("agy");
-                    let short_cid: String = stream_sid
-                        .as_deref()
-                        .unwrap_or("")
-                        .chars()
-                        .take(8)
-                        .collect();
-                    let locale = crate::i18n::current_thread_locale();
-                    emit_progress(AiProgressUpdate::Stage(
-                        rust_i18n::t!(
-                            "ai.cli_connected",
-                            locale = locale.as_str(),
-                            model = model,
-                            cid = short_cid
-                        )
-                        .into_owned(),
-                    ));
-                }
-                Some("step_update") => {
-                    if let Some(su) = v.get("step_update") {
-                        if let Some(cid) = su.get("conversation_id").and_then(|s| s.as_str()) {
-                            if !cid.trim().is_empty() {
-                                stream_sid = Some(cid.to_string());
-                            }
-                        }
-                        if let Some(stype) = su.get("step_type").and_then(|s| s.as_str()) {
-                            let state = su.get("state").and_then(|s| s.as_str()).unwrap_or("");
-                            let sidx = su.get("step_index").and_then(|n| n.as_u64()).unwrap_or(0);
-                            let step_key = if stype == "tool" {
-                                format!("{}:{}:{}", sidx, stype, state)
-                            } else {
-                                format!("{}:{}", sidx, stype)
-                            };
-                            if step_key != last_step_key {
-                                last_step_key = step_key;
-                                let locale = crate::i18n::current_thread_locale();
-                                match stype {
-                                    "user_input" => {
-                                        emit_progress(AiProgressUpdate::Stage(
-                                            rust_i18n::t!(
-                                                "ai.waiting_response",
-                                                locale = locale.as_str()
-                                            )
-                                            .into_owned(),
-                                        ));
-                                    }
-                                    "planner_response" | "thought" | "thinking" => {
-                                        emit_progress(AiProgressUpdate::Stage(
-                                            rust_i18n::t!("ai.thinking", locale = locale.as_str())
-                                                .into_owned(),
-                                        ));
-                                    }
-                                    "agent_response" => {
-                                        emit_progress(AiProgressUpdate::Stage(
-                                            rust_i18n::t!(
-                                                "ai.streaming_output",
-                                                locale = locale.as_str()
-                                            )
-                                            .into_owned(),
-                                        ));
-                                    }
-                                    "tool" if state == "ACTIVE" => {
-                                        let tool_name = su
-                                            .get("tool_name")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("tool");
-                                        let params = su
-                                            .get("tool_info")
-                                            .and_then(|ti| ti.get("parameters"));
-                                        let target = params
-                                            .and_then(|p| {
-                                                ["Path", "TargetFile", "AbsolutePath", "Query", "Pattern", "DirectoryPath", "SearchDirectory"]
-                                                    .iter()
-                                                    .find_map(|k| p.get(*k).and_then(|v| v.as_str()))
-                                            })
-                                            .unwrap_or("");
-                                        let label = if target.is_empty() {
-                                            rust_i18n::t!(
-                                                "ai.calling_tool",
-                                                locale = locale.as_str(),
-                                                tool = tool_name
-                                            )
-                                            .into_owned()
-                                        } else {
-                                            let short_target: String = target
-                                                .chars()
-                                                .rev()
-                                                .take(48)
-                                                .collect::<Vec<_>>()
-                                                .into_iter()
-                                                .rev()
-                                                .collect();
-                                            format!("{}: {}", tool_name, short_target)
-                                        };
-                                        emit_progress(AiProgressUpdate::Stage(label));
-                                    }
-                                    "tool" => {}
-                                    other => {
-                                        emit_progress(AiProgressUpdate::Stage(
-                                            rust_i18n::t!(
-                                                "ai.exec_step",
-                                                locale = locale.as_str(),
-                                                step = other,
-                                                state = state
-                                            )
-                                            .into_owned(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        for key in ["thinking_delta", "thought", "reasoning_delta"] {
-                            if let Some(td) = su.get(key).and_then(|s| s.as_str()) {
-                                if !td.is_empty() {
-                                    emit_progress(AiProgressUpdate::ThinkingDelta(td.to_string()));
-                                }
-                            }
-                        }
-                        if let Some(delta) = su.get("text_delta").and_then(|s| s.as_str()) {
-                            if !delta.is_empty() {
-                                stream_text_buf.push_str(delta);
-                                emit_progress(AiProgressUpdate::TextDelta(delta.to_string()));
-                            }
-                        }
-                    }
-                }
-                Some("result") => {
-                    if let Some(res) = v.get("result") {
-                        if let Some(cid) = res.get("conversation_id").and_then(|s| s.as_str()) {
-                            if !cid.trim().is_empty() {
-                                stream_sid = Some(cid.to_string());
-                            }
-                        }
-                        if let Some(resp) = res.get("response").and_then(|r| r.as_str()) {
-                            if !resp.trim().is_empty() {
-                                stream_result = Some(resp.to_string());
-                            }
-                        }
-                        let dur = res.get("duration_seconds").and_then(|d| d.as_f64());
-                        let in_tok = res
-                            .get("usage")
-                            .and_then(|u| u.get("input_tokens"))
-                            .and_then(|n| n.as_u64());
-                        let out_tok = res
-                            .get("usage")
-                            .and_then(|u| u.get("output_tokens"))
-                            .and_then(|n| n.as_u64());
-                        if let (Some(d), Some(it), Some(ot)) = (dur, in_tok, out_tok) {
-                            let locale = crate::i18n::current_thread_locale();
-                            emit_progress(AiProgressUpdate::LogLine(
-                                rust_i18n::t!(
-                                    "ai.cli_done",
-                                    locale = locale.as_str(),
-                                    dur = format!("{:.1}", d),
-                                    in_tok = it,
-                                    out_tok = ot
-                                )
-                                .into_owned(),
-                            ));
-                        }
-                        let is_err = res
-                            .get("is_error")
-                            .and_then(|b| b.as_bool())
-                            .unwrap_or(false)
-                            || res.get("error").is_some();
-                        if !is_err
-                            && (stream_result.is_some() || !stream_text_buf.trim().is_empty())
-                        {
-                            return true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            false
+            process_agy_stream_line(line, &mut state)
         })?;
 
-        if want_json_envelope {
-            if let Some(resp) = stream_result {
-                let text = if json_mode && !resp.contains('{') && stream_text_buf.contains('{') {
-                    stream_text_buf
-                } else {
-                    resp
-                };
-                return Ok(AiPromptOutput {
-                    text,
-                    session_id: stream_sid.or_else(|| session_id.map(|s| s.to_string())),
-                });
-            }
-            if !stream_text_buf.trim().is_empty() {
-                return Ok(AiPromptOutput {
-                    text: stream_text_buf,
-                    session_id: stream_sid.or_else(|| session_id.map(|s| s.to_string())),
-                });
-            }
-            // Backwards-compatible fallback for single-JSON or mock CLI outputs
-            let trimmed = raw.trim();
-            let parsed_val = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
-                crate::ai::extract_json_block(trimmed)
-                    .and_then(|b| serde_json::from_str::<Value>(b).ok())
-            });
-            if let Some(v) = parsed_val {
-                let sid = v
-                    .get("conversation_id")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| stream_sid.clone())
-                    .or_else(|| session_id.map(|s| s.to_string()));
-                if let Some(inner) = v.get("response").and_then(|r| r.as_str()) {
-                    if !inner.trim().is_empty() {
-                        return Ok(AiPromptOutput {
-                            text: inner.to_string(),
-                            session_id: sid,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(AiPromptOutput {
-            text: raw,
-            session_id: stream_sid.or_else(|| session_id.map(|s| s.to_string())),
-        })
+        finalize_agy_output(raw, state, want_json_envelope, json_mode, session_id)
     }
 }
 
@@ -980,5 +1055,27 @@ mod tests {
             "should not block waiting on post-result teardown: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn test_agy_empty_stream_result_reports_diagnostic_instead_of_raw_init() {
+        let mut state = AgyStreamState::default();
+        process_agy_stream_line(
+            r#"{"event":"init","conversation_id":"abc-123"}"#,
+            &mut state,
+        );
+        process_agy_stream_line(
+            r#"{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command","state":"ACTIVE"}}"#,
+            &mut state,
+        );
+        process_agy_stream_line(
+            r#"{"event":"result","result":{"status":"ERROR","error":"permission required","response":""}}"#,
+            &mut state,
+        );
+        let err = finalize_agy_output("raw".to_string(), state, true, true, None).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("status=ERROR"), "msg={}", msg);
+        assert!(msg.contains("tool:run_command:ACTIVE"), "msg={}", msg);
+        assert!(msg.contains("permission required"), "msg={}", msg);
     }
 }

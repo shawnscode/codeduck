@@ -107,8 +107,8 @@ effort_badge = "  effort:%{effort}"
 session_badge = "  session:%{session}"
 
 [tree]
-title_grouped = " Change Groups (j/k:move  l:Diff  S:commit) "
-title_flat = " File List (t:groups  S:commit) "
+title_grouped = " Change Groups (f/F:file  n/N:issue  S:commit) "
+title_flat = " File List (f/F:file  n/N:issue  t:groups  S:commit) "
 
 [diff]
 loading_title = " Loading %{target}... "
@@ -118,10 +118,12 @@ error_body = "Error loading diff:\n\n%{err}\n\nPress R to retry or C to pick ano
 empty_title = " Continuous Diff "
 empty_body = "No changed files in this target.\n\nPress C to switch to another commit/revision, or R to refresh."
 pane_title = " %{path} | %{hunk}/%{total} (n/N:hunk, hjkl:move) "
+pane_title_findings = " %{path} | %{hunk}/%{total} (n/N:issue (%{count}), hjkl:move) "
 
 [inspector]
 scroll_active = "%{base} (J/K:scroll +%{offset}) "
 scroll_hint = "%{base} (J/K:scroll) "
+finding_preview = " AI Finding Preview (I:dismiss · J/K:scroll) "
 group_details = " Group Details "
 code_inspector = " Code Inspector (%{loc}) "
 no_file = "No file"
@@ -140,7 +142,7 @@ qa_question = "Q%{tag}: %{question}"
 qa_answer_prefix = "A: "
 
 [footer]
-normal_hints = "Tab:pane  hjkl:move  n/N:hunk  J/K:info  S:commit  U:revert  R:refresh  d:diff  O:settings  ?:help  q:quit"
+normal_hints = "hjkl:move  f/F:file  n/N:issue/hunk  S:commit  U:revert  R:refresh  d:diff  O:settings  ?:help  q:quit"
 note_prompt = "Note for current file > "
 ask_prompt = "Ask AI about current file > "
 
@@ -149,23 +151,19 @@ frame_title = " Help (j/k scroll) "
 title = "codeduck — Keybindings & Commands"
 window_title = "Panes & Layout"
 window_body = """
-  Tab / Ctrl-w   Toggle focus (left tree / right diff)
-  H / L          Focus left tree / right diff directly
-  J / K          Scroll bottom inspector (B / I toggle sidebar / inspector)"""
+  B              Toggle left sidebar
+  Esc            Dismiss AI Q&A / note panel (J / K scroll)"""
 nav_title = "Navigation & Search"
 nav_body = """
   j / k          Move up / down
-  h / l / 0      Fold/expand or scroll horizontally (switch pane at edge) / col 0
-  n / N          Next / previous diff hunk (also ]c / [c)
-  ]f / [f        Next / previous file
-  ]g / [g        Next / previous AI group
-  ]i / [i        Next / previous AI finding
+  h / l / 0      Scroll horizontally / col 0
+  n / N          Next / previous AI issue (when ready), otherwise diff hunk
+  f / F          Next / previous file item (keeps focus in Diff)
   Ctrl-d / u     Half-page down/up; Ctrl-f / b full page; gg / G top / bottom
   / and ; / ,    Search diff and jump next / previous match"""
 ops_title = "Review, Commit, Config & Commands"
 ops_body = """
   d / t          Cycle diff mode / toggle AI-grouped vs flat file tree
-  za / zM / zR   Toggle current group / collapse all / expand all
   O              Open Settings & Language config (:config / :settings)
   S              Open Commit modal (grouped select + AI English commit message)
   U              Revert selected group or file (double confirmation; :revert)

@@ -737,33 +737,53 @@ where
     ));
     let findings_prompt =
         build_findings_prompt(bundle, rendered_diffs, &cfg.review_language, &stage1);
-    let out2 = invoke_with_session(
-        deep_provider,
-        &findings_prompt,
-        &bundle.repo_root,
-        true,
-        &deep_cfg,
-        true,
-    )?;
-    emit_progress(AiProgressUpdate::Stage(
-        rust_i18n::t!("ai.merging_findings", locale = locale.as_str()).into_owned(),
-    ));
-    let stage2 = parse_ai_review_json(&out2.text, deep_provider.display_name(), rendered_diffs)
-        .with_context(|| {
-            let preview: String = out2
-                .text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(80)
-                .collect();
-            format!(
-                "Stage 2 JSON parse failed ({}): {}",
-                deep_provider.id(),
-                preview
-            )
-        })?;
+    let run_stage2 = |prompt_text: &str, allow_tools: bool| -> Result<(AiReviewResult, Option<String>)> {
+        let out = invoke_with_session(
+            deep_provider,
+            prompt_text,
+            &bundle.repo_root,
+            true,
+            &deep_cfg,
+            allow_tools,
+        )?;
+        emit_progress(AiProgressUpdate::Stage(
+            rust_i18n::t!("ai.merging_findings", locale = locale.as_str()).into_owned(),
+        ));
+        let parsed = parse_ai_review_json(&out.text, deep_provider.display_name(), rendered_diffs)
+            .with_context(|| {
+                let preview: String = out
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(80)
+                    .collect();
+                format!(
+                    "Stage 2 JSON parse failed ({}): {}",
+                    deep_provider.id(),
+                    preview
+                )
+            })?;
+        Ok((parsed, out.session_id))
+    };
+
+    let (stage2, stage2_sid) = match run_stage2(&findings_prompt, true) {
+        Ok(res) => res,
+        Err(first_err) if !is_current_task_cancelled() => {
+            let msg = format!("{:#}", first_err);
+            if msg.contains("returned no text") || msg.contains("Stage 2 JSON parse failed") {
+                let no_tools_prompt = format!(
+                    "{}\n\nIMPORTANT: Do NOT call any tools, inspect workspace files, or run commands. Produce the JSON response purely from the provided diffs above.",
+                    findings_prompt
+                );
+                run_stage2(&no_tools_prompt, false).or(Err(first_err))?
+            } else {
+                return Err(first_err);
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     stage1.overall_risk = stage1.overall_risk.min(stage2.overall_risk);
     if !stage2.files.is_empty() {
@@ -789,7 +809,7 @@ where
 
     Ok(AnalyzeDiffOutput {
         review: stage1,
-        session_id: out2.session_id,
+        session_id: stage2_sid,
     })
 }
 
@@ -963,7 +983,7 @@ pub fn build_findings_prompt(
     let mut prompt = format!(
         "You are a senior software engineer performing Stage 2 (Deep Core Findings & Key Analysis) of a Code Review.\n\
          Strictly READ-ONLY: do NOT edit files, stage/commit changes, or run state-changing commands.\n\
-         You may inspect workspace files via read-only tools ONLY if necessary to verify suspicious bugs, callers, or edge cases.\n\
+         You may inspect workspace files ONLY via read-only file/search tools (e.g. view_file/read_file/grep_search) if necessary to verify suspicious bugs, callers, or edge cases; NEVER call run_command, browser tools, write/edit tools, or ask_question.\n\
          Focus on concrete bugs, concurrency/security issues, edge cases, and high-value hunk/file notes. Omit trivial or obvious boilerplate.\n\
          Write all human-readable descriptions in language: {}.\n\n\
          Repository VCS: {}\n\

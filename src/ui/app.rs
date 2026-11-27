@@ -11,6 +11,7 @@ use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ai::{self, ProviderDescriptor};
 use crate::config::AppConfig;
@@ -19,7 +20,7 @@ use crate::i18n;
 use crate::ignore::IgnoreMatcher;
 use crate::model::{
     AiReviewResult, CommitInfo, DiffTarget, DifftDisplayMode, FileDiffRendered, HunkAnalysis,
-    ReviewFinding, ReviewGroup, ReviewSessionState, UserNote,
+    ReviewFinding, ReviewGroup, ReviewSessionState, RiskLevel, Severity, UserNote,
 };
 use crate::ui::export::export_review_markdown_with_locale;
 use crate::vcs::{DiffBundle, VcsBackend};
@@ -31,13 +32,6 @@ pub enum PaneFocus {
 }
 
 impl PaneFocus {
-    pub fn toggle(self) -> Self {
-        match self {
-            PaneFocus::Tree => PaneFocus::Diff,
-            PaneFocus::Diff => PaneFocus::Tree,
-        }
-    }
-
     pub fn label(self, locale: &str) -> String {
         match self {
             PaneFocus::Tree => rust_i18n::t!("focus.tree", locale = locale).into_owned(),
@@ -103,6 +97,28 @@ pub enum CommitListRow {
     File(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeIssueLevel {
+    Finding(Severity),
+    HunkRisk(RiskLevel),
+}
+
+impl TreeIssueLevel {
+    pub fn localized_label(self, locale: &str) -> String {
+        match self {
+            TreeIssueLevel::Finding(s) => s.localized_label(locale),
+            TreeIssueLevel::HunkRisk(r) => r.localized_label(locale),
+        }
+    }
+
+    pub fn color(self) -> Color {
+        match self {
+            TreeIssueLevel::Finding(s) => severity_color(s),
+            TreeIssueLevel::HunkRisk(r) => risk_color(r),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TreeRow {
     GroupHeader {
@@ -112,7 +128,6 @@ pub enum TreeRow {
         category: String,
         risk_label: String,
         file_count: usize,
-        expanded: bool,
         order: u32,
         first_change_idx: Option<usize>,
     },
@@ -121,6 +136,16 @@ pub enum TreeRow {
         change_idx: usize,
         badge: String,
         finding_count: usize,
+        in_group: bool,
+    },
+    FindingItem {
+        finding_id: String,
+        path: String,
+        change_idx: usize,
+        line: Option<u32>,
+        end_line: Option<u32>,
+        level: TreeIssueLevel,
+        title: String,
         in_group: bool,
     },
 }
@@ -253,7 +278,6 @@ pub struct App {
 
     pub tree_rows: Vec<TreeRow>,
     pub tree_cursor: usize,
-    pub collapsed_groups: HashSet<String>,
     pub selected_file_idx: Option<usize>,
 
     pub diff_cursor_y: usize,
@@ -403,16 +427,15 @@ impl App {
             pending_rerender_at: None,
             diff_error: None,
             display_mode,
-            focus: PaneFocus::Tree,
+            focus: PaneFocus::Diff,
             tree_mode: TreeMode::FlatFiles,
             user_forced_flat_tree: false,
             input_mode: InputMode::Normal,
             overlay: OverlayKind::None,
             show_sidebar: true,
-            show_inspector: true,
+            show_inspector: false,
             tree_rows: Vec::new(),
             tree_cursor: 0,
-            collapsed_groups: HashSet::new(),
             selected_file_idx,
             diff_cursor_y: 0,
             diff_scroll_y: 0,
@@ -558,16 +581,15 @@ impl App {
             pending_rerender_at: None,
             diff_error: None,
             display_mode,
-            focus: PaneFocus::Tree,
+            focus: PaneFocus::Diff,
             tree_mode: TreeMode::FlatFiles,
             user_forced_flat_tree: false,
             input_mode: InputMode::Normal,
             overlay: OverlayKind::None,
             show_sidebar: true,
-            show_inspector: true,
+            show_inspector: false,
             tree_rows: Vec::new(),
             tree_cursor: 0,
-            collapsed_groups: HashSet::new(),
             selected_file_idx: None,
             diff_cursor_y: 0,
             diff_scroll_y: 0,
@@ -1698,20 +1720,22 @@ impl App {
 
     pub fn rebuild_tree_rows(&mut self) {
         let mut rows = Vec::new();
-        let finding_counts: HashMap<&str, usize> = if let Some(ai) = &self.ai_review {
-            let mut map = HashMap::new();
-            for f in &ai.findings {
-                *map.entry(f.file.as_str()).or_insert(0) += 1;
+        let mut issues_by_file: HashMap<String, Vec<TreeIssueEntry>> = HashMap::new();
+        if let Some(ai) = &self.ai_review {
+            for item in collect_ai_tree_issues(ai) {
+                issues_by_file
+                    .entry(item.file.clone())
+                    .or_default()
+                    .push(item);
             }
-            map
-        } else {
-            HashMap::new()
-        };
+            for list in issues_by_file.values_mut() {
+                list.sort_by_key(|it| (it.jump_line().unwrap_or(0), it.is_hunk, it.order));
+            }
+        }
 
         if self.tree_mode == TreeMode::AiGrouped {
             if let Some(ai) = &self.ai_review {
                 for g in &ai.groups {
-                    let expanded = !self.collapsed_groups.contains(&g.id);
                     let valid_files: Vec<(&String, usize)> = g
                         .files
                         .iter()
@@ -1729,22 +1753,20 @@ impl App {
                         category: g.category.clone(),
                         risk_label: g.risk_level.localized_label(self.locale()),
                         file_count: valid_files.len(),
-                        expanded,
                         order: g.review_order,
                         first_change_idx,
                     });
 
-                    if expanded {
-                        for (path, idx) in valid_files {
-                            let badge = self.bundle.changes[idx].kind.short_badge().to_string();
-                            rows.push(TreeRow::FileItem {
-                                path: path.clone(),
-                                change_idx: idx,
-                                badge,
-                                finding_count: finding_counts.get(path.as_str()).copied().unwrap_or(0),
-                                in_group: true,
-                            });
-                        }
+                    for (path, idx) in valid_files {
+                        let badge = self.bundle.changes[idx].kind.short_badge().to_string();
+                        push_file_and_finding_rows(
+                            &mut rows,
+                            path.clone(),
+                            idx,
+                            badge,
+                            &issues_by_file,
+                            true,
+                        );
                     }
                 }
                 self.tree_rows = rows;
@@ -1757,13 +1779,14 @@ impl App {
 
         // Flat file list
         for (idx, ch) in self.bundle.changes.iter().enumerate() {
-            rows.push(TreeRow::FileItem {
-                path: ch.path.clone(),
-                change_idx: idx,
-                badge: ch.kind.short_badge().to_string(),
-                finding_count: finding_counts.get(ch.path.as_str()).copied().unwrap_or(0),
-                in_group: false,
-            });
+            push_file_and_finding_rows(
+                &mut rows,
+                ch.path.clone(),
+                idx,
+                ch.kind.short_badge().to_string(),
+                &issues_by_file,
+                false,
+            );
         }
         self.tree_rows = rows;
         if self.tree_cursor >= self.tree_rows.len() && !self.tree_rows.is_empty() {
@@ -1773,6 +1796,12 @@ impl App {
 
     pub fn rebuild_continuous_diff(&mut self) {
         let prev_file_idx = self.selected_file_idx;
+        let prev_source_line = self
+            .continuous
+            .line_to_source_line
+            .get(self.diff_cursor_y)
+            .copied()
+            .flatten();
         let prev_offset_in_file = prev_file_idx.and_then(|cidx| {
             self.continuous
                 .sections
@@ -1812,6 +1841,8 @@ impl App {
             }
         }
 
+        let locale = self.locale();
+        let inline_max_cols = self.diff_pane_width.saturating_sub(4).max(36) as usize;
         let total_sections = ordered_entries.len();
         for (sec_no, (change_idx, group_title)) in ordered_entries.into_iter().enumerate() {
             let fd = &self.rendered_diffs[change_idx];
@@ -1848,21 +1879,61 @@ impl App {
             continuous.line_to_file.push(Some(change_idx));
             continuous.line_to_source_line.push(None);
 
-            let body_start_y = continuous.lines.len();
             let raw_ansi_lines: Vec<&str> = fd.ansi_output.lines().collect();
             let parsed_lines = &self.parsed_texts[change_idx].lines;
+            let local_src_lines: Vec<Option<u32>> = (0..parsed_lines.len())
+                .map(|ly| {
+                    raw_ansi_lines
+                        .get(ly)
+                        .and_then(|raw| parse_source_line_from_ansi(raw))
+                })
+                .collect();
+
+            let (top_inline, after_local_inline) = self
+                .ai_review
+                .as_ref()
+                .map(|ai| {
+                    build_file_inline_annotations(
+                        ai,
+                        fd,
+                        parsed_lines,
+                        &local_src_lines,
+                        locale,
+                        inline_max_cols,
+                    )
+                })
+                .unwrap_or_default();
+
+            for inline_line in top_inline {
+                continuous.lines.push(inline_line);
+                continuous.line_to_file.push(Some(change_idx));
+                continuous.line_to_source_line.push(None);
+            }
+
+            let body_start_y = continuous.lines.len();
+            let mut local_to_global_y = Vec::with_capacity(parsed_lines.len());
 
             for (local_y, line) in parsed_lines.iter().enumerate() {
-                let src_line = raw_ansi_lines
-                    .get(local_y)
-                    .and_then(|raw| parse_source_line_from_ansi(raw));
+                local_to_global_y.push(continuous.lines.len());
+                let src_line = local_src_lines[local_y];
                 continuous.lines.push(line.clone());
                 continuous.line_to_file.push(Some(change_idx));
                 continuous.line_to_source_line.push(src_line);
+
+                if let Some(inline_cards) = after_local_inline.get(&local_y) {
+                    for inline_line in inline_cards {
+                        continuous.lines.push(inline_line.clone());
+                        continuous.line_to_file.push(Some(change_idx));
+                        continuous.line_to_source_line.push(None);
+                    }
+                }
             }
 
             for hm in &fd.hunks_meta {
-                let global_y = (body_start_y + hm.local_anchor_line)
+                let global_y = local_to_global_y
+                    .get(hm.local_anchor_line)
+                    .copied()
+                    .unwrap_or(body_start_y)
                     .min(continuous.lines.len().saturating_sub(1));
                 continuous.global_hunks.push(GlobalHunkAnchor {
                     change_idx,
@@ -1916,10 +1987,21 @@ impl App {
             return;
         }
 
-        if let (Some(cidx), Some(rel_off)) = (prev_file_idx, prev_offset_in_file) {
+        if let Some(cidx) = prev_file_idx {
             if let Some(sec) = self.continuous.sections.iter().find(|s| s.change_idx == cidx) {
-                let max_in_sec = sec.end_y.saturating_sub(1);
-                self.diff_cursor_y = (sec.start_y + rel_off).min(max_in_sec);
+                if let Some(ln) = prev_source_line {
+                    if let Some(gy) = (sec.body_start_y..sec.end_y)
+                        .find(|&gy| self.continuous.line_to_source_line.get(gy).copied().flatten() == Some(ln))
+                    {
+                        self.diff_cursor_y = gy;
+                    } else if let Some(rel_off) = prev_offset_in_file {
+                        let max_in_sec = sec.end_y.saturating_sub(1);
+                        self.diff_cursor_y = (sec.start_y + rel_off).min(max_in_sec);
+                    }
+                } else if let Some(rel_off) = prev_offset_in_file {
+                    let max_in_sec = sec.end_y.saturating_sub(1);
+                    self.diff_cursor_y = (sec.start_y + rel_off).min(max_in_sec);
+                }
             }
         }
 
@@ -1955,6 +2037,9 @@ impl App {
         match self.tree_rows.get(self.tree_cursor)? {
             TreeRow::GroupHeader { group_id, .. } => ai.groups.iter().find(|g| &g.id == group_id),
             TreeRow::FileItem {
+                path, in_group, ..
+            }
+            | TreeRow::FindingItem {
                 path, in_group, ..
             } => {
                 if *in_group {
@@ -3331,6 +3416,9 @@ impl App {
                 }
                 Some(TreeRow::FileItem {
                     path, change_idx, ..
+                })
+                | Some(TreeRow::FindingItem {
+                    path, change_idx, ..
                 }) => {
                     let label = rust_i18n::t!(
                         "revert.target_file",
@@ -3542,61 +3630,11 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-        // Multi-key Vim sequences: g, ], [, z
+        // Multi-key Vim sequences: g
         if let Some(prefix) = self.pending_key.take() {
             match (prefix, key.code) {
                 ('g', KeyCode::Char('g')) => {
                     self.jump_top();
-                    return;
-                }
-                (']', KeyCode::Char('c')) => {
-                    self.jump_hunk(true);
-                    return;
-                }
-                ('[', KeyCode::Char('c')) => {
-                    self.jump_hunk(false);
-                    return;
-                }
-                (']', KeyCode::Char('f')) => {
-                    self.step_file(true);
-                    return;
-                }
-                ('[', KeyCode::Char('f')) => {
-                    self.step_file(false);
-                    return;
-                }
-                (']', KeyCode::Char('g')) => {
-                    self.step_group(true);
-                    return;
-                }
-                ('[', KeyCode::Char('g')) => {
-                    self.step_group(false);
-                    return;
-                }
-                (']', KeyCode::Char('i')) => {
-                    self.step_finding(true);
-                    return;
-                }
-                ('[', KeyCode::Char('i')) => {
-                    self.step_finding(false);
-                    return;
-                }
-                ('z', KeyCode::Char('a')) => {
-                    self.toggle_current_group();
-                    return;
-                }
-                ('z', KeyCode::Char('M')) => {
-                    if let Some(ai) = &self.ai_review {
-                        for g in &ai.groups {
-                            self.collapsed_groups.insert(g.id.clone());
-                        }
-                        self.rebuild_tree_rows();
-                    }
-                    return;
-                }
-                ('z', KeyCode::Char('R')) => {
-                    self.collapsed_groups.clear();
-                    self.rebuild_tree_rows();
                     return;
                 }
                 _ => {
@@ -3630,10 +3668,6 @@ impl App {
                     self.scroll_full_page(false);
                     return;
                 }
-                KeyCode::Char('w') => {
-                    self.toggle_focus_pane();
-                    return;
-                }
                 _ => {}
             }
         }
@@ -3654,9 +3688,9 @@ impl App {
                 self.input_buffer.clear();
                 self.input_cursor = 0;
             }
-            // n / N: next / previous diff hunk across continuous diff
-            KeyCode::Char('n') => self.jump_hunk(true),
-            KeyCode::Char('N') => self.jump_hunk(false),
+            // n / N: jump AI issues once issue list is ready, otherwise jump diff hunks
+            KeyCode::Char('n') => self.step_n_or_hunk(true),
+            KeyCode::Char('N') => self.step_n_or_hunk(false),
             // ; / , : search match navigation
             KeyCode::Char(';') => self.jump_to_search_match(true),
             KeyCode::Char(',') => self.jump_to_search_match(false),
@@ -3676,12 +3710,18 @@ impl App {
                 self.input_cursor = 0;
             }
             KeyCode::Char('J') => {
-                self.show_inspector = true;
-                self.inspector_scroll_y = self.inspector_scroll_y.saturating_add(2);
+                if self.show_inspector {
+                    self.inspector_scroll_y = self.inspector_scroll_y.saturating_add(2);
+                }
             }
             KeyCode::Char('K') => {
-                self.show_inspector = true;
-                self.inspector_scroll_y = self.inspector_scroll_y.saturating_sub(2);
+                if self.show_inspector {
+                    self.inspector_scroll_y = self.inspector_scroll_y.saturating_sub(2);
+                }
+            }
+            KeyCode::Esc => {
+                self.show_inspector = false;
+                self.inspector_scroll_y = 0;
             }
             KeyCode::Char('a') => {
                 self.user_forced_flat_tree = false;
@@ -3746,9 +3786,6 @@ impl App {
                     self.focus = PaneFocus::Diff;
                 }
             }
-            KeyCode::Char('I') => {
-                self.show_inspector = !self.show_inspector;
-            }
             KeyCode::Char('S') => {
                 self.open_commit_confirm();
             }
@@ -3782,21 +3819,9 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab => self.toggle_focus_pane(),
-            KeyCode::Char('H') => {
-                if self.show_sidebar {
-                    self.inspector_scroll_y = 0;
-                    self.focus = PaneFocus::Tree;
-                }
-            }
-            KeyCode::Char('L') => {
-                self.inspector_scroll_y = 0;
-                self.focus = PaneFocus::Diff;
-            }
             KeyCode::Char('g') => self.pending_key = Some('g'),
-            KeyCode::Char(']') => self.pending_key = Some(']'),
-            KeyCode::Char('[') => self.pending_key = Some('['),
-            KeyCode::Char('z') => self.pending_key = Some('z'),
+            KeyCode::Char('f') => self.step_file(true),
+            KeyCode::Char('F') => self.step_file(false),
             KeyCode::Char('G') => self.jump_bottom(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
@@ -3805,15 +3830,6 @@ impl App {
             KeyCode::Char('0') => self.diff_scroll_x = 0,
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_selection(),
             _ => {}
-        }
-    }
-
-    fn toggle_focus_pane(&mut self) {
-        self.inspector_scroll_y = 0;
-        if !self.show_sidebar {
-            self.focus = PaneFocus::Diff;
-        } else {
-            self.focus = self.focus.toggle();
         }
     }
 
@@ -3857,43 +3873,9 @@ impl App {
             PaneFocus::Diff => {
                 if self.diff_scroll_x > 0 {
                     self.diff_scroll_x = self.diff_scroll_x.saturating_sub(4);
-                } else if self.show_sidebar {
-                    self.inspector_scroll_y = 0;
-                    self.focus = PaneFocus::Tree;
                 }
             }
-            PaneFocus::Tree => {
-                self.collapse_active_tree_group();
-            }
-        }
-    }
-
-    fn collapse_active_tree_group(&mut self) {
-        match self.tree_rows.get(self.tree_cursor).cloned() {
-            Some(TreeRow::GroupHeader {
-                group_id,
-                expanded: true,
-                ..
-            }) => {
-                self.collapsed_groups.insert(group_id);
-                self.rebuild_tree_rows();
-            }
-            Some(TreeRow::FileItem { in_group: true, .. }) => {
-                if let Some((pos, gid)) = self.tree_rows[..self.tree_cursor]
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(i, r)| match r {
-                        TreeRow::GroupHeader { group_id, .. } => Some((i, group_id.clone())),
-                        _ => None,
-                    })
-                {
-                    self.collapsed_groups.insert(gid);
-                    self.rebuild_tree_rows();
-                    self.tree_cursor = pos.min(self.tree_rows.len().saturating_sub(1));
-                }
-            }
-            _ => {}
+            PaneFocus::Tree => {}
         }
     }
 
@@ -3903,17 +3885,7 @@ impl App {
                 self.diff_scroll_x = self.diff_scroll_x.saturating_add(4);
             }
             PaneFocus::Tree => {
-                if let Some(TreeRow::GroupHeader {
-                    group_id,
-                    expanded: false,
-                    ..
-                }) = self.tree_rows.get(self.tree_cursor)
-                {
-                    self.collapsed_groups.remove(group_id);
-                    self.rebuild_tree_rows();
-                } else {
-                    self.focus = PaneFocus::Diff;
-                }
+                self.focus = PaneFocus::Diff;
             }
         }
     }
@@ -3975,14 +3947,38 @@ impl App {
             PaneFocus::Tree => {
                 if let Some(row) = self.tree_rows.get(self.tree_cursor).cloned() {
                     match row {
-                        TreeRow::GroupHeader { group_id, .. } => {
-                            if !self.collapsed_groups.remove(&group_id) {
-                                self.collapsed_groups.insert(group_id);
-                            }
-                            self.rebuild_tree_rows();
+                        TreeRow::GroupHeader {
+                            first_change_idx: Some(change_idx),
+                            ..
+                        } => {
+                            self.jump_continuous_to_file(change_idx);
+                            self.focus = PaneFocus::Diff;
                         }
+                        TreeRow::GroupHeader { .. } => {}
                         TreeRow::FileItem { change_idx, .. } => {
                             self.jump_continuous_to_file(change_idx);
+                            self.focus = PaneFocus::Diff;
+                        }
+                        TreeRow::FindingItem {
+                            finding_id,
+                            change_idx,
+                            line,
+                            end_line,
+                            level,
+                            title,
+                            ..
+                        } => {
+                            let target_ln = end_line.or(line);
+                            let range = matches!(level, TreeIssueLevel::HunkRisk(_))
+                                .then(|| line.zip(end_line))
+                                .flatten();
+                            self.jump_to_finding_location(
+                                change_idx,
+                                target_ln,
+                                range,
+                                &finding_id,
+                                Some(&title),
+                            );
                             self.focus = PaneFocus::Diff;
                         }
                     }
@@ -3995,15 +3991,31 @@ impl App {
     }
 
     fn sync_diff_to_tree_selection(&mut self) {
-        let target_idx = match self.tree_rows.get(self.tree_cursor) {
-            Some(TreeRow::FileItem { change_idx, .. }) => Some(*change_idx),
+        match self.tree_rows.get(self.tree_cursor).cloned() {
+            Some(TreeRow::FileItem { change_idx, .. }) => {
+                self.jump_continuous_to_file(change_idx);
+            }
             Some(TreeRow::GroupHeader {
-                first_change_idx, ..
-            }) => *first_change_idx,
-            None => None,
-        };
-        if let Some(idx) = target_idx {
-            self.jump_continuous_to_file(idx);
+                first_change_idx: Some(idx),
+                ..
+            }) => {
+                self.jump_continuous_to_file(idx);
+            }
+            Some(TreeRow::FindingItem {
+                finding_id,
+                change_idx,
+                line,
+                end_line,
+                level,
+                ..
+            }) => {
+                let target_ln = end_line.or(line);
+                let range = matches!(level, TreeIssueLevel::HunkRisk(_))
+                    .then(|| line.zip(end_line))
+                    .flatten();
+                self.jump_to_finding_location(change_idx, target_ln, range, &finding_id, None);
+            }
+            _ => {}
         }
     }
 
@@ -4056,21 +4068,6 @@ impl App {
             self.diff_scroll_y = self.diff_cursor_y.saturating_sub(margin);
         } else if self.diff_cursor_y + margin >= scroll + h {
             self.diff_scroll_y = (self.diff_cursor_y + margin + 1).saturating_sub(h);
-        }
-    }
-
-    fn toggle_current_group(&mut self) {
-        match self.tree_rows.get(self.tree_cursor).cloned() {
-            Some(TreeRow::GroupHeader { group_id, .. }) => {
-                if !self.collapsed_groups.remove(&group_id) {
-                    self.collapsed_groups.insert(group_id);
-                }
-                self.rebuild_tree_rows();
-            }
-            Some(TreeRow::FileItem { .. }) => {
-                self.collapse_active_tree_group();
-            }
-            None => {}
         }
     }
 
@@ -4194,6 +4191,32 @@ impl App {
         self.sync_tree_to_diff_cursor();
     }
 
+    fn jump_to_finding_location(
+        &mut self,
+        change_idx: usize,
+        line: Option<u32>,
+        range: Option<(u32, u32)>,
+        finding_id: &str,
+        status_title: Option<&str>,
+    ) {
+        self.inspector_scroll_y = 0;
+        self.selected_file_idx = Some(change_idx);
+        self.diff_scroll_x = 0;
+        if let Some(target_y) = find_finding_global_y(&self.continuous, change_idx, line, range) {
+            self.diff_cursor_y = target_y;
+            self.diff_scroll_y = target_y.saturating_sub((self.diff_pane_height / 4) as usize);
+        }
+        self.last_stepped_finding_id = Some(finding_id.to_string());
+        if let Some(title) = status_title {
+            self.status_message = rust_i18n::t!(
+                "status.finding_status",
+                locale = self.locale(),
+                title = title
+            )
+            .into_owned();
+        }
+    }
+
     fn step_file(&mut self, forward: bool) {
         if self.continuous.sections.is_empty() {
             return;
@@ -4218,117 +4241,104 @@ impl App {
         self.sync_tree_to_diff_cursor();
     }
 
-    fn step_group(&mut self, forward: bool) {
-        let group_positions: Vec<usize> = self
-            .tree_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| matches!(r, TreeRow::GroupHeader { .. }).then_some(i))
-            .collect();
-        if group_positions.is_empty() {
-            return;
+    fn step_n_or_hunk(&mut self, forward: bool) {
+        let has_issues = self
+            .ai_review
+            .as_ref()
+            .is_some_and(|ai| !collect_ai_tree_issues(ai).is_empty());
+        if !has_issues || !self.step_finding(forward) {
+            self.jump_hunk(forward);
         }
-        self.inspector_scroll_y = 0;
-        let next_pos = if forward {
-            group_positions
-                .iter()
-                .copied()
-                .find(|&p| p > self.tree_cursor)
-                .unwrap_or(group_positions[0])
-        } else {
-            group_positions
-                .iter()
-                .copied()
-                .rev()
-                .find(|&p| p < self.tree_cursor)
-                .unwrap_or(*group_positions.last().unwrap())
-        };
-        self.tree_cursor = next_pos;
-        self.sync_diff_to_tree_selection();
     }
 
-    fn step_finding(&mut self, forward: bool) {
-        let Some(ai) = &self.ai_review else {
-            return;
-        };
-        if ai.findings.is_empty() {
-            return;
-        }
-        self.inspector_scroll_y = 0;
+    fn step_finding(&mut self, forward: bool) -> bool {
         let cur_y = self.diff_cursor_y;
-        // Find target y for each finding in continuous diff, preserving deterministic order for same-line items
-        let mut finding_targets: Vec<(usize, u32, usize, &ReviewFinding)> = ai
-            .findings
-            .iter()
-            .enumerate()
-            .filter_map(|(ord, f)| {
-                let cidx = *self.path_to_index.get(&f.file)?;
-                let sec = self
-                    .continuous
-                    .sections
-                    .iter()
-                    .find(|s| s.change_idx == cidx)?;
-                let y = if let Some(ln) = f.line {
-                    (sec.body_start_y..sec.end_y)
-                        .find(|&gy| self.continuous.line_to_source_line[gy] == Some(ln))
-                        .unwrap_or(sec.start_y)
-                } else {
-                    sec.start_y
-                };
-                Some((y, f.line.unwrap_or(0), ord, f))
-            })
-            .collect();
-        finding_targets.sort_by_key(|(y, ln, ord, _)| (*y, *ln, *ord));
-        if finding_targets.is_empty() {
-            return;
-        }
-
-        let current_match_pos = self
-            .last_stepped_finding_id
-            .as_deref()
-            .and_then(|last_id| {
-                finding_targets
-                    .iter()
-                    .position(|(y, _, _, f)| *y == cur_y && f.id == last_id)
-            });
-
-        let chosen = if let Some(pos) = current_match_pos {
-            let next_pos = if forward {
-                (pos + 1) % finding_targets.len()
-            } else if pos == 0 {
-                finding_targets.len() - 1
-            } else {
-                pos - 1
+        let chosen = {
+            let Some(ai) = &self.ai_review else {
+                return false;
             };
-            &finding_targets[next_pos]
-        } else if forward {
-            finding_targets
-                .iter()
-                .find(|(y, _, _, _)| *y > cur_y)
-                .unwrap_or(&finding_targets[0])
-        } else {
-            finding_targets
-                .iter()
-                .rev()
-                .find(|(y, _, _, _)| *y < cur_y)
-                .unwrap_or(finding_targets.last().unwrap())
+            let issues = collect_ai_tree_issues(ai);
+            if issues.is_empty() {
+                return false;
+            }
+            // Find target y for each issue/risk item in continuous diff
+            let mut finding_targets: Vec<(
+                usize,
+                u32,
+                bool,
+                usize,
+                usize,
+                Option<u32>,
+                Option<(u32, u32)>,
+                String,
+                String,
+            )> = issues
+                .into_iter()
+                .filter_map(|it| {
+                    let cidx = *self.path_to_index.get(&it.file)?;
+                    let jump_ln = it.jump_line();
+                    let range = it.range();
+                    let y = find_finding_global_y(&self.continuous, cidx, jump_ln, range)?;
+                    Some((
+                        y,
+                        jump_ln.unwrap_or(0),
+                        it.is_hunk,
+                        it.order,
+                        cidx,
+                        jump_ln,
+                        range,
+                        it.id,
+                        it.title,
+                    ))
+                })
+                .collect();
+            finding_targets.sort_by_key(|(y, ln, is_hunk, ord, ..)| (*y, *ln, *is_hunk, *ord));
+            if finding_targets.is_empty() {
+                return false;
+            }
+
+            let current_match_pos =
+                self.last_stepped_finding_id
+                    .as_deref()
+                    .and_then(|last_id| {
+                        finding_targets
+                            .iter()
+                            .position(|(y, _, _, _, _, _, _, id, _)| *y == cur_y && id == last_id)
+                    });
+
+            if let Some(pos) = current_match_pos {
+                let next_pos = if forward {
+                    (pos + 1) % finding_targets.len()
+                } else if pos == 0 {
+                    finding_targets.len() - 1
+                } else {
+                    pos - 1
+                };
+                finding_targets.swap_remove(next_pos)
+            } else if forward {
+                let pos = finding_targets
+                    .iter()
+                    .position(|(y, ..)| *y > cur_y)
+                    .unwrap_or(0);
+                finding_targets.swap_remove(pos)
+            } else {
+                let pos = finding_targets
+                    .iter()
+                    .rposition(|(y, ..)| *y < cur_y)
+                    .unwrap_or(finding_targets.len() - 1);
+                finding_targets.swap_remove(pos)
+            }
         };
 
-        let target_y = chosen.0;
-        let finding_id = chosen.3.id.clone();
-        let finding_title = chosen.3.title.clone();
-        self.last_stepped_finding_id = Some(finding_id);
-        self.diff_cursor_y = target_y;
-        self.diff_scroll_y = self
-            .diff_cursor_y
-            .saturating_sub((self.diff_pane_height / 4) as usize);
+        let (_, _, _, _, change_idx, line, range, finding_id, finding_title) = chosen;
+        self.jump_to_finding_location(change_idx, line, range, &finding_id, Some(&finding_title));
         self.sync_tree_to_diff_cursor();
-        self.status_message = rust_i18n::t!(
-            "status.finding_status",
-            locale = self.locale(),
-            title = finding_title
-        )
-        .into_owned();
+        if let Some(pos) = self.tree_rows.iter().position(|r| {
+            matches!(r, TreeRow::FindingItem { finding_id: id, .. } if id == &finding_id)
+        }) {
+            self.tree_cursor = pos;
+        }
+        true
     }
 
     fn recompute_search_matches(&mut self) {
@@ -4762,7 +4772,6 @@ impl App {
                     self.focus = PaneFocus::Diff;
                 }
             }
-            "inspector" => self.show_inspector = !self.show_inspector,
             "refresh" | "r" => {
                 let t = self.bundle.target.clone();
                 if let Err(e) = self.reload_target_with_options(t, true) {
@@ -4917,4 +4926,537 @@ fn append_bounded_tail(buf: &mut String, delta: &str, max_bytes: usize) {
 
 fn truncate(s: &str, max_cols: usize) -> String {
     crate::ui::truncate_display_width(s, max_cols)
+}
+
+fn find_finding_global_y(
+    continuous: &ContinuousDiff,
+    change_idx: usize,
+    line: Option<u32>,
+    range: Option<(u32, u32)>,
+) -> Option<usize> {
+    let sec = continuous
+        .sections
+        .iter()
+        .find(|s| s.change_idx == change_idx)?;
+    let Some(ln) = line else {
+        return Some(sec.start_y);
+    };
+    if let Some(exact) = (sec.body_start_y..sec.end_y).find(|&gy| {
+        continuous
+            .line_to_source_line
+            .get(gy)
+            .copied()
+            .flatten()
+            == Some(ln)
+    }) {
+        return Some(exact);
+    }
+
+    // For multi-line hunks, prefer the last rendered line inside [start_line, end_line]
+    if let Some((rs, re)) = range {
+        let (lo, hi) = if rs <= re { (rs, re) } else { (re, rs) };
+        if let Some(last_in_range) = (sec.body_start_y..sec.end_y).rev().find(|&gy| {
+            matches!(
+                continuous.line_to_source_line.get(gy).copied().flatten(),
+                Some(sl) if sl >= lo && sl <= hi
+            )
+        }) {
+            return Some(last_in_range);
+        }
+    }
+
+    // Fallback 1: closest source line inside a hunk bracketing `ln`
+    let file_hunks: Vec<&GlobalHunkAnchor> = continuous
+        .global_hunks
+        .iter()
+        .filter(|h| h.change_idx == change_idx)
+        .collect();
+    if let Some((pos, h)) = file_hunks.iter().enumerate().find(|(_, h)| {
+        matches!((h.start_line, h.end_line), (Some(s), Some(e)) if ln >= s && ln <= e)
+    }) {
+        let h_start = h.global_y.max(sec.body_start_y);
+        let h_end = file_hunks
+            .get(pos + 1)
+            .map(|next_h| next_h.global_y)
+            .unwrap_or(sec.end_y)
+            .min(sec.end_y);
+        if let Some((best_y, _)) = (h_start..h_end)
+            .filter_map(|gy| {
+                continuous
+                    .line_to_source_line
+                    .get(gy)
+                    .copied()
+                    .flatten()
+                    .map(|sl| (gy, sl.abs_diff(ln)))
+            })
+            .min_by_key(|&(_, d)| d)
+        {
+            return Some(best_y);
+        }
+        return Some(h.global_y);
+    }
+
+    // Fallback 2: closest source line anywhere in this file's rendered diff
+    (sec.body_start_y..sec.end_y)
+        .filter_map(|gy| {
+            continuous
+                .line_to_source_line
+                .get(gy)
+                .copied()
+                .flatten()
+                .map(|sl| (gy, sl.abs_diff(ln)))
+        })
+        .min_by_key(|&(_, d)| d)
+        .map(|(y, _)| y)
+        .or(Some(sec.start_y))
+}
+
+struct TreeIssueEntry {
+    id: String,
+    file: String,
+    line: Option<u32>,
+    end_line: Option<u32>,
+    level: TreeIssueLevel,
+    title: String,
+    is_hunk: bool,
+    order: usize,
+}
+
+impl TreeIssueEntry {
+    fn jump_line(&self) -> Option<u32> {
+        self.end_line.or(self.line)
+    }
+
+    fn range(&self) -> Option<(u32, u32)> {
+        if self.is_hunk {
+            Some((self.line?, self.end_line?))
+        } else {
+            None
+        }
+    }
+}
+
+fn collect_ai_tree_issues(ai: &AiReviewResult) -> Vec<TreeIssueEntry> {
+    let mut out = Vec::with_capacity(ai.findings.len() + ai.hunks.len());
+    for (ord, f) in ai.findings.iter().enumerate() {
+        out.push(TreeIssueEntry {
+            id: f.id.clone(),
+            file: f.file.clone(),
+            line: f.line,
+            end_line: None,
+            level: TreeIssueLevel::Finding(f.severity),
+            title: f.title.clone(),
+            is_hunk: false,
+            order: ord,
+        });
+    }
+    for (ord, ha) in ai.hunks.iter().enumerate() {
+        if ha.risk_level <= RiskLevel::Medium
+            && (!ha.title.trim().is_empty() || !ha.analysis.trim().is_empty())
+        {
+            out.push(TreeIssueEntry {
+                id: format!("__hunk__{}", ord),
+                file: ha.file.clone(),
+                line: ha.start_line.or(ha.end_line),
+                end_line: ha.end_line,
+                level: TreeIssueLevel::HunkRisk(ha.risk_level),
+                title: if ha.title.trim().is_empty() {
+                    ha.analysis.clone()
+                } else {
+                    ha.title.clone()
+                },
+                is_hunk: true,
+                order: ord,
+            });
+        }
+    }
+    out
+}
+
+pub fn count_file_tree_issues(ai: &AiReviewResult, file_path: &str) -> usize {
+    let findings = ai.findings.iter().filter(|f| f.file == file_path).count();
+    let elevated_hunks = ai
+        .hunks
+        .iter()
+        .filter(|ha| {
+            ha.file == file_path
+                && ha.risk_level <= RiskLevel::Medium
+                && (!ha.title.trim().is_empty() || !ha.analysis.trim().is_empty())
+        })
+        .count();
+    findings + elevated_hunks
+}
+
+fn push_file_and_finding_rows(
+    rows: &mut Vec<TreeRow>,
+    path: String,
+    change_idx: usize,
+    badge: String,
+    issues_by_file: &HashMap<String, Vec<TreeIssueEntry>>,
+    in_group: bool,
+) {
+    let file_issues = issues_by_file.get(&path);
+    let finding_count = file_issues.map(|v| v.len()).unwrap_or(0);
+    rows.push(TreeRow::FileItem {
+        path: path.clone(),
+        change_idx,
+        badge,
+        finding_count,
+        in_group,
+    });
+    if let Some(list) = file_issues {
+        for item in list {
+            rows.push(TreeRow::FindingItem {
+                finding_id: item.id.clone(),
+                path: path.clone(),
+                change_idx,
+                line: item.line,
+                end_line: item.end_line,
+                level: item.level,
+                title: item.title.clone(),
+                in_group,
+            });
+        }
+    }
+}
+
+pub fn risk_color(risk: RiskLevel) -> Color {
+    match risk {
+        RiskLevel::Critical => Color::Red,
+        RiskLevel::High => Color::LightRed,
+        RiskLevel::Medium => Color::Yellow,
+        RiskLevel::Low => Color::Green,
+        RiskLevel::Info => Color::Cyan,
+    }
+}
+
+pub fn severity_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Critical => Color::Red,
+        Severity::Warning => Color::Yellow,
+        Severity::Suggestion => Color::Cyan,
+        Severity::Info => Color::Blue,
+        Severity::Praise => Color::Green,
+    }
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+fn wrap_inline_text(text: &str, max_cols: usize) -> Vec<String> {
+    let width = max_cols.max(16);
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut current = String::new();
+        let mut cur_w = 0usize;
+        let mut last_space_byte: Option<usize> = None;
+
+        for ch in trimmed.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if cur_w + cw > width && !current.is_empty() {
+                if let Some(sp) = last_space_byte {
+                    let head = current[..sp].trim_end().to_string();
+                    let tail = current[sp..].trim_start().to_string();
+                    if !head.is_empty() {
+                        out.push(head);
+                    }
+                    current = tail;
+                    cur_w = current.chars().map(|c| c.width().unwrap_or(0)).sum();
+                    last_space_byte = current.rfind(' ');
+                    if cur_w + cw <= width {
+                        current.push(ch);
+                        cur_w += cw;
+                        if ch == ' ' {
+                            last_space_byte = Some(current.len() - 1);
+                        }
+                        continue;
+                    }
+                }
+                out.push(current);
+                current = String::new();
+                cur_w = 0;
+                last_space_byte = None;
+                if ch == ' ' {
+                    continue;
+                }
+            }
+            if ch == ' ' {
+                last_space_byte = Some(current.len());
+            }
+            current.push(ch);
+            cur_w += cw;
+        }
+        if !current.trim().is_empty() {
+            out.push(current.trim_end().to_string());
+        }
+    }
+    out
+}
+
+fn append_inline_card(
+    out: &mut Vec<Line<'static>>,
+    accent: Color,
+    badge_label: &str,
+    title_text: &str,
+    body_blocks: &[(&str, &str, Style)],
+    max_cols: usize,
+) {
+    let box_w = max_cols.max(36);
+    let inner_w = box_w.saturating_sub(4).max(20);
+
+    // Ensure a single blank spacer line above the card
+    if !out.last().is_some_and(line_is_blank) {
+        out.push(Line::raw(""));
+    }
+
+    let badge_w = UnicodeWidthStr::width(badge_label);
+    let top_title_budget = box_w.saturating_sub(6 + badge_w).max(8);
+    let wrapped_titles = wrap_inline_text(title_text, top_title_budget);
+    let first_title = wrapped_titles
+        .first()
+        .map(String::as_str)
+        .unwrap_or("");
+    let header_content_w = badge_w + UnicodeWidthStr::width(first_title);
+    // "  ┌─ " uses 3 box chars on left, plus " " + "─"*fill + "┐" on right
+    let fill = box_w.saturating_sub(5 + header_content_w);
+
+    out.push(Line::from(vec![
+        Span::styled("  ┌─ ", Style::default().fg(accent)),
+        Span::styled(
+            badge_label.to_string(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            first_title.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}┐", "─".repeat(fill)),
+            Style::default().fg(accent),
+        ),
+    ]));
+
+    let push_box_row = |dst: &mut Vec<Line<'static>>, text: String, style: Style| {
+        let w = UnicodeWidthStr::width(text.as_str());
+        let pad = inner_w.saturating_sub(w);
+        dst.push(Line::from(vec![
+            Span::styled("  │ ", Style::default().fg(accent)),
+            Span::styled(text, style),
+            Span::styled(format!("{} │", " ".repeat(pad)), Style::default().fg(accent)),
+        ]));
+    };
+
+    for cont in wrapped_titles.into_iter().skip(1) {
+        for rewrapped in wrap_inline_text(&cont, inner_w) {
+            push_box_row(
+                out,
+                rewrapped,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+
+    for &(prefix, text, style) in body_blocks {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let full = if prefix.is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("{}{}", prefix, trimmed)
+        };
+        for wrapped in wrap_inline_text(&full, inner_w) {
+            push_box_row(out, wrapped, style);
+        }
+    }
+
+    out.push(Line::from(Span::styled(
+        format!("  └{}┘", "─".repeat(box_w.saturating_sub(2))),
+        Style::default().fg(accent),
+    )));
+    // Blank spacer line below the card
+    out.push(Line::raw(""));
+}
+
+fn push_inline_finding(
+    out: &mut Vec<Line<'static>>,
+    f: &ReviewFinding,
+    locale: &str,
+    max_cols: usize,
+) {
+    let accent = severity_color(f.severity);
+    let badge_label = format!("[{}] ", f.severity.localized_label(locale));
+    let line_tag = f.line.map(|l| format!("L{}: ", l)).unwrap_or_default();
+    let title_text = format!("{}{}", line_tag, f.title);
+    let sugg_prefix = rust_i18n::t!("inspector.suggestion_prefix", locale = locale);
+    let trimmed_sugg_prefix = sugg_prefix.trim_start();
+    let mut blocks: Vec<(&str, &str, Style)> = vec![("", &f.description, Style::default())];
+    if let Some(sugg) = &f.suggestion {
+        blocks.push((
+            trimmed_sugg_prefix,
+            sugg,
+            Style::default().fg(Color::Green),
+        ));
+    }
+    append_inline_card(out, accent, &badge_label, &title_text, &blocks, max_cols);
+}
+
+fn push_inline_hunk(
+    out: &mut Vec<Line<'static>>,
+    ha: &HunkAnalysis,
+    locale: &str,
+    max_cols: usize,
+) {
+    let accent = risk_color(ha.risk_level);
+    let badge_label = format!("[{}] ", ha.risk_level.localized_label(locale));
+    let range_tag = match (ha.start_line, ha.end_line) {
+        (Some(s), Some(e)) => format!(" (L{}-L{})", s, e),
+        (Some(s), None) => format!(" (L{})", s),
+        _ => String::new(),
+    };
+    let title_text = format!("{}{}", ha.title, range_tag);
+    let blocks = [("", ha.analysis.as_str(), Style::default().fg(Color::Gray))];
+    append_inline_card(out, accent, &badge_label, &title_text, &blocks, max_cols);
+}
+
+fn build_file_inline_annotations(
+    ai: &AiReviewResult,
+    fd: &FileDiffRendered,
+    parsed_lines: &[Line<'static>],
+    local_src_lines: &[Option<u32>],
+    locale: &str,
+    max_cols: usize,
+) -> (Vec<Line<'static>>, HashMap<usize, Vec<Line<'static>>>) {
+    let mut top_lines: Vec<Line<'static>> = Vec::new();
+    let mut after_local_y: HashMap<usize, Vec<Line<'static>>> = HashMap::new();
+
+    // Compute (hunk_meta_ref, start_local_y, end_local_y, last_non_blank_local_y)
+    let mut ordered_hunks: Vec<&crate::model::HunkMeta> = fd.hunks_meta.iter().collect();
+    ordered_hunks.sort_by_key(|hm| hm.local_anchor_line);
+
+    let max_local_y = parsed_lines.len().saturating_sub(1);
+    let hunk_spans: Vec<(&crate::model::HunkMeta, usize, usize, usize)> = if parsed_lines.is_empty() {
+        Vec::new()
+    } else {
+        ordered_hunks
+            .iter()
+            .enumerate()
+            .map(|(idx, hm)| {
+                let start_y = hm.local_anchor_line.min(max_local_y);
+                let next_anchor = ordered_hunks
+                    .get(idx + 1)
+                    .map(|n| n.local_anchor_line.saturating_sub(1))
+                    .unwrap_or(max_local_y);
+                let end_y = next_anchor.max(start_y).min(max_local_y);
+                let last_code_y = (start_y..=end_y)
+                    .rev()
+                    .find(|&y| !line_is_blank(&parsed_lines[y]))
+                    .unwrap_or(end_y);
+                (*hm, start_y, end_y, last_code_y)
+            })
+            .collect()
+    };
+
+    for f in ai.findings.iter().filter(|f| f.file == fd.path) {
+        let target_local_y = if parsed_lines.is_empty() {
+            None
+        } else if let Some(ln) = f.line {
+            local_src_lines
+                .iter()
+                .position(|&s| s == Some(ln))
+                .or_else(|| {
+                    let containing_hunk = hunk_spans.iter().find(|(hm, _, _, _)| {
+                        matches!((hm.start_line, hm.end_line), (Some(s), Some(e)) if ln >= s && ln <= e)
+                    });
+                    containing_hunk.and_then(|&(_, s_y, e_y, last_code_y)| {
+                        (s_y..=e_y)
+                            .filter_map(|y| local_src_lines[y].map(|sl| (y, sl.abs_diff(ln))))
+                            .min_by_key(|&(_, d)| d)
+                            .map(|(y, _)| y)
+                            .or(Some(last_code_y))
+                    })
+                })
+                .or_else(|| {
+                    local_src_lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(y, sl)| sl.map(|s| (y, s.abs_diff(ln))))
+                        .min_by_key(|&(_, d)| d)
+                        .map(|(y, _)| y)
+                })
+        } else {
+            None
+        };
+
+        if let Some(ly) = target_local_y {
+            let entry = after_local_y.entry(ly).or_default();
+            push_inline_finding(entry, f, locale, max_cols);
+        } else {
+            push_inline_finding(&mut top_lines, f, locale, max_cols);
+        }
+    }
+
+    for ha in ai.hunks.iter().filter(|h| h.file == fd.path) {
+        let anchor_ln = ha.end_line.or(ha.start_line);
+        let matched_last_y = if parsed_lines.is_empty() {
+            None
+        } else {
+            anchor_ln
+                .and_then(|end_ln| local_src_lines.iter().position(|&s| s == Some(end_ln)))
+                .or_else(|| {
+                    let (Some(hs), Some(he)) = (ha.start_line, ha.end_line) else {
+                        return None;
+                    };
+                    let (lo, hi) = if hs <= he { (hs, he) } else { (he, hs) };
+                    local_src_lines.iter().enumerate().rev().find_map(|(y, sl)| {
+                        matches!(*sl, Some(ln) if ln >= lo && ln <= hi).then_some(y)
+                    })
+                })
+                .or_else(|| {
+                    let overlap_last = match (ha.start_line, ha.end_line) {
+                        (Some(hs), Some(he)) => {
+                            let (lo, hi) = if hs <= he { (hs, he) } else { (he, hs) };
+                            hunk_spans.iter().rev().find(|(hm, _, _, _)| {
+                                matches!(
+                                    (hm.start_line, hm.end_line),
+                                    (Some(ms), Some(me)) if lo <= me && ms <= hi
+                                )
+                            })
+                        }
+                        _ => None,
+                    };
+                    overlap_last
+                        .or_else(|| {
+                            hunk_spans
+                                .iter()
+                                .find(|(hm, _, _, _)| ha.chunk_index == Some(hm.chunk_index))
+                        })
+                        .or_else(|| {
+                            let target_ln = anchor_ln?;
+                            hunk_spans.iter().min_by_key(|(hm, _, _, _)| {
+                                hm.end_line
+                                    .or(hm.start_line)
+                                    .map(|ms| ms.abs_diff(target_ln))
+                                    .unwrap_or(u32::MAX)
+                            })
+                        })
+                        .map(|&(_, _, _, last_code_y)| last_code_y)
+                })
+        };
+
+        if let Some(ly) = matched_last_y {
+            let entry = after_local_y.entry(ly).or_default();
+            push_inline_hunk(entry, ha, locale, max_cols);
+        } else {
+            push_inline_hunk(&mut top_lines, ha, locale, max_cols);
+        }
+    }
+
+    (top_lines, after_local_y)
 }

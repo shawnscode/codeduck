@@ -437,47 +437,92 @@ pub fn strip_ansi_escapes(s: &str) -> String {
     out
 }
 
+fn parse_gutter_token(s: &str) -> Option<(Option<u32>, &str)> {
+    let mut len = 0usize;
+    let bytes = s.as_bytes();
+    if bytes.starts_with(b"...") {
+        len = 3;
+        let rest = &s[len..];
+        if rest.is_empty() || rest.starts_with(' ') {
+            return Some((None, rest));
+        }
+        return None;
+    }
+    if bytes.starts_with(b"..") {
+        len = 2;
+        let rest = &s[len..];
+        if rest.is_empty() || rest.starts_with(' ') {
+            return Some((None, rest));
+        }
+        return None;
+    }
+    while len < bytes.len() && bytes[len].is_ascii_digit() {
+        len += 1;
+    }
+    if len == 0 || len > 7 {
+        return None;
+    }
+    let rest = &s[len..];
+    if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('|') {
+        let n = s[..len].parse::<u32>().ok()?;
+        Some((Some(n), rest))
+    } else {
+        None
+    }
+}
+
 pub fn parse_source_line_from_ansi(ansi_line: &str) -> Option<u32> {
     let plain = strip_ansi_escapes(ansi_line);
-    // Leading gutter line number (<= 6 leading spaces + digits followed by whitespace)
-    let leading_ws = plain.bytes().take_while(|&b| b == b' ').count();
-    if leading_ws <= 6 {
-        let rest = &plain[leading_ws..];
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let after_digits = &rest[digits.len()..];
-        if !digits.is_empty()
-            && digits.len() <= 7
-            && (after_digits.is_empty() || after_digits.starts_with(' '))
-        {
-            if let Ok(n) = digits.parse::<u32>() {
-                return Some(n);
-            }
+    let trimmed_start = plain.trim_start_matches(' ');
+    let leading_ws = plain.len() - trimmed_start.len();
+
+    // Handle simple_line_diff fallback ("+   42 | ..." / "-   41 | ...")
+    if leading_ws == 0 && (plain.starts_with("+ ") || plain.starts_with("- ")) {
+        let after_sign = plain[2..].trim_start_matches(' ');
+        if let Some((Some(n), _)) = parse_gutter_token(after_sign) {
+            return Some(n);
         }
     }
-    // Side-by-side right column gutter: at least 2 spaces gap immediately preceding digits + space
+
+    let mut lhs_fallback: Option<u32> = None;
+    let mut rhs_inline_candidate: Option<u32> = None;
+
+    // Leading gutter (<= 8 leading spaces): supports
+    // - single column: "  14 code", "     18 code"
+    // - aligned old+new gutter: " 371  424 code", " ...  436 code", " 371  ... code"
+    if leading_ws <= 8 {
+        if let Some((tok1, rest1)) = parse_gutter_token(trimmed_start) {
+            let sp = rest1.bytes().take_while(|&b| b == b' ').count();
+            // Restrict tight gutter gap so indented code literals (e.g. " 444    0 => ...")
+            // are not mistaken for a second line-number column.
+            let max_gap = if tok1.is_none() { 4 } else { 2 };
+            if (1..=max_gap).contains(&sp) {
+                if let Some((Some(rhs_inline), _)) = parse_gutter_token(&rest1[sp..]) {
+                    rhs_inline_candidate = Some(rhs_inline);
+                }
+            }
+            lhs_fallback = tok1;
+        }
+    }
+
+    // Side-by-side right column gutter: preceded by >= 2 spaces in the right half of the line
     let bytes = plain.as_bytes();
-    let mid_start = bytes.len() / 3;
+    let mid_start = (bytes.len() / 3).max(18);
     let mut i = mid_start;
     while i + 2 < bytes.len() {
         if bytes[i] == b' ' && bytes[i + 1] == b' ' {
             while i < bytes.len() && bytes[i] == b' ' {
                 i += 1;
             }
-            let d_start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            let d_len = i - d_start;
-            if d_len > 0 && d_len <= 7 && (i == bytes.len() || bytes[i] == b' ') {
-                if let Ok(n) = plain[d_start..i].parse::<u32>() {
-                    return Some(n);
-                }
+            if let Some((Some(rhs_sbs), _)) = parse_gutter_token(&plain[i..]) {
+                return Some(rhs_sbs);
             }
         } else {
             i += 1;
         }
     }
-    None
+
+    rhs_inline_candidate.or(lhs_fallback)
 }
 
 fn build_hunks_meta(
@@ -736,4 +781,70 @@ pub fn build_ai_structural_diff(change: &FileChange, json: Option<&DifftJsonOutp
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_source_line_from_ansi;
+
+    #[test]
+    fn parses_side_by_side_inline_and_unified_difft_gutters() {
+        // Pure-addition collapsed gutter in side-by-side output ("...  436")
+        assert_eq!(
+            parse_source_line_from_ansi(
+                " \x1b[2m...\x1b[0m  \x1b[92m436\x1b[0m                 let prefix_cols = 0;"
+            ),
+            Some(436)
+        );
+        // Modified aligned line ("371  424") prefers new rhs line 424
+        assert_eq!(
+            parse_source_line_from_ansi(" 371  424             }"),
+            Some(424)
+        );
+        // Side-by-side dual columns ("271 ... 324 ...") prefers right rhs line 324
+        assert_eq!(
+            parse_source_line_from_ansi(
+                " 271     } else {                                   324     } else {"
+            ),
+            Some(324)
+        );
+        // Blank left column with right column line 322
+        assert_eq!(
+            parse_source_line_from_ansi(
+                " ...                                                322             draw_diff_pane(frame);"
+            ),
+            Some(322)
+        );
+        // Inline added line (5 spaces leading gutter)
+        assert_eq!(
+            parse_source_line_from_ansi("     18     App, CommitModalFocus,"),
+            Some(18)
+        );
+        // Pure deleted line falls back to lhs line 371
+        assert_eq!(
+            parse_source_line_from_ansi(" 371  ...                 old deleted"),
+            Some(371)
+        );
+        // Wrapped continuation line returns None
+        assert_eq!(
+            parse_source_line_from_ansi(
+                "  .. ar, UnicodeWidthStr};                 .. ar, UnicodeWidthStr};"
+            ),
+            None
+        );
+        // Code line starting with a numeric literal after >= 4 spaces must not override rhs/lhs gutter
+        assert_eq!(
+            parse_source_line_from_ansi("  13    0 => foo"),
+            Some(13)
+        );
+        assert_eq!(
+            parse_source_line_from_ansi(" 444    0 => foo                  496    0 => bar"),
+            Some(496)
+        );
+        // Diff section banner must not be misparsed as line number
+        assert_eq!(
+            parse_source_line_from_ansi("14/mod.rs --- 1/18 --- Text (exceeded DFT_GRAPH_LIMIT)"),
+            None
+        );
+    }
 }

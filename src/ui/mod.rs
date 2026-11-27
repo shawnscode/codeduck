@@ -14,9 +14,9 @@ use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::i18n;
-use crate::model::{RiskLevel, Severity};
 use crate::ui::app::{
-    App, CommitModalFocus, InputMode, OverlayKind, PaneFocus, TreeMode, TreeRow,
+    App, CommitModalFocus, InputMode, OverlayKind, PaneFocus, TreeMode, TreeRow, risk_color,
+    severity_color,
 };
 use rust_i18n::t;
 
@@ -54,14 +54,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn spinner_frame(started_at: Option<Instant>) -> (&'static str, std::time::Duration) {
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let elapsed = started_at.map(|t| t.elapsed()).unwrap_or_default();
+    let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
+    (spin, elapsed)
+}
+
+fn format_project_label(app: &App) -> String {
+    let repo_name = app
+        .bundle
+        .repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("repo");
+    if let Ok(rel) = app.bundle.path_base_dir.strip_prefix(&app.bundle.repo_root) {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !rel_str.is_empty() && rel_str != "." {
+            return format!("{}/{}", repo_name, rel_str);
+        }
+    }
+    repo_name.to_string()
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let locale = app.locale();
     let total = app.bundle.changes.len();
 
     let (ai_badge, ai_deep_badge) = if app.ai_running {
-        const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let elapsed = app.ai_started_at.map(|t| t.elapsed()).unwrap_or_default();
-        let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
+        let (spin, elapsed) = spinner_frame(app.ai_started_at);
         (
             Span::styled(
                 t!(
@@ -84,9 +106,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             .as_deref()
             .unwrap_or(&app.active_ai_provider_id);
         let deep = if app.ai_deep_running {
-            const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let elapsed = app.ai_started_at.map(|t| t.elapsed()).unwrap_or_default();
-            let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
+            let (spin, elapsed) = spinner_frame(app.ai_started_at);
             Some(Span::styled(
                 t!(
                     "header.risks",
@@ -138,12 +158,21 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_default();
 
+    let project_label = format_project_label(app);
     let line1 = Line::from(vec![
         Span::styled(
             " codeduck ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {} ", project_label),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(42, 66, 98))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
@@ -246,6 +275,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(header, area);
 }
 
+fn estimate_wrapped_line_count(lines: &[Line<'_>], inner_width: u16) -> u16 {
+    let w = inner_width.max(12) as usize;
+    let total: usize = lines
+        .iter()
+        .map(|l| {
+            let text_w: usize = l.spans.iter().map(|s| s.content.width()).sum();
+            text_w.div_ceil(w).max(1)
+        })
+        .sum();
+    total.min(u16::MAX as usize) as u16
+}
+
 fn draw_workspace(frame: &mut Frame, app: &mut App, area: Rect) {
     let (tree_area, right_area) = if app.show_sidebar {
         let cols = Layout::default()
@@ -261,13 +302,25 @@ fn draw_workspace(frame: &mut Frame, app: &mut App, area: Rect) {
         draw_tree_pane(frame, app, ta);
     }
 
-    if app.show_inspector {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(right_area);
-        draw_diff_pane(frame, app, rows[0]);
-        draw_passive_info_pane(frame, app, rows[1]);
+    if app.show_inspector || app.ai_followup_running {
+        let (title, lines) = build_inspector_content(app);
+        let wrapped_h = estimate_wrapped_line_count(&lines, right_area.width.saturating_sub(2));
+        let min_diff_h = 6u16.min(right_area.height);
+        let max_insp_h = (right_area.height * 36 / 100)
+            .max(5)
+            .min(right_area.height.saturating_sub(min_diff_h));
+
+        if max_insp_h >= 4 {
+            let insp_h = (wrapped_h.saturating_add(2)).clamp(4, max_insp_h);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(min_diff_h), Constraint::Length(insp_h)])
+                .split(right_area);
+            draw_diff_pane(frame, app, rows[0]);
+            draw_passive_info_pane_with(frame, app, rows[1], title, lines);
+        } else {
+            draw_diff_pane(frame, app, right_area);
+        }
     } else {
         draw_diff_pane(frame, app, right_area);
     }
@@ -294,14 +347,12 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                 category,
                 risk_label,
                 file_count,
-                expanded,
                 order,
                 ..
             } => {
-                let arrow = if *expanded { "▼" } else { "▶" };
                 let line1 = Line::from(vec![
                     Span::styled(
-                        format!("{} {}. ", arrow, order),
+                        format!("{}. ", order),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -368,6 +419,43 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
                 ListItem::new(Line::from(spans))
+            }
+            TreeRow::FindingItem {
+                line,
+                end_line,
+                level,
+                title,
+                in_group,
+                ..
+            } => {
+                let indent = if *in_group { "    " } else { "  " };
+                let sev_color = level.color();
+                let sev_label = level.localized_label(locale);
+                let line_tag = match (*line, *end_line) {
+                    (Some(s), Some(e)) if e != s => format!("L{}-{} ", s, e),
+                    (Some(s), _) => format!("L{} ", s),
+                    (None, Some(e)) => format!("L{} ", e),
+                    (None, None) => String::new(),
+                };
+                let prefix_cols = indent.len()
+                    + 5
+                    + UnicodeWidthStr::width(sev_label.as_str())
+                    + 3
+                    + line_tag.len();
+                let title_budget = (area.width as usize).saturating_sub(prefix_cols).max(10);
+                let shown_title = truncate_display_width(title, title_budget);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{}└─ ", indent),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("[{}] ", sev_label),
+                        Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(line_tag, Style::default().fg(Color::Cyan)),
+                    Span::styled(shown_title, Style::default().fg(Color::Gray)),
+                ]))
             }
         })
         .collect();
@@ -452,14 +540,31 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             .flatten()
             .map(|i| i + 1)
             .unwrap_or(0);
-        let title = t!(
-            "diff.pane_title",
-            locale = locale,
-            path = active_path,
-            hunk = active_hunk_num,
-            total = hunk_total
-        )
-        .into_owned();
+        let file_finding_cnt = app
+            .ai_review
+            .as_ref()
+            .map(|ai| crate::ui::app::count_file_tree_issues(ai, active_path))
+            .unwrap_or(0);
+        let title = if file_finding_cnt > 0 {
+            t!(
+                "diff.pane_title_findings",
+                locale = locale,
+                path = active_path,
+                hunk = active_hunk_num,
+                total = hunk_total,
+                count = file_finding_cnt
+            )
+            .into_owned()
+        } else {
+            t!(
+                "diff.pane_title",
+                locale = locale,
+                path = active_path,
+                hunk = active_hunk_num,
+                total = hunk_total
+            )
+            .into_owned()
+        };
 
         // Render visible slice with cursor row highlight when Diff pane is focused
         let start = app.diff_scroll_y.min(app.continuous.lines.len().saturating_sub(1));
@@ -602,7 +707,39 @@ fn append_qa_and_notes(lines: &mut Vec<Line<'static>>, app: &App, file_path: Opt
     }
 }
 
-fn draw_passive_info_pane(frame: &mut Frame, app: &App, area: Rect) {
+fn append_finding_lines(
+    lines: &mut Vec<Line<'static>>,
+    locale: &str,
+    findings: &[&crate::model::ReviewFinding],
+) {
+    for f in findings.iter().take(4) {
+        let sev_color = severity_color(f.severity);
+        let line_tag = f.line.map(|l| format!("L{}: ", l)).unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{}] ", f.severity.localized_label(locale)),
+                Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}{}", line_tag, f.title),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        push_multiline(lines, "  ", &f.description, Style::default());
+        if let Some(sugg) = &f.suggestion {
+            push_multiline(
+                lines,
+                &t!("inspector.suggestion_prefix", locale = locale),
+                sugg,
+                Style::default().fg(Color::Green),
+            );
+        }
+    }
+}
+
+fn build_inspector_content(app: &App) -> (String, Vec<Line<'static>>) {
     let locale = app.locale();
     let (base_title, lines) = match app.focus {
         PaneFocus::Tree => build_tree_context_info(app),
@@ -624,7 +761,16 @@ fn draw_passive_info_pane(frame: &mut Frame, app: &App, area: Rect) {
         )
         .into_owned()
     };
+    (title, lines)
+}
 
+fn draw_passive_info_pane_with(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: String,
+    lines: Vec<Line<'static>>,
+) {
     let widget = Paragraph::new(lines)
         .block(
             Block::default()
@@ -692,8 +838,15 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         }
     }
 
-    // If cursor is on a FileItem, also show file-level summary
-    if let Some(TreeRow::FileItem { path, .. }) = app.tree_rows.get(app.tree_cursor) {
+    // If cursor is on a FileItem or FindingItem, also show file-level summary & selected finding
+    let selected_tree_file = match app.tree_rows.get(app.tree_cursor) {
+        Some(TreeRow::FileItem { path, .. }) => Some((path.as_str(), None)),
+        Some(TreeRow::FindingItem {
+            path, finding_id, ..
+        }) => Some((path.as_str(), Some(finding_id.as_str()))),
+        _ => None,
+    };
+    if let Some((path, selected_fid)) = selected_tree_file {
         if let Some(fa) = app.session.file_analysis_map.get(path) {
             if !lines.is_empty() {
                 lines.push(Line::raw(""));
@@ -712,6 +865,42 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
             ]));
             for rf in &fa.review_focus {
                 lines.push(Line::from(format!("  ◦ {}", rf)));
+            }
+        }
+        if let (Some(fid), Some(ai)) = (selected_fid, &app.ai_review) {
+            if let Some(f) = ai.findings.iter().find(|f| f.id == fid) {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                append_finding_lines(&mut lines, locale, &[f]);
+            } else if let Some(ha) = fid
+                .strip_prefix("__hunk__")
+                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|idx| ai.hunks.get(idx))
+            {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                let range_tag = match (ha.start_line, ha.end_line) {
+                    (Some(s), Some(e)) => format!(" (L{}-L{})", s, e),
+                    (Some(s), None) => format!(" (L{})", s),
+                    _ => String::new(),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", ha.risk_level.localized_label(locale)),
+                        Style::default()
+                            .fg(risk_color(ha.risk_level))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{}{}", ha.title, range_tag),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                push_multiline(&mut lines, "", &ha.analysis, Style::default());
             }
         }
     }
@@ -811,37 +1000,7 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         if !lines.is_empty() {
             lines.push(Line::raw(""));
         }
-        for f in findings.iter().take(4) {
-            let sev_color = match f.severity {
-                Severity::Critical => Color::Red,
-                Severity::Warning => Color::Yellow,
-                Severity::Suggestion => Color::Cyan,
-                Severity::Info => Color::Blue,
-                Severity::Praise => Color::Green,
-            };
-            let line_tag = f.line.map(|l| format!("L{}: ", l)).unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("[{}] ", f.severity.localized_label(locale)),
-                    Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}{}", line_tag, f.title),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            push_multiline(&mut lines, "  ", &f.description, Style::default());
-            if let Some(sugg) = &f.suggestion {
-                push_multiline(
-                    &mut lines,
-                    &t!("inspector.suggestion_prefix", locale = locale),
-                    sugg,
-                    Style::default().fg(Color::Green),
-                );
-            }
-        }
+        append_finding_lines(&mut lines, locale, &findings);
     }
 
     append_qa_and_notes(&mut lines, app, fd.map(|f| f.path.as_str()));
@@ -868,7 +1027,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .map(|k| format!(" [{}]", k))
         .unwrap_or_default();
 
-    let status_line = Line::from(vec![
+    let mut status_spans = vec![
         Span::styled(
             mode_label.0,
             Style::default()
@@ -882,8 +1041,38 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(&app.status_message),
-    ]);
+    ];
+
+    if app.ai_running || app.ai_deep_running || app.ai_followup_running {
+        let (spin, elapsed) = spinner_frame(app.ai_started_at);
+        let prov = app
+            .resolved_ai_provider_id
+            .as_deref()
+            .unwrap_or(&app.active_ai_provider_id);
+        status_spans.push(Span::styled(
+            t!(
+                "progress.running",
+                locale = locale,
+                spin = spin,
+                provider = prov,
+                secs = format!("{:.1}", elapsed.as_secs_f32())
+            )
+            .into_owned(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let stage = if app.ai_followup_running && app.ai_progress_stage.is_empty() {
+            t!("inspector.querying_ai", locale = locale).into_owned()
+        } else {
+            app.ai_progress_stage.clone()
+        };
+        status_spans.push(Span::styled(stage, Style::default().fg(Color::White)));
+    } else {
+        status_spans.push(Span::raw(&app.status_message));
+    }
+
+    let status_line = Line::from(status_spans);
 
     let avail_w = area.width.saturating_sub(28) as usize;
     let edited = || text_input::format_with_cursor(&app.input_buffer, app.input_cursor, avail_w);
@@ -2239,16 +2428,6 @@ fn pane_border_style(focused: bool) -> Style {
     }
 }
 
-fn risk_color(risk: RiskLevel) -> Color {
-    match risk {
-        RiskLevel::Critical => Color::Red,
-        RiskLevel::High => Color::LightRed,
-        RiskLevel::Medium => Color::Yellow,
-        RiskLevel::Low => Color::Green,
-        RiskLevel::Info => Color::Cyan,
-    }
-}
-
 pub fn truncate_display_width(s: &str, max_cols: usize) -> String {
     if UnicodeWidthStr::width(s) <= max_cols {
         return s.to_string();
@@ -2305,10 +2484,8 @@ fn append_stream_progress_lines(
     max_thinking: usize,
     max_text: usize,
 ) {
-    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     if running {
-        let elapsed = started_at.map(|t| t.elapsed()).unwrap_or_default();
-        let spin = SPINNER[((elapsed.as_millis() / 100) % 10) as usize];
+        let (spin, elapsed) = spinner_frame(started_at);
         lines.push(Line::from(vec![
             Span::styled(
                 t!(

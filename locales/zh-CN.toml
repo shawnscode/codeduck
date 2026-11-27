@@ -107,8 +107,8 @@ effort_badge = "  强度:%{effort}"
 session_badge = "  会话:%{session}"
 
 [tree]
-title_grouped = " 改动分组 (j/k:移动  l:Diff  S:提交) "
-title_flat = " 文件列表 (t:分组  S:提交) "
+title_grouped = " 改动分组 (f/F:文件  n/N:问题  S:提交) "
+title_flat = " 文件列表 (f/F:文件  n/N:问题  t:分组  S:提交) "
 
 [diff]
 loading_title = " 正在加载 %{target}... "
@@ -118,10 +118,12 @@ error_body = "加载 Diff 出错:\n\n%{err}\n\n按 R 重试，或按 C 选择其
 empty_title = " 连续 Diff "
 empty_body = "当前目标下没有变更文件。\n\n按 C 切换其他提交/版本，或按 R 刷新。"
 pane_title = " %{path} | %{hunk}/%{total} (n/N跳块, hjkl移动) "
+pane_title_findings = " %{path} | %{hunk}/%{total} (n/N跳问题 · AI提示(%{count})) "
 
 [inspector]
 scroll_active = "%{base} (J/K滚动: +%{offset}) "
 scroll_hint = "%{base} (J/K滚动) "
+finding_preview = " AI 风险提示预览 (I:收起 · J/K:滚动) "
 group_details = " 分组详情 "
 code_inspector = " 代码说明 (%{loc}) "
 no_file = "未定位文件"
@@ -140,7 +142,7 @@ qa_question = "问%{tag}: %{question}"
 qa_answer_prefix = "答: "
 
 [footer]
-normal_hints = "Tab:切窗  hjkl:移动  n/N:跳块  J/K:滚底  S:提交  U:回退  R:刷新  d:视图  O:设置  ?:帮助  q:退出"
+normal_hints = "hjkl:移动  f/F:文件  n/N:问题/跳块  S:提交  U:回退  R:刷新  d:视图  O:设置  ?:帮助  q:退出"
 note_prompt = "当前文件批注 > "
 ask_prompt = "向 AI 提问 > "
 
@@ -149,23 +151,19 @@ frame_title = " Help (j/k 滚动) "
 title = "codeduck — 快捷键说明"
 window_title = "窗口与浏览"
 window_body = """
-  Tab / Ctrl-w   切换焦点（左侧列表 / 右侧 Diff）
-  H / L          直接切到左侧列表 / 右侧 Diff
-  J / K          滚动底部详情面板（B/I 显隐侧栏/底栏）"""
+  B              显隐左侧列表
+  Esc            收起 AI 追问 / 批注面板（J / K 滚动）"""
 nav_title = "移动与跳转"
 nav_body = """
   j / k          上下移动
-  h / l / 0      折叠展开分组 / 左右滚屏并在边缘切窗 / 回行首
-  n / N          下/上一个差异块（]c / [c 亦可）
-  ]f / [f        下/上一个文件
-  ]g / [g        下/上一个分组
-  ]i / [i        下/上一个风险提示
+  h / l / 0      左/右滚屏 / 回行首
+  n / N          下/上一个问题（AI 问题列表就绪后）或差异块
+  f / F          下/上一个文件条目（焦点保留在 Diff）
   Ctrl-d / u     半页上下；Ctrl-f / b 整页；gg / G 顶 / 底
   / 与 ; / ,     搜索与跳转下一/上一匹配"""
 ops_title = "审阅、提交、配置与命令"
 ops_body = """
   d / t          切换 Diff 模式 / 切换分组与文件列表
-  za / zM / zR   折叠当前组 / 全部折叠 / 全部展开
   O              打开配置与语言选择面板（:config / :settings 亦可）
   S              打开提交面板（按分组勾选文件并生成英文提交说明）
   U              回退当前选中的分组或单个文件（支持二次确认，:revert 亦可）

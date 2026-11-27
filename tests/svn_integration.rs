@@ -214,31 +214,41 @@ EOF
     assert!(app.continuous.sections.len() == 2);
     assert!(app.continuous.global_hunks.len() >= 2);
 
-    // Tree focus: bottom panel context reflects active group
-    assert_eq!(app.focus, PaneFocus::Tree);
+    // Default focus stays in Diff; Tab / Ctrl-w / H never focus the left file list
+    assert_eq!(app.focus, PaneFocus::Diff);
     assert_eq!(app.active_group_in_tree().unwrap().id, "g1");
-
-    // Vim actions: switch to Diff pane, n/N jump across hunks, cycle difft mode, export report
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
     assert_eq!(app.focus, PaneFocus::Diff);
 
-    // Tab again toggles right back to Tree (bottom info panel never steals focus)
-    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    assert_eq!(app.focus, PaneFocus::Tree);
-    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    // f / F step next / previous file while keeping focus in Diff
+    let initial_file = app.selected_file_idx;
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
     assert_eq!(app.focus, PaneFocus::Diff);
+    assert_ne!(app.selected_file_idx, initial_file);
+    app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+    assert_eq!(app.focus, PaneFocus::Diff);
+    assert_eq!(app.selected_file_idx, initial_file);
 
-    // n jumps through cross-file hunks and updates active paragraph analysis
+    // When AI issue list is populated, n / N cycle through AI issues & elevated hunks
     let (_, _, _, hunk_ana, findings) = app.active_hunk_context();
     assert_eq!(hunk_ana.unwrap().title, "Switch sub to saturating_mul");
     assert_eq!(findings.len(), 1);
 
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-    let first_y = app.diff_cursor_y;
+    assert!(app.status_message.contains("Removed public function sub"));
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-    assert_ne!(app.diff_cursor_y, first_y);
+    assert!(app.status_message.contains("Switch sub to saturating_mul"));
     app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
-    assert_eq!(app.diff_cursor_y, first_y);
+    assert!(app.status_message.contains("Removed public function sub"));
+
+    // Without AI issues, n / N fall back to jumping cross-file hunks
+    let saved_ai = app.ai_review.take();
+    let before_hunk_y = app.diff_cursor_y;
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_ne!(app.diff_cursor_y, before_hunk_y);
+    app.ai_review = saved_ai;
 
     app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
     assert_eq!(app.display_mode, DifftDisplayMode::Inline);
@@ -1476,8 +1486,11 @@ args = ["-c", "echo pwned"]
     tcfg.ai_provider = "none".to_string();
     let mut app = App::new(git_backend, tcfg, DiffTarget::Uncommitted, 120).unwrap();
 
-    // `:tree` hides sidebar AND restores focus to Diff
-    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Tree);
+    // Focus stays in Diff; Tab/Ctrl-w/H are disabled, `:tree` toggles sidebar visibility while staying in Diff
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
     app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
     for ch in "tree".chars() {
         app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -1486,13 +1499,11 @@ args = ["-c", "echo pwned"]
     assert!(!app.show_sidebar);
     assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
 
-    // Show sidebar again, verify `l` moves Tree -> Diff, `l` scrolls right in Diff,
-    // first `h` scrolls back to 0, second `h` moves Diff -> Tree cleanly
+    // Show sidebar again, verify `h` at scroll_x=0 keeps focus in Diff,
+    // `l` scrolls right in Diff and `h` scrolls back to 0 without leaving Diff
     app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE));
     assert!(app.show_sidebar);
     app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Tree);
-    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
     assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
     app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
     assert_eq!(app.diff_scroll_x, 4);
@@ -1500,7 +1511,7 @@ args = ["-c", "echo pwned"]
     assert_eq!(app.diff_scroll_x, 0);
     assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
     app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Tree);
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
 
     // Same-line findings cycle with `]i`
     app.ai_review = Some(codeduck::model::AiReviewResult {
@@ -1542,12 +1553,25 @@ args = ["-c", "echo pwned"]
         ],
     });
     app.rebuild_tree_and_continuous();
-    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    // Single-key `n` / `N` cycle issues and sync left tree cursor to FindingItem (`[` / `]` are unbound)
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     assert!(app.status_message.contains("First finding"));
-    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    assert!(matches!(
+        app.tree_rows.get(app.tree_cursor),
+        Some(codeduck::ui::app::TreeRow::FindingItem { finding_id, .. }) if finding_id == "f1"
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     assert!(app.status_message.contains("Second finding"));
+    assert!(matches!(
+        app.tree_rows.get(app.tree_cursor),
+        Some(codeduck::ui::app::TreeRow::FindingItem { finding_id, .. }) if finding_id == "f2"
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+    assert!(app.status_message.contains("First finding"));
+    assert!(matches!(
+        app.tree_rows.get(app.tree_cursor),
+        Some(codeduck::ui::app::TreeRow::FindingItem { finding_id, .. }) if finding_id == "f1"
+    ));
 
     // Pressing `y` while commit_msg_generating sets commit_hint_notice (NOT commit_error)
     app.open_commit_confirm();
@@ -2488,4 +2512,171 @@ fn test_partial_commit_and_revert_prune_in_place_without_full_reload() {
     let rev2 = app.ai_review.as_ref().expect("AI review for b.rs should remain");
     assert_eq!(rev2.findings.len(), 1);
     assert_eq!(rev2.findings[0].file, "b.rs");
+}
+
+#[test]
+fn test_header_project_name_scheme_c_diff_and_synced_footer_progress() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let repo_dir = tmp.path().join("my_cool_project");
+    fs::create_dir_all(&repo_dir).unwrap();
+    run("git", &["init"], &repo_dir);
+    run("git", &["config", "user.email", "t@example.com"], &repo_dir);
+    run("git", &["config", "user.name", "Tester"], &repo_dir);
+    fs::write(repo_dir.join("main.rs"), "fn main() {}\n").unwrap();
+    run("git", &["add", "main.rs"], &repo_dir);
+    run("git", &["commit", "-m", "init"], &repo_dir);
+    fs::write(repo_dir.join("main.rs"), "fn main() { let x = 1; }\n").unwrap();
+
+    let backend = vcs::open_vcs(&repo_dir, Some(VcsKind::Git)).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "none".to_string();
+    let mut app = App::new(Arc::clone(&backend), cfg, DiffTarget::Uncommitted, 120).unwrap();
+
+    // Default Scheme C: inspector hidden so Diff takes full workspace height
+    assert!(!app.show_inspector);
+
+    // Simulate active AI progress to verify synced footer spinner + project name in header
+    app.ai_running = true;
+    app.active_ai_provider_id = "agy".to_string();
+    app.ai_started_at = Some(std::time::Instant::now());
+    app.ai_progress_stage = "Testing stream stage...".to_string();
+
+    let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let rendered: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        rendered.contains("my_cool_project"),
+        "header should show project name, got:\n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("Running (agy"),
+        "footer should show live spinner progress, got:\n{}",
+        rendered
+    );
+    assert!(rendered.contains("Testing stream stage..."));
+    assert!(
+        !rendered.contains("Group Details"),
+        "inspector box should stay hidden by default under Scheme C"
+    );
+
+    // Findings and hunk analyses render inline beneath their code lines inside Diff,
+    // leaving the right Diff pane at 100% full height unless the user explicitly presses `I`.
+    app.ai_running = false;
+    app.ai_review = Some(codeduck::model::AiReviewResult {
+        provider_name: "mock".to_string(),
+        summary: "ok".to_string(),
+        overall_risk: codeduck::model::RiskLevel::Medium,
+        review_strategy: String::new(),
+        groups: vec![codeduck::model::ReviewGroup {
+            id: "g1".to_string(),
+            title: "Main".to_string(),
+            description: String::new(),
+            category: "feature".to_string(),
+            risk_level: codeduck::model::RiskLevel::Medium,
+            review_order: 1,
+            files: vec!["main.rs".to_string()],
+            key_points: vec![],
+        }],
+        files: vec![],
+        hunks: vec![codeduck::model::HunkAnalysis {
+            file: "main.rs".to_string(),
+            chunk_index: Some(0),
+            start_line: Some(1),
+            end_line: Some(1),
+            title: "Declare unused local".to_string(),
+            analysis: "Adds variable x inside main.".to_string(),
+            risk_level: codeduck::model::RiskLevel::Medium,
+        }],
+        findings: vec![codeduck::model::ReviewFinding {
+            id: "f1".to_string(),
+            file: "main.rs".to_string(),
+            line: Some(1),
+            severity: codeduck::model::Severity::Warning,
+            title: "Unused local x".to_string(),
+            description: "Variable x is unused".to_string(),
+            suggestion: Some("Remove or use x".to_string()),
+        }],
+    });
+    app.rebuild_tree_and_continuous();
+    // Verify both ReviewFinding AND Medium/High/Critical HunkAnalysis appear in the left tree under main.rs
+    assert!(app.tree_rows.iter().any(|r| matches!(
+        r,
+        codeduck::ui::app::TreeRow::FindingItem { finding_id, line: Some(1), .. } if finding_id == "f1"
+    )));
+    assert!(app.tree_rows.iter().any(|r| matches!(
+        r,
+        codeduck::ui::app::TreeRow::FindingItem {
+            level: codeduck::ui::app::TreeIssueLevel::HunkRisk(codeduck::model::RiskLevel::Medium),
+            title,
+            ..
+        } if title == "Declare unused local"
+    )));
+    // Selecting FindingItem via `n` cycles through FindingItem and Medium HunkAnalysis and highlights in tree
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(
+        app.continuous.line_to_source_line[app.diff_cursor_y],
+        Some(1)
+    );
+    assert!(matches!(
+        app.tree_rows.get(app.tree_cursor),
+        Some(codeduck::ui::app::TreeRow::FindingItem { finding_id, .. }) if finding_id == "f1"
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(matches!(
+        app.tree_rows.get(app.tree_cursor),
+        Some(codeduck::ui::app::TreeRow::FindingItem {
+            level: codeduck::ui::app::TreeIssueLevel::HunkRisk(codeduck::model::RiskLevel::Medium),
+            ..
+        })
+    ));
+    assert_eq!(app.focus, codeduck::ui::app::PaneFocus::Diff);
+
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let with_inline_ai: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        with_inline_ai.contains("Unused local x"),
+        "finding should render inline beneath its code line:\n{}",
+        with_inline_ai
+    );
+    assert!(with_inline_ai.contains("Remove or use x"));
+    assert!(with_inline_ai.contains("Declare unused local"));
+    assert!(with_inline_ai.contains("┌─ "));
+    assert!(with_inline_ai.contains("┐"));
+    assert!(with_inline_ai.contains("┘"));
+    assert!(
+        !with_inline_ai.contains("AI Finding Preview"),
+        "bottom popup box must stay closed so Diff keeps 100% height"
+    );
+    assert!(!with_inline_ai.contains("Code Inspector"));
+
+    // Pressing `I` or `J` does NOT open an Inspector popup; Diff keeps 100% full height
+    app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
+    assert!(!app.show_inspector);
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let after_i_key: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(!after_i_key.contains("Code Inspector"));
 }
