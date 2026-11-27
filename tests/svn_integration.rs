@@ -2357,3 +2357,135 @@ fn test_svn_same_repo_external_merges_commit_while_cross_repo_splits() {
             .is_empty()
     );
 }
+
+#[test]
+fn test_partial_commit_and_revert_prune_in_place_without_full_reload() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let git_dir = tmp.path().join("partial_prune_repo");
+    fs::create_dir_all(&git_dir).unwrap();
+    run("git", &["init"], &git_dir);
+    run("git", &["config", "user.email", "t@example.com"], &git_dir);
+    run("git", &["config", "user.name", "Tester"], &git_dir);
+    fs::write(git_dir.join("a.rs"), "fn a() { 1 }\n").unwrap();
+    fs::write(git_dir.join("b.rs"), "fn b() { 1 }\n").unwrap();
+    fs::write(git_dir.join("c.rs"), "fn c() { 1 }\n").unwrap();
+    run("git", &["add", "."], &git_dir);
+    run("git", &["commit", "-m", "init"], &git_dir);
+
+    fs::write(git_dir.join("a.rs"), "fn a() { 2 }\n").unwrap();
+    fs::write(git_dir.join("b.rs"), "fn b() { 2 }\n").unwrap();
+    fs::write(git_dir.join("c.rs"), "fn c() { 2 }\n").unwrap();
+
+    let backend = vcs::open_vcs(&git_dir, Some(VcsKind::Git)).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "none".to_string();
+    let mut app = App::new(Arc::clone(&backend), cfg, DiffTarget::Uncommitted, 120).unwrap();
+
+    // Seed existing AI review covering all 3 files across 2 groups + findings
+    app.ai_review = Some(codeduck::model::AiReviewResult {
+        provider_name: "mock".to_string(),
+        summary: "existing analysis".to_string(),
+        overall_risk: codeduck::model::RiskLevel::Medium,
+        review_strategy: String::new(),
+        groups: vec![
+            codeduck::model::ReviewGroup {
+                id: "g1".to_string(),
+                title: "Group A".to_string(),
+                description: String::new(),
+                category: "feature".to_string(),
+                risk_level: codeduck::model::RiskLevel::Low,
+                review_order: 1,
+                files: vec!["a.rs".to_string()],
+                key_points: vec![],
+            },
+            codeduck::model::ReviewGroup {
+                id: "g2".to_string(),
+                title: "Group BC".to_string(),
+                description: String::new(),
+                category: "bugfix".to_string(),
+                risk_level: codeduck::model::RiskLevel::Medium,
+                review_order: 2,
+                files: vec!["b.rs".to_string(), "c.rs".to_string()],
+                key_points: vec![],
+            },
+        ],
+        files: vec![],
+        hunks: vec![],
+        findings: vec![
+            codeduck::model::ReviewFinding {
+                id: "f1".to_string(),
+                file: "a.rs".to_string(),
+                line: Some(1),
+                severity: codeduck::model::Severity::Warning,
+                title: "Finding A".to_string(),
+                description: "desc a".to_string(),
+                suggestion: None,
+            },
+            codeduck::model::ReviewFinding {
+                id: "f2".to_string(),
+                file: "b.rs".to_string(),
+                line: Some(1),
+                severity: codeduck::model::Severity::Warning,
+                title: "Finding B".to_string(),
+                description: "desc b".to_string(),
+                suggestion: None,
+            },
+        ],
+    });
+    app.tree_mode = codeduck::ui::app::TreeMode::AiGrouped;
+    app.rebuild_tree_and_continuous();
+    let initial_diff_gen = app.diff_generation;
+
+    // 1. Partial commit: commit only `a.rs` via CommitConfirm
+    app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+    for f in &mut app.commit_files {
+        f.included = f.path == "a.rs";
+    }
+    app.commit_message = "commit only a.rs".to_string();
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    for _ in 0..40 {
+        app.poll_background();
+        if !app.commit_executing {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Must prune in-place without triggering a full Diff reload or discarding remaining AI review!
+    assert!(!app.diff_loading);
+    assert_eq!(app.diff_generation, initial_diff_gen);
+    let paths_after_commit: Vec<&str> = app.bundle.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths_after_commit, vec!["b.rs", "c.rs"]);
+    let rev = app.ai_review.as_ref().expect("AI review should be preserved");
+    assert_eq!(rev.groups.len(), 1);
+    assert_eq!(rev.groups[0].files, vec!["b.rs", "c.rs"]);
+    assert_eq!(rev.findings.len(), 1);
+    assert_eq!(rev.findings[0].file, "b.rs");
+
+    // 2. Partial revert: select Group BC, revert only `c.rs` -> prunes `c.rs` in-place while keeping `b.rs` & its finding
+    app.tree_cursor = 0;
+    app.focus = codeduck::ui::app::PaneFocus::Tree;
+    app.open_revert_confirm();
+    for f in &mut app.revert_files {
+        f.included = f.path == "c.rs";
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    for _ in 0..40 {
+        app.poll_background();
+        if !app.revert_executing {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!app.diff_loading);
+    assert_eq!(app.diff_generation, initial_diff_gen);
+    let paths_after_revert: Vec<&str> = app.bundle.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths_after_revert, vec!["b.rs"]);
+    let rev2 = app.ai_review.as_ref().expect("AI review for b.rs should remain");
+    assert_eq!(rev2.findings.len(), 1);
+    assert_eq!(rev2.findings[0].file, "b.rs");
+}
