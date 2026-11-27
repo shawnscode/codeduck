@@ -17,7 +17,7 @@ impl std::fmt::Display for VcsKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DiffTarget {
     /// Uncommitted working copy changes (and staged changes in git).
     Uncommitted,

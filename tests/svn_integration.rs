@@ -630,8 +630,8 @@ echo "- 调整 a.lua 逻辑为返回 10"
     app.poll_background();
     assert!(!app.commit_main.generating);
 
-    // Step 1 'y' opens double confirmation (does NOT commit yet)
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    // Step 1 Enter opens double confirmation (does NOT commit yet)
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         app.overlay,
         codeduck::ui::app::OverlayKind::CommitDoubleConfirm
@@ -643,14 +643,14 @@ echo "- 调整 a.lua 逻辑为返回 10"
     assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
 
     // Confirm Step 1 -> CommitDoubleConfirm -> Step 2 waits for updated AI message before committing
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         app.overlay,
         codeduck::ui::app::OverlayKind::CommitDoubleConfirm
     );
-    // Pressing 'y' while AI is regenerating the commit message is safely guarded
+    // Pressing Enter while AI is regenerating the commit message is safely guarded
     if app.commit_main.generating {
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             app.overlay,
             codeduck::ui::app::OverlayKind::CommitDoubleConfirm
@@ -663,7 +663,7 @@ echo "- 调整 a.lua 逻辑为返回 10"
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
     }
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         app.poll_background();
         if !app.commit_executing && !app.diff_loading {
@@ -1304,7 +1304,7 @@ fn test_audit_regressions_edge_cases_and_ui_rendering() {
         app.commit_main.stream_thinking = "Summarizing selected files".to_string();
         app.commit_main.stream_text = "Initialize codeduck repository".to_string();
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
         app.commit_main.generating = false;
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1603,11 +1603,11 @@ args = ["-c", "echo pwned"]
         Some(codeduck::ui::app::TreeRow::FindingItem { finding_id, .. }) if finding_id == "f1"
     ));
 
-    // Pressing `y` while commit_msg_generating sets commit_hint_notice (NOT commit_error)
+    // Pressing Enter while commit_msg_generating sets commit_hint_notice (NOT commit_error)
     app.open_commit_confirm();
     app.open_commit_double_confirm();
     app.commit_main.generating = true;
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(app.commit_error.is_none());
     assert!(app.commit_hint_notice.is_some());
     app.commit_main.generating = false;
@@ -1698,8 +1698,8 @@ fn test_revert_group_and_file_with_double_confirm_svn_and_git() {
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
 
-    // Press `y` -> opens RevertDoubleConfirm (Step 2, does not revert yet)
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    // Press Enter -> opens RevertDoubleConfirm (Step 2, does not revert yet)
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         app.overlay,
         codeduck::ui::app::OverlayKind::RevertDoubleConfirm
@@ -1713,8 +1713,8 @@ fn test_revert_group_and_file_with_double_confirm_svn_and_git() {
     assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::RevertConfirm);
 
     // Confirm Step 1 -> Step 2 -> confirm Step 2
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         app.poll_background();
         if !app.revert_executing && !app.diff_loading {
@@ -1762,8 +1762,8 @@ fn test_revert_group_and_file_with_double_confirm_svn_and_git() {
     gapp.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE));
     assert_eq!(gapp.revert_files.len(), 1);
     assert_eq!(gapp.revert_files[0].path, "tracked.rs");
-    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         gapp.poll_background();
         if !gapp.revert_executing && !gapp.diff_loading {
@@ -1782,8 +1782,8 @@ fn test_revert_group_and_file_with_double_confirm_svn_and_git() {
 
     // Now revert untracked.rs
     gapp.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE));
-    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-    gapp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    gapp.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         gapp.poll_background();
         if !gapp.revert_executing && !gapp.diff_loading {
@@ -2223,13 +2223,13 @@ fn git_submodule_uncommitted_commit_and_revert_flow() {
     assert_eq!(app.commit_modal_focus, CommitModalFocus::Files);
 
     // Confirm -> Step 2 (renders both Main & External boxes cleanly) -> execute merged commit
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         app.overlay,
         codeduck::ui::app::OverlayKind::CommitDoubleConfirm
     );
     term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         app.poll_background();
         if !app.commit_executing && !app.diff_loading {
@@ -2499,8 +2499,8 @@ fn test_partial_commit_and_revert_prune_in_place_without_full_reload() {
         f.included = f.path == "a.rs";
     }
     app.commit_main.message = "commit only a.rs".to_string();
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         app.poll_background();
         if !app.commit_executing {
@@ -2526,8 +2526,8 @@ fn test_partial_commit_and_revert_prune_in_place_without_full_reload() {
     for f in &mut app.revert_files {
         f.included = f.path == "c.rs";
     }
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     for _ in 0..40 {
         app.poll_background();
         if !app.revert_executing {
@@ -2696,19 +2696,32 @@ fn test_header_project_name_scheme_c_diff_and_synced_footer_progress() {
     );
     assert!(!with_inline_ai.contains("Code Inspector"));
 
-    // Pressing `I` or `J` does NOT open an Inspector popup; Diff keeps 100% full height
-    app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    // P1-1: Pressing `I` toggles the Code Inspector on/off; `J` does not open it.
     app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
     assert!(!app.show_inspector);
+    app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    assert!(app.show_inspector);
     term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
-    let after_i_key: String = term
+    let after_i_open: String = term
         .backend()
         .buffer()
         .content()
         .iter()
         .map(|c| c.symbol())
         .collect();
-    assert!(!after_i_key.contains("Code Inspector"));
+    assert!(after_i_open.contains("Code Inspector"));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    assert!(!app.show_inspector);
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let after_i_close: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(!after_i_close.contains("Code Inspector"));
 }
 
 #[test]
@@ -3314,7 +3327,7 @@ echo '{{
     }
     app_ig.commit_main.message = "commit z_other.rs".to_string();
     app_ig.commit_main.dirty = true;
-    app_ig.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    app_ig.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     app_ig.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
     for _ in 0..80 {
         app_ig.poll_background();
@@ -3569,4 +3582,282 @@ exec difft "$@"
         "comments leaked from DFT_PARSE_ERROR_LIMIT text fallback JSON chunks into AI prompt: {}",
         pe_prompt
     );
+}
+
+#[test]
+fn test_ui_ux_audit_regressions() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::process::Command;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let repo_dir = tmp.path().join("ui_ux_repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    run("git", &["init"], &repo_dir);
+    run("git", &["config", "user.email", "t@example.com"], &repo_dir);
+    run("git", &["config", "user.name", "Tester"], &repo_dir);
+    fs::write(repo_dir.join("a.rs"), "fn alpha() { let v = 1; }\n").unwrap();
+    fs::write(repo_dir.join("b.rs"), "fn beta() {}\n").unwrap();
+    run("git", &["add", "."], &repo_dir);
+    run("git", &["commit", "-m", "initial commit"], &repo_dir);
+
+    fs::write(
+        repo_dir.join("a.rs"),
+        "fn alpha() { let v = 2; let extra = v + 1; }\n",
+    )
+    .unwrap();
+    fs::write(repo_dir.join("b.rs"), "fn beta() { let z = 9; }\n").unwrap();
+
+    let cfg_path = tmp.path().join("configs.toml");
+    let backend = vcs::open_vcs(&repo_dir, Some(VcsKind::Git)).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "none".to_string();
+    let mut app = App::new(Arc::clone(&backend), cfg, DiffTarget::Uncommitted, 80).unwrap();
+    app.config_path_override = Some(cfg_path.clone());
+
+    // Seed AI review groups covering a.rs + b.rs so [g] group revert toggle and Inspector group details apply
+    app.ai_review = Some(codeduck::model::AiReviewResult {
+        provider_name: "mock".to_string(),
+        summary: "Updated alpha and beta helpers".to_string(),
+        overall_risk: codeduck::model::RiskLevel::Low,
+        review_strategy: "Verify alpha arithmetic".to_string(),
+        groups: vec![codeduck::model::ReviewGroup {
+            id: "g1".to_string(),
+            title: "Core Helpers".to_string(),
+            description: "Changes in a.rs and b.rs".to_string(),
+            category: "feature".to_string(),
+            risk_level: codeduck::model::RiskLevel::Low,
+            review_order: 1,
+            files: vec!["a.rs".to_string(), "b.rs".to_string()],
+            key_points: vec!["Check alpha return".to_string()],
+        }],
+        files: vec![],
+        hunks: vec![],
+        findings: vec![],
+    });
+    app.rebuild_tree_and_continuous();
+
+    // 1. P0-1: :export quoted path with spaces + overwrite confirmation + :export!
+    let cmd_export = ":export \"my review report.md\"";
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    app.handle_paste(&cmd_export[1..]);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let expected_export = repo_dir.join("my review report.md");
+    assert!(
+        expected_export.exists(),
+        ":export should write full quoted path with spaces"
+    );
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+
+    // Re-exporting same path asks confirmation; 'n' cancels without overwriting
+    fs::write(&expected_export, "SENTINEL_KEEP").unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    app.handle_paste(&cmd_export[1..]);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.overlay,
+        codeduck::ui::app::OverlayKind::ExportOverwriteConfirm
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+    assert_eq!(fs::read_to_string(&expected_export).unwrap(), "SENTINEL_KEEP");
+
+    // :export! overwrites directly without modal
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    app.handle_paste("export! \"my review report.md\"");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+    assert!(
+        fs::read_to_string(&expected_export)
+            .unwrap()
+            .contains("# Code Review Report")
+    );
+
+    // 2. P0-2 & P0-5: Repeat key ignored, 'y' does NOT confirm, and Step 1 Message Enter advances
+    app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.commit_modal_focus,
+        codeduck::ui::app::CommitModalFocus::Message
+    );
+    // Edit via 'e', type a commit message, Enter exits edit mode without advancing
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert!(app.commit_editing_msg);
+    app.handle_paste("feat: update alpha and beta");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.commit_editing_msg);
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
+
+    // Repeat Enter is ignored; 'y' is ignored; fresh Enter from Message focus advances to Step 2
+    let mut rep_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    rep_enter.kind = KeyEventKind::Repeat;
+    app.handle_key(rep_enter);
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.overlay,
+        codeduck::ui::app::OverlayKind::CommitDoubleConfirm
+    );
+    // 'y' in Step 2 must NOT confirm commit
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(!app.commit_executing);
+    assert_eq!(
+        app.overlay,
+        codeduck::ui::app::OverlayKind::CommitDoubleConfirm
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+
+    // 3. P0-3 & Batch C: Revert single-file lock + [g] File/Group toggle + Repeat/'y' safety
+    app.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::RevertConfirm);
+    assert_eq!(app.revert_files.len(), 1);
+    assert!(app.revert_can_toggle_group);
+    // Cannot uncheck sole file in single-file revert
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert!(app.revert_files[0].included);
+    // [g] toggles to full group ("Core Helpers": 2 files) and back
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.revert_files.len(), 2);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    assert_eq!(app.revert_files.len(), 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::RevertConfirm);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // 4. P1-2: Notes preserved across :refresh and target switch
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    app.handle_paste("Check alpha edge case");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.session.notes.len(), 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+    for _ in 0..40 {
+        app.poll_background();
+        if !app.diff_loading {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        app.session.notes.len(),
+        1,
+        "notes must survive forced refresh"
+    );
+
+    // 5. P1-1 & Batch C: Inspector Esc dismiss, :ask empty guard, g+Esc silent cancel, human unknown key
+    // Adding a note opened Inspector and `R` kept it open; pressing `I` toggles off then back on.
+    assert!(app.show_inspector);
+    app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    assert!(!app.show_inspector);
+    app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+    assert!(app.show_inspector);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.show_inspector);
+    assert!(app.inspector_dismissed);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.status_message = "KEEP_STATUS".to_string();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.status_message, "KEEP_STATUS");
+    assert!(app.pending_key.is_none());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(
+        !app.status_message.contains("Char("),
+        "unknown key should be formatted cleanly, got: {}",
+        app.status_message
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+    app.handle_paste("ask");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.input_mode, codeduck::ui::app::InputMode::Normal);
+    assert!(app.status_message.contains("AI"));
+
+    // 6. P1-7/8/9: Settings <-> AiPicker roundtrip & display mode dirty mask save
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    assert!(app.settings_dirty_mask.display_mode);
+    let expected_mode = app.display_mode;
+    app.open_settings();
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::AiPicker);
+    assert!(app.ai_picker_from_settings);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::Settings);
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert!(!app.settings_dirty_mask.any());
+    let reloaded_cfg = AppConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded_cfg.display_mode, expected_mode);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // 7. Batch B2 & C: Narrow 80x24 render across workspace, Help clamp, Search highlight, CommitPicker
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    app.handle_paste("alpha");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let narrow_buf: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(narrow_buf.contains("ui_ux_repo"));
+    assert!(narrow_buf.contains("?:help"));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    for _ in 0..10 {
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let max_help_scroll = app.help_scroll_y;
+    assert!(max_help_scroll < 120);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    // CommitPicker displays error cleanly when commits_error is set
+    app.overlay = codeduck::ui::app::OverlayKind::CommitPicker;
+    app.commits_error = Some("Mock log failed".to_string());
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let cp_buf: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(cp_buf.contains("Mock log failed"));
+    app.overlay = codeduck::ui::app::OverlayKind::None;
+
+    // 8. Batch C: --headless-export - prints Markdown report cleanly to stdout
+    let bin = env!("CARGO_BIN_EXE_codeduck");
+    let cli_out = Command::new(bin)
+        .args([
+            "--path",
+            repo_dir.to_str().unwrap(),
+            "--ai",
+            "none",
+            "--headless-export",
+            "-",
+        ])
+        .env("CODEDUCK_HOME", tmp.path().join("home"))
+        .output()
+        .unwrap();
+    assert!(
+        cli_out.status.success(),
+        "headless export to stdout failed: {}",
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+    let stdout_str = String::from_utf8_lossy(&cli_out.stdout);
+    assert!(stdout_str.starts_with("# Code Review Report"));
+    assert!(!stdout_str.contains("Report written to"));
 }

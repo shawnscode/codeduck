@@ -20,7 +20,9 @@ use codeduck::ignore::IgnoreMatcher;
 use codeduck::model::{DiffTarget, DifftDisplayMode, VcsKind};
 use codeduck::ui;
 use codeduck::ui::app::App;
-use codeduck::ui::export::export_review_markdown_with_locale;
+use codeduck::ui::export::{
+    export_review_markdown_with_locale, render_review_markdown_with_locale,
+};
 use codeduck::vcs;
 
 #[derive(Parser, Debug)]
@@ -235,17 +237,27 @@ fn main() -> Result<()> {
             None
         };
         let session = codeduck::model::ReviewSessionState::default();
-        export_review_markdown_with_locale(
-            &export_path,
-            &bundle,
-            ai_res.as_ref(),
-            &session,
-            &config.ui_language,
-        )?;
-        println!(
-            "{}",
-            i18n::format_written_report(&config.ui_language, &export_path.display().to_string())
-        );
+        if export_path.as_os_str() == "-" {
+            let md = render_review_markdown_with_locale(
+                &bundle,
+                ai_res.as_ref(),
+                &session,
+                &config.ui_language,
+            );
+            print!("{}", md);
+        } else {
+            export_review_markdown_with_locale(
+                &export_path,
+                &bundle,
+                ai_res.as_ref(),
+                &session,
+                &config.ui_language,
+            )?;
+            println!(
+                "{}",
+                i18n::format_written_report(&config.ui_language, &export_path.display().to_string())
+            );
+        }
         return Ok(());
     }
 

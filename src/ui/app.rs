@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use chrono::Local;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ai::{self, ProviderDescriptor};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, UserSettingsMask};
 use crate::difft::{DifftEngine, parse_source_line_from_ansi_with_buf};
 use crate::i18n;
 use crate::ignore::IgnoreMatcher;
@@ -66,6 +66,7 @@ pub enum OverlayKind {
     CommitDoubleConfirm,
     RevertConfirm,
     RevertDoubleConfirm,
+    ExportOverwriteConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +76,26 @@ pub enum CommitModalFocus {
     ExternalMessage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AiReviewStage {
+    #[default]
+    None,
+    GroupingOnly,
+    DeepFailed,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingJumpAccuracy {
+    Exact,
+    Approximate(Option<u32>),
+    FileHeader,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitFileEntry {
     pub path: String,
+    pub old_path: Option<String>,
     pub badge: String,
     pub is_external: bool,
     pub included: bool,
@@ -367,6 +385,7 @@ pub struct App {
     pub parsed_texts: Vec<Text<'static>>,
     pub continuous: ContinuousDiff,
     pub diff_loading: bool,
+    pub diff_started_at: Option<Instant>,
     pub diff_generation: u64,
     pub rerender_generation: u64,
     rerender_cancel_seq: Arc<AtomicU64>,
@@ -414,11 +433,16 @@ pub struct App {
     pub active_ai_session_id: Option<String>,
     pub available_providers: Vec<ProviderDescriptor>,
     pub ai_picker_cursor: usize,
+    pub ai_picker_from_settings: bool,
+    pub ai_review_provider_id: Option<String>,
+    pub ai_review_stage: AiReviewStage,
     pub cached_external_prefixes: Vec<String>,
     pub pending_status_override: Option<String>,
 
     pub commits_cache: Vec<CommitInfo>,
     pub commits_loading: bool,
+    pub commits_started_at: Option<Instant>,
+    pub commits_error: Option<String>,
     pub commit_picker_cursor: usize,
 
     pub commit_files: Vec<CommitFileEntry>,
@@ -428,6 +452,7 @@ pub struct App {
     pub commit_modal_focus: CommitModalFocus,
     pub commit_editing_msg: bool,
     pub commit_executing: bool,
+    pub commit_exec_started_at: Option<Instant>,
     pub commit_main: CommitMsgSlot,
     pub commit_ext: CommitMsgSlot,
     pub pending_commit_regen_at: Option<Instant>,
@@ -439,12 +464,23 @@ pub struct App {
     pub revert_files: Vec<CommitFileEntry>,
     pub revert_files_cursor: usize,
     pub revert_executing: bool,
+    pub revert_exec_started_at: Option<Instant>,
     pub revert_error: Option<String>,
+    pub revert_can_toggle_group: bool,
+    pub revert_group_mode: bool,
+    revert_file_indices: Vec<usize>,
+    revert_group_indices: Vec<usize>,
+    revert_file_title: String,
+    revert_group_title: Option<String>,
+    pub export_pending_path: Option<PathBuf>,
 
     pub session: ReviewSessionState,
     pub qa_history: Vec<QaEntry>,
     pub ai_followup_running: bool,
+    pub inspector_dismissed: bool,
     pub last_stepped_finding_id: Option<String>,
+    session_cache_by_target: HashMap<DiffTarget, (ReviewSessionState, Vec<QaEntry>)>,
+    pending_restore_session: Option<(DiffTarget, ReviewSessionState, Vec<QaEntry>)>,
 
     pub input_buffer: String,
     pub input_cursor: usize,
@@ -453,16 +489,19 @@ pub struct App {
     pub search_match_cursor: usize,
     pub inspector_scroll_y: u16,
     pub help_scroll_y: u16,
+    pub modal_confirm_scroll_y: u16,
     pub pending_commits_force_refresh: bool,
 
     pub pending_key: Option<char>,
     pub status_message: String,
+    pub user_status_at: Option<Instant>,
     pub should_quit: bool,
     pub dirty: bool,
 
     pub settings_cursor: usize,
-    pub settings_status: Option<String>,
+    pub settings_status: Option<(String, bool)>,
     pub settings_ai_dirty: bool,
+    pub settings_dirty_mask: UserSettingsMask,
     pub config_path_override: Option<PathBuf>,
 
     pub bg_rx: Receiver<BgMessage>,
@@ -503,6 +542,7 @@ impl App {
             parsed_texts,
             continuous: ContinuousDiff::default(),
             diff_loading: false,
+            diff_started_at: None,
             diff_generation: 0,
             rerender_generation: 0,
             rerender_cancel_seq: Arc::new(AtomicU64::new(0)),
@@ -545,10 +585,15 @@ impl App {
             active_ai_session_id,
             available_providers,
             ai_picker_cursor: 0,
+            ai_picker_from_settings: false,
+            ai_review_provider_id: None,
+            ai_review_stage: AiReviewStage::None,
             cached_external_prefixes,
             pending_status_override: None,
             commits_cache: Vec::new(),
             commits_loading: false,
+            commits_started_at: None,
+            commits_error: None,
             commit_picker_cursor: 0,
             commit_files: Vec::new(),
             commit_groups: Vec::new(),
@@ -557,6 +602,7 @@ impl App {
             commit_modal_focus: CommitModalFocus::Files,
             commit_editing_msg: false,
             commit_executing: false,
+            commit_exec_started_at: None,
             commit_main: CommitMsgSlot::default(),
             commit_ext: CommitMsgSlot::default(),
             pending_commit_regen_at: None,
@@ -567,11 +613,22 @@ impl App {
             revert_files: Vec::new(),
             revert_files_cursor: 0,
             revert_executing: false,
+            revert_exec_started_at: None,
             revert_error: None,
+            revert_can_toggle_group: false,
+            revert_group_mode: false,
+            revert_file_indices: Vec::new(),
+            revert_group_indices: Vec::new(),
+            revert_file_title: String::new(),
+            revert_group_title: None,
+            export_pending_path: None,
             session: ReviewSessionState::default(),
             qa_history: Vec::new(),
             ai_followup_running: false,
+            inspector_dismissed: false,
             last_stepped_finding_id: None,
+            session_cache_by_target: HashMap::new(),
+            pending_restore_session: None,
             input_buffer: String::new(),
             input_cursor: 0,
             search_query: String::new(),
@@ -579,14 +636,17 @@ impl App {
             search_match_cursor: 0,
             inspector_scroll_y: 0,
             help_scroll_y: 0,
+            modal_confirm_scroll_y: 0,
             pending_commits_force_refresh: false,
             pending_key: None,
             status_message,
+            user_status_at: None,
             should_quit: false,
             dirty: true,
             settings_cursor: 0,
             settings_status: None,
             settings_ai_dirty: false,
+            settings_dirty_mask: UserSettingsMask::default(),
             config_path_override: None,
             bg_rx,
             bg_tx,
@@ -722,6 +782,7 @@ impl App {
         self.rerender_cancel_seq
             .store(self.rerender_generation, Ordering::Relaxed);
         self.diff_loading = true;
+        self.diff_started_at = Some(Instant::now());
         self.diff_error = None;
         self.ai_generation += 1;
         self.ai_stage1_completed_gen = 0;
@@ -731,8 +792,25 @@ impl App {
         self.commit_error = None;
         self.commit_hint_notice = None;
         self.ai_review = None;
+        self.ai_review_provider_id = None;
+        self.ai_review_stage = AiReviewStage::None;
         self.ai_error = None;
-        self.qa_history.clear();
+        self.inspector_scroll_y = 0;
+        self.inspector_dismissed = false;
+        let old_target = self.bundle.target.clone();
+        let old_session = std::mem::take(&mut self.session);
+        let old_qa = std::mem::take(&mut self.qa_history);
+        if target == old_target {
+            self.pending_restore_session = Some((target.clone(), old_session, old_qa));
+        } else {
+            self.session_cache_by_target
+                .insert(old_target, (old_session, old_qa));
+            if let Some((cached_sess, cached_qa)) = self.session_cache_by_target.remove(&target) {
+                self.pending_restore_session = Some((target.clone(), cached_sess, cached_qa));
+            } else {
+                self.pending_restore_session = None;
+            }
+        }
         self.last_stepped_finding_id = None;
         self.user_forced_flat_tree = false;
         self.bundle = DiffBundle {
@@ -752,7 +830,6 @@ impl App {
         self.diff_cursor_y = 0;
         self.diff_scroll_y = 0;
         self.diff_scroll_x = 0;
-        self.session = ReviewSessionState::default();
         self.tree_mode = TreeMode::FlatFiles;
         self.rebuild_tree_rows();
         self.status_message = rust_i18n::t!(
@@ -845,13 +922,19 @@ impl App {
     }
 
     pub fn trigger_ai_analysis(&mut self, bypass_cache: bool) {
+        self.trigger_ai_analysis_with_status(bypass_cache, false);
+    }
+
+    pub fn trigger_ai_analysis_with_status(&mut self, bypass_cache: bool, preserve_status: bool) {
         if self.bundle.changes.is_empty() {
             self.cancel_analysis_task();
             self.ai_running = false;
             self.ai_deep_running = false;
             self.ai_started_at = None;
-            self.status_message =
-                rust_i18n::t!("status.no_changes", locale = self.locale()).into_owned();
+            if !preserve_status {
+                self.status_message =
+                    rust_i18n::t!("status.no_changes", locale = self.locale()).into_owned();
+            }
             return;
         }
 
@@ -865,8 +948,10 @@ impl App {
                 || self.active_ai_provider_id.eq_ignore_ascii_case("off")
             {
                 self.ai_error = None;
-                self.status_message =
-                    rust_i18n::t!("status.ai_disabled", locale = self.locale()).into_owned();
+                if !preserve_status {
+                    self.status_message =
+                        rust_i18n::t!("status.ai_disabled", locale = self.locale()).into_owned();
+                }
             } else {
                 self.ai_error = Some(
                     rust_i18n::t!(
@@ -1093,6 +1178,7 @@ impl App {
                     }
                     changed = true;
                     self.diff_loading = false;
+                    self.diff_started_at = None;
                     match result {
                         Ok((
                             bundle,
@@ -1125,6 +1211,7 @@ impl App {
                             }) {
                                 self.re_render_all_for_mode_or_width();
                             }
+                            let had_status_override = self.pending_status_override.is_some();
                             self.status_message = if let Some(override_msg) =
                                 self.pending_status_override.take()
                             {
@@ -1138,10 +1225,51 @@ impl App {
                                 )
                                 .into_owned()
                             };
+                            if let Some((ptarget, mut psess, pqa)) = self.pending_restore_session.take()
+                            {
+                                if ptarget == self.bundle.target {
+                                    psess.notes.retain_mut(|note| {
+                                        if let Some(&cidx) = self.path_to_index.get(&note.file) {
+                                            if let Some(ln) = note.line {
+                                                let max_ln = self.bundle.changes[cidx]
+                                                    .new_content
+                                                    .as_deref()
+                                                    .or(self.bundle.changes[cidx]
+                                                        .old_content
+                                                        .as_deref())
+                                                    .map(|b| String::from_utf8_lossy(b).lines().count() as u32)
+                                                    .unwrap_or(0);
+                                                if max_ln > 0 && ln > max_ln {
+                                                    note.line = None;
+                                                }
+                                            }
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    });
+                                    self.session.notes = psess.notes;
+                                    self.qa_history = pqa
+                                        .into_iter()
+                                        .filter(|q| {
+                                            q.file
+                                                .as_ref()
+                                                .is_none_or(|p| self.path_to_index.contains_key(p))
+                                        })
+                                        .collect();
+                                }
+                            }
                             let bypass_cache = std::mem::take(&mut self.bypass_next_ai_cache);
-                            self.trigger_ai_analysis(bypass_cache);
+                            self.trigger_ai_analysis_with_status(bypass_cache, had_status_override);
                         }
                         Err(err) => {
+                            if let Some((ptarget, psess, pqa)) = self.pending_restore_session.take()
+                            {
+                                if ptarget == self.bundle.target {
+                                    self.session = psess;
+                                    self.qa_history = pqa;
+                                }
+                            }
                             self.pending_status_override = None;
                             self.diff_error = Some(err.clone());
                             self.status_message = rust_i18n::t!(
@@ -1305,10 +1433,20 @@ impl App {
                     self.retain_review_active_paths(&mut review);
                     let group_cnt = review.groups.len();
                     self.ai_review = Some(review);
+                    self.ai_review_provider_id = Some(provider_id);
+                    self.ai_review_stage = AiReviewStage::GroupingOnly;
                     if !self.user_forced_flat_tree {
                         self.tree_mode = TreeMode::AiGrouped;
                     }
+                    let prev_offset = self.diff_cursor_y.saturating_sub(self.diff_scroll_y);
                     self.rebuild_tree_and_continuous();
+                    if !self.continuous.lines.is_empty() {
+                        let max_scroll = self.continuous.lines.len().saturating_sub(1);
+                        self.diff_scroll_y = self
+                            .diff_cursor_y
+                            .saturating_sub(prev_offset)
+                            .min(max_scroll);
+                    }
                     self.sync_tree_to_diff_cursor();
                     self.status_message = rust_i18n::t!(
                         "status.ai_groups_ready",
@@ -1350,6 +1488,8 @@ impl App {
                                     .insert(fa.path.clone(), fa.clone());
                             }
                             self.ai_review = Some(review);
+                            self.ai_review_provider_id = Some(provider_id);
+                            self.ai_review_stage = AiReviewStage::Complete;
                             if !self.user_forced_flat_tree {
                                 self.tree_mode = TreeMode::AiGrouped;
                             }
@@ -1366,7 +1506,8 @@ impl App {
                         Err(err) => {
                             if self.ai_stage1_completed_gen == generation && self.ai_review.is_some()
                             {
-                                self.ai_error = None;
+                                self.ai_error = Some(err.clone());
+                                self.ai_review_stage = AiReviewStage::DeepFailed;
                                 self.status_message = rust_i18n::t!(
                                     "status.ai_groups_ready_deep_failed",
                                     locale = self.locale(),
@@ -1375,6 +1516,7 @@ impl App {
                                 .into_owned();
                             } else {
                                 self.ai_error = Some(err.clone());
+                                self.ai_review_stage = AiReviewStage::None;
                                 self.status_message = rust_i18n::t!(
                                     "status.ai_failed",
                                     locale = self.locale(),
@@ -1413,10 +1555,18 @@ impl App {
                                 question,
                                 answer: out.text,
                             });
-                            self.show_inspector = true;
-                            self.status_message =
-                                rust_i18n::t!("status.ai_answer_added", locale = self.locale())
-                                    .into_owned();
+                            if self.inspector_dismissed {
+                                self.status_message = rust_i18n::t!(
+                                    "status.ai_answer_ready_dismissed",
+                                    locale = self.locale()
+                                )
+                                .into_owned();
+                            } else {
+                                self.show_inspector = true;
+                                self.status_message =
+                                    rust_i18n::t!("status.ai_answer_added", locale = self.locale())
+                                        .into_owned();
+                            }
                         }
                         Err(e) => {
                             self.status_message = rust_i18n::t!(
@@ -1431,18 +1581,39 @@ impl App {
                 BgMessage::CommitsLoaded(res) => {
                     changed = true;
                     self.commits_loading = false;
+                    self.commits_started_at = None;
                     match res {
                         Ok(commits) => {
-                            let changed = self.commits_cache.len() != commits.len()
-                                || self.commits_cache.first().map(|c| &c.revision)
-                                    != commits.first().map(|c| &c.revision);
+                            self.commits_error = None;
+                            let prev_rev = if self.commit_picker_cursor > 0 {
+                                self.commits_cache
+                                    .get(self.commit_picker_cursor - 1)
+                                    .map(|c| c.revision.clone())
+                            } else {
+                                None
+                            };
                             self.commits_cache = commits;
-                            if changed {
+                            if let Some(rev) = prev_rev {
+                                if let Some(pos) =
+                                    self.commits_cache.iter().position(|c| c.revision == rev)
+                                {
+                                    self.commit_picker_cursor = pos + 1;
+                                } else {
+                                    self.commit_picker_cursor =
+                                        self.commit_picker_cursor.min(self.commits_cache.len());
+                                    self.status_message = rust_i18n::t!(
+                                        "status.commits_missing_cursor",
+                                        locale = self.locale()
+                                    )
+                                    .into_owned();
+                                }
+                            } else {
                                 self.commit_picker_cursor =
                                     self.commit_picker_cursor.min(self.commits_cache.len());
                             }
                         }
                         Err(e) => {
+                            self.commits_error = Some(e.clone());
                             self.status_message = rust_i18n::t!(
                                 "status.commits_load_failed",
                                 locale = self.locale(),
@@ -1527,6 +1698,7 @@ impl App {
                 BgMessage::CommitDone(outcome) => {
                     changed = true;
                     self.commit_executing = false;
+                    self.commit_exec_started_at = None;
                     if let Some(err) = outcome.error {
                         if !outcome.committed_paths.is_empty() {
                             let committed: HashSet<String> =
@@ -1573,6 +1745,7 @@ impl App {
                 BgMessage::RevertDone(outcome) => {
                     changed = true;
                     self.revert_executing = false;
+                    self.revert_exec_started_at = None;
                     if let Some(err) = outcome.error {
                         if !outcome.reverted_paths.is_empty() {
                             let reverted: HashSet<String> =
@@ -2171,6 +2344,12 @@ impl App {
         }
     }
 
+    pub fn active_group_for_current_file(&self) -> Option<&ReviewGroup> {
+        let ai = self.ai_review.as_ref()?;
+        let cur = self.current_file()?;
+        ai.groups.iter().find(|g| g.files.contains(&cur.path))
+    }
+
     pub fn active_hunk_context(
         &self,
     ) -> (
@@ -2236,15 +2415,23 @@ impl App {
         }
 
         if self.overlay != OverlayKind::None {
+            let prev_status = self.status_message.clone();
             self.handle_overlay_key(key);
+            if self.status_message != prev_status {
+                self.user_status_at = Some(Instant::now());
+            }
             return;
         }
 
+        let prev_status = self.status_message.clone();
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Command | InputMode::Search | InputMode::AddNote | InputMode::AskAi => {
                 self.handle_input_mode_key(key);
             }
+        }
+        if self.status_message != prev_status {
+            self.user_status_at = Some(Instant::now());
         }
     }
 
@@ -2348,7 +2535,12 @@ impl App {
                 let total = self.available_providers.len() + 1;
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        self.overlay = OverlayKind::None;
+                        if self.ai_picker_from_settings {
+                            self.ai_picker_from_settings = false;
+                            self.overlay = OverlayKind::Settings;
+                        } else {
+                            self.overlay = OverlayKind::None;
+                        }
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
                         if self.ai_picker_cursor + 1 < total {
@@ -2359,13 +2551,22 @@ impl App {
                         self.ai_picker_cursor = self.ai_picker_cursor.saturating_sub(1);
                     }
                     KeyCode::Enter => {
-                        self.overlay = OverlayKind::None;
                         let new_id = if self.ai_picker_cursor < self.available_providers.len() {
                             self.available_providers[self.ai_picker_cursor].id.clone()
                         } else {
                             "none".to_string()
                         };
-                        self.apply_ai_provider_change(&new_id, true);
+                        if self.ai_picker_from_settings {
+                            self.ai_picker_from_settings = false;
+                            self.settings_dirty_mask.ai_provider = true;
+                            self.settings_ai_dirty = true;
+                            self.apply_ai_provider_change(&new_id, false);
+                            self.overlay = OverlayKind::Settings;
+                        } else {
+                            self.settings_dirty_mask.ai_provider = true;
+                            self.overlay = OverlayKind::None;
+                            self.apply_ai_provider_change(&new_id, true);
+                        }
                     }
                     _ => {}
                 }
@@ -2381,6 +2582,23 @@ impl App {
             }
             OverlayKind::RevertDoubleConfirm => {
                 self.handle_revert_double_confirm_key(key);
+            }
+            OverlayKind::ExportOverwriteConfirm => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                        self.export_pending_path = None;
+                        self.overlay = OverlayKind::None;
+                    }
+                    KeyCode::Enter if Self::is_confirm_press(&key) => {
+                        if let Some(out) = self.export_pending_path.take() {
+                            self.overlay = OverlayKind::None;
+                            self.execute_export_to_path(&out);
+                        } else {
+                            self.overlay = OverlayKind::None;
+                        }
+                    }
+                    _ => {}
+                }
             }
             OverlayKind::None => {}
         }
@@ -2412,6 +2630,22 @@ impl App {
         }
     }
 
+    fn default_ai_picker_cursor(&self) -> usize {
+        if self.active_ai_provider_id.eq_ignore_ascii_case("none")
+            || self.active_ai_provider_id.eq_ignore_ascii_case("off")
+        {
+            return self.available_providers.len();
+        }
+        let target = self
+            .resolved_ai_provider_id
+            .as_deref()
+            .unwrap_or(&self.active_ai_provider_id);
+        self.available_providers
+            .iter()
+            .position(|p| p.id.eq_ignore_ascii_case(target))
+            .unwrap_or(0)
+    }
+
     pub fn open_settings(&mut self) {
         self.available_providers = ai::detect_available_providers(&self.config);
         self.settings_cursor = 0;
@@ -2421,18 +2655,24 @@ impl App {
     }
 
     fn save_user_settings_with_status(&mut self) {
+        let mask = if self.settings_dirty_mask.any() {
+            self.settings_dirty_mask
+        } else {
+            UserSettingsMask::all()
+        };
         match self
             .config
-            .save_user_settings(self.config_path_override.as_deref())
+            .save_user_settings_mask(self.config_path_override.as_deref(), mask)
         {
             Ok(path) => {
+                self.settings_dirty_mask = UserSettingsMask::default();
                 let msg = rust_i18n::t!(
                     "status.settings_saved",
                     locale = self.locale(),
                     path = path.display()
                 )
                 .into_owned();
-                self.settings_status = Some(msg.clone());
+                self.settings_status = Some((msg.clone(), false));
                 self.status_message = msg;
             }
             Err(e) => {
@@ -2442,7 +2682,7 @@ impl App {
                     err = e
                 )
                 .into_owned();
-                self.settings_status = Some(msg.clone());
+                self.settings_status = Some((msg.clone(), true));
                 self.status_message = msg;
             }
         }
@@ -2482,6 +2722,7 @@ impl App {
                         let new_loc = i18n::next_locale(&self.config.ui_language, forward);
                         self.config.ui_language = new_loc.clone();
                         self.config.ui_language_explicit = true;
+                        self.settings_dirty_mask.ui_language = true;
                         self.rebuild_tree_and_continuous();
                         let disp = i18n::display_name(&new_loc);
                         self.status_message = rust_i18n::t!(
@@ -2494,12 +2735,14 @@ impl App {
                     1 => {
                         let next_lang = i18n::next_locale(&self.config.review_language, forward);
                         self.config.review_language = next_lang;
+                        self.settings_dirty_mask.review_language = true;
                         self.settings_ai_dirty = true;
                     }
                     2 => {
                         if matches!(key.code, KeyCode::Enter) {
+                            self.ai_picker_from_settings = true;
+                            self.ai_picker_cursor = self.default_ai_picker_cursor();
                             self.overlay = OverlayKind::AiPicker;
-                            self.ai_picker_cursor = 0;
                             return;
                         }
                         let mut choices = vec!["auto".to_string()];
@@ -2522,6 +2765,7 @@ impl App {
                         };
                         let new_id = choices[next_idx].clone();
                         self.apply_ai_provider_change(&new_id, false);
+                        self.settings_dirty_mask.ai_provider = true;
                         self.settings_ai_dirty = true;
                     }
                     3 => {
@@ -2536,6 +2780,7 @@ impl App {
                         };
                         self.display_mode = next;
                         self.config.display_mode = next;
+                        self.settings_dirty_mask.display_mode = true;
                         self.re_render_all_for_mode_or_width();
                     }
                     4 => {
@@ -2544,22 +2789,26 @@ impl App {
                         match DifftEngine::new(&self.config.difft_bin, new_val) {
                             Ok(engine) => {
                                 self.difft_engine = Arc::new(engine);
+                                self.settings_dirty_mask.ignore_comments = true;
                                 self.re_render_all_for_mode_or_width();
                             }
                             Err(e) => {
                                 self.config.ignore_comments = !new_val;
-                                self.settings_status = Some(format!("{}", e));
+                                self.settings_status = Some((format!("{}", e), true));
                             }
                         }
                     }
                     5 => {
                         self.config.cache_ai_results = !self.config.cache_ai_results;
+                        self.settings_dirty_mask.cache_ai_results = true;
                     }
                     6 => {
                         self.config.cache_history = !self.config.cache_history;
+                        self.settings_dirty_mask.cache_history = true;
                     }
                     7 => {
                         self.config.reuse_session = !self.config.reuse_session;
+                        self.settings_dirty_mask.reuse_session = true;
                     }
                     _ => {}
                 }
@@ -2616,6 +2865,7 @@ impl App {
                     .any(|e| Self::path_in_external(vcs_kind, &c.path, e));
                 CommitFileEntry {
                     path: c.path.clone(),
+                    old_path: c.old_path.clone(),
                     badge: c.kind.short_badge().to_string(),
                     is_external: is_ext,
                     included: true,
@@ -2938,6 +3188,7 @@ impl App {
         {
             self.regenerate_commit_message();
         }
+        self.modal_confirm_scroll_y = 0;
         self.overlay = OverlayKind::CommitDoubleConfirm;
     }
 
@@ -3118,6 +3369,7 @@ impl App {
         }
 
         self.commit_executing = true;
+        self.commit_exec_started_at = Some(Instant::now());
         self.commit_error = None;
         let vcs = Arc::clone(&self.vcs);
         let msg = self.commit_main.message.clone();
@@ -3138,7 +3390,10 @@ impl App {
         }
 
         // Ctrl+S advances to double confirmation anytime inside CommitConfirm modal
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('s')
+            && Self::is_confirm_press(&key)
+        {
             self.commit_editing_msg = false;
             self.open_commit_double_confirm();
             return;
@@ -3339,26 +3594,15 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('y') => {
+            KeyCode::Enter if Self::is_confirm_press(&key) => {
                 self.open_commit_double_confirm();
-            }
-            KeyCode::Enter => {
-                match self.commit_modal_focus {
-                    CommitModalFocus::Message => {
-                        self.commit_main.cursor = self.commit_main.message.len();
-                        self.commit_editing_msg = true;
-                    }
-                    CommitModalFocus::ExternalMessage => {
-                        self.commit_ext.cursor = self.commit_ext.message.len();
-                        self.commit_editing_msg = true;
-                    }
-                    CommitModalFocus::Files => {
-                        self.open_commit_double_confirm();
-                    }
-                }
             }
             _ => {}
         }
+    }
+
+    fn is_confirm_press(key: &KeyEvent) -> bool {
+        key.kind != KeyEventKind::Repeat && key.kind != KeyEventKind::Release
     }
 
     fn handle_commit_double_confirm_key(&mut self, key: KeyEvent) {
@@ -3369,9 +3613,16 @@ impl App {
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.commit_error = None;
                 self.commit_hint_notice = None;
+                self.modal_confirm_scroll_y = 0;
                 self.overlay = OverlayKind::CommitConfirm;
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.modal_confirm_scroll_y = self.modal_confirm_scroll_y.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.modal_confirm_scroll_y = self.modal_confirm_scroll_y.saturating_sub(1);
+            }
+            KeyCode::Char('f') if Self::is_confirm_press(&key) => {
                 if !self.any_commit_msg_generating() {
                     return;
                 }
@@ -3379,7 +3630,7 @@ impl App {
                 self.commit_hint_notice = None;
                 self.execute_commit_confirm();
             }
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Enter if Self::is_confirm_press(&key) => {
                 if self.any_commit_msg_generating() {
                     self.commit_hint_notice =
                         Some(rust_i18n::t!("commit.wait_hint", locale = self.locale()).into_owned());
@@ -3390,6 +3641,43 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn collect_group_indices(&self, group: &ReviewGroup) -> Vec<usize> {
+        let mut idxs = Vec::new();
+        let mut seen = HashSet::new();
+        for p in &group.files {
+            if let Some(&idx) = self.path_to_index.get(p) {
+                if seen.insert(idx) {
+                    idxs.push(idx);
+                }
+            }
+        }
+        idxs
+    }
+
+    fn populate_revert_files(&mut self, title: String, indices: Vec<usize>) {
+        let vcs_kind = self.vcs.kind();
+        let externals = self.resolve_cached_externals();
+        self.revert_title = title;
+        self.revert_files = indices
+            .into_iter()
+            .filter_map(|idx| self.bundle.changes.get(idx))
+            .map(|c| {
+                let is_ext = externals
+                    .iter()
+                    .any(|e| Self::path_in_external(vcs_kind, &c.path, e));
+                CommitFileEntry {
+                    path: c.path.clone(),
+                    old_path: c.old_path.clone(),
+                    badge: c.kind.short_badge().to_string(),
+                    is_external: is_ext,
+                    included: true,
+                }
+            })
+            .collect();
+        self.revert_files_cursor = 0;
+        self.revert_error = None;
     }
 
     pub fn open_revert_confirm(&mut self) {
@@ -3409,31 +3697,42 @@ impl App {
             return;
         }
 
-        let (title, indices): (String, Vec<usize>) = match self.focus {
+        let mut file_title = String::new();
+        let mut file_indices = Vec::new();
+        let mut group_title: Option<String> = None;
+        let mut group_indices: Vec<usize> = Vec::new();
+        let mut start_in_group = false;
+
+        match self.focus {
             PaneFocus::Tree => match self.tree_rows.get(self.tree_cursor).cloned() {
                 Some(TreeRow::GroupHeader {
                     group_id, title, ..
                 }) => {
-                    let mut idxs = Vec::new();
-                    let mut seen = HashSet::new();
                     if let Some(ai) = &self.ai_review {
                         if let Some(g) = ai.groups.iter().find(|g| g.id == group_id) {
-                            for p in &g.files {
-                                if let Some(&idx) = self.path_to_index.get(p) {
-                                    if seen.insert(idx) {
-                                        idxs.push(idx);
-                                    }
-                                }
-                            }
+                            group_indices = self.collect_group_indices(g);
+                            group_title = Some(
+                                rust_i18n::t!(
+                                    "revert.target_group",
+                                    locale = self.locale(),
+                                    title = title
+                                )
+                                .into_owned(),
+                            );
+                            start_in_group = true;
                         }
                     }
-                    let label = rust_i18n::t!(
-                        "revert.target_group",
-                        locale = self.locale(),
-                        title = title
-                    )
-                    .into_owned();
-                    (label, idxs)
+                    if let Some(cidx) = group_indices.first().copied() {
+                        if let Some(ch) = self.bundle.changes.get(cidx) {
+                            file_indices = vec![cidx];
+                            file_title = rust_i18n::t!(
+                                "revert.target_file",
+                                locale = self.locale(),
+                                path = ch.path
+                            )
+                            .into_owned();
+                        }
+                    }
                 }
                 Some(TreeRow::FileItem {
                     path, change_idx, ..
@@ -3441,15 +3740,31 @@ impl App {
                 | Some(TreeRow::FindingItem {
                     path, change_idx, ..
                 }) => {
-                    let label = rust_i18n::t!(
+                    file_title = rust_i18n::t!(
                         "revert.target_file",
                         locale = self.locale(),
                         path = path
                     )
                     .into_owned();
-                    (label, vec![change_idx])
+                    file_indices = vec![change_idx];
+                    if let Some(grp) = self.ai_review.as_ref().and_then(|ai| {
+                        ai.groups.iter().find(|g| g.files.contains(&path))
+                    }) {
+                        let g_idxs = self.collect_group_indices(grp);
+                        if g_idxs.len() > 1 {
+                            group_indices = g_idxs;
+                            group_title = Some(
+                                rust_i18n::t!(
+                                    "revert.target_group",
+                                    locale = self.locale(),
+                                    title = grp.title
+                                )
+                                .into_owned(),
+                            );
+                        }
+                    }
                 }
-                None => (String::new(), Vec::new()),
+                None => {}
             },
             PaneFocus::Diff => {
                 let y = self
@@ -3463,46 +3778,55 @@ impl App {
                     .flatten()
                     .or(self.selected_file_idx);
                 if let Some(cidx) = idx.filter(|&i| i < self.bundle.changes.len()) {
-                    let label = rust_i18n::t!(
+                    let path = &self.bundle.changes[cidx].path;
+                    file_title = rust_i18n::t!(
                         "revert.target_file",
                         locale = self.locale(),
-                        path = self.bundle.changes[cidx].path
+                        path = path
                     )
                     .into_owned();
-                    (label, vec![cidx])
-                } else {
-                    (String::new(), Vec::new())
+                    file_indices = vec![cidx];
+                    if let Some(grp) = self.ai_review.as_ref().and_then(|ai| {
+                        ai.groups.iter().find(|g| g.files.contains(path))
+                    }) {
+                        let g_idxs = self.collect_group_indices(grp);
+                        if g_idxs.len() > 1 {
+                            group_indices = g_idxs;
+                            group_title = Some(
+                                rust_i18n::t!(
+                                    "revert.target_group",
+                                    locale = self.locale(),
+                                    title = grp.title
+                                )
+                                .into_owned(),
+                            );
+                        }
+                    }
                 }
             }
+        }
+
+        let (initial_title, initial_indices) = if start_in_group {
+            (group_title.clone().unwrap_or_default(), group_indices.clone())
+        } else {
+            (file_title.clone(), file_indices.clone())
         };
 
-        if indices.is_empty() {
+        if initial_indices.is_empty() {
             self.status_message =
                 rust_i18n::t!("revert.no_target", locale = self.locale()).into_owned();
             return;
         }
 
-        let vcs_kind = self.vcs.kind();
-        let externals = self.resolve_cached_externals();
-        self.revert_title = title;
-        self.revert_files = indices
-            .into_iter()
-            .filter_map(|idx| self.bundle.changes.get(idx))
-            .map(|c| {
-                let is_ext = externals
-                    .iter()
-                    .any(|e| Self::path_in_external(vcs_kind, &c.path, e));
-                CommitFileEntry {
-                    path: c.path.clone(),
-                    badge: c.kind.short_badge().to_string(),
-                    is_external: is_ext,
-                    included: true,
-                }
-            })
-            .collect();
-        self.revert_files_cursor = 0;
+        self.revert_file_indices = file_indices;
+        self.revert_file_title = file_title;
+        self.revert_group_indices = group_indices;
+        self.revert_group_title = group_title;
+        self.revert_can_toggle_group =
+            !self.revert_file_indices.is_empty() && !self.revert_group_indices.is_empty();
+        self.revert_group_mode = start_in_group;
+        self.populate_revert_files(initial_title, initial_indices);
         self.revert_executing = false;
-        self.revert_error = None;
         self.overlay = OverlayKind::RevertConfirm;
     }
 
@@ -3523,6 +3847,7 @@ impl App {
             return;
         }
         self.revert_executing = true;
+        self.revert_exec_started_at = Some(Instant::now());
         self.revert_error = None;
         let vcs = Arc::clone(&self.vcs);
         let tx = self.bg_tx.clone();
@@ -3550,13 +3875,15 @@ impl App {
                 self.revert_files_cursor = self.revert_files_cursor.saturating_sub(1);
             }
             KeyCode::Char(' ') | KeyCode::Char('x') => {
-                if let Some(entry) = self.revert_files.get_mut(self.revert_files_cursor) {
-                    entry.included = !entry.included;
-                    self.revert_error = None;
+                if self.revert_files.len() > 1 {
+                    if let Some(entry) = self.revert_files.get_mut(self.revert_files_cursor) {
+                        entry.included = !entry.included;
+                        self.revert_error = None;
+                    }
                 }
             }
             KeyCode::Char('a') => {
-                if !self.revert_files.is_empty() {
+                if self.revert_files.len() > 1 {
                     let all_included = self.revert_files.iter().all(|f| f.included);
                     let target = !all_included;
                     for f in &mut self.revert_files {
@@ -3565,7 +3892,19 @@ impl App {
                     self.revert_error = None;
                 }
             }
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('g') if self.revert_can_toggle_group => {
+                self.revert_group_mode = !self.revert_group_mode;
+                if self.revert_group_mode {
+                    let title = self.revert_group_title.clone().unwrap_or_default();
+                    let indices = self.revert_group_indices.clone();
+                    self.populate_revert_files(title, indices);
+                } else {
+                    let title = self.revert_file_title.clone();
+                    let indices = self.revert_file_indices.clone();
+                    self.populate_revert_files(title, indices);
+                }
+            }
+            KeyCode::Enter if Self::is_confirm_press(&key) => {
                 if !self.revert_files.iter().any(|f| f.included) {
                     self.revert_error = Some(
                         rust_i18n::t!("revert.err_keep_file", locale = self.locale()).into_owned(),
@@ -3573,6 +3912,7 @@ impl App {
                     return;
                 }
                 self.revert_error = None;
+                self.modal_confirm_scroll_y = 0;
                 self.overlay = OverlayKind::RevertDoubleConfirm;
             }
             _ => {}
@@ -3586,9 +3926,16 @@ impl App {
         match key.code {
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.revert_error = None;
+                self.modal_confirm_scroll_y = 0;
                 self.overlay = OverlayKind::RevertConfirm;
             }
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.modal_confirm_scroll_y = self.modal_confirm_scroll_y.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.modal_confirm_scroll_y = self.modal_confirm_scroll_y.saturating_sub(1);
+            }
+            KeyCode::Enter if Self::is_confirm_press(&key) => {
                 self.execute_revert_confirm();
             }
             _ => {}
@@ -3658,12 +4005,16 @@ impl App {
                     self.jump_top();
                     return;
                 }
+                (_, KeyCode::Esc) => {
+                    return;
+                }
                 _ => {
+                    let key_disp = format_key_code(&key);
                     self.status_message = rust_i18n::t!(
                         "status.unknown_key_seq",
                         locale = self.locale(),
                         prefix = prefix,
-                        key = format!("{:?}", key.code)
+                        key = key_disp
                     )
                     .into_owned();
                     return;
@@ -3720,15 +4071,27 @@ impl App {
                     self.status_message =
                         rust_i18n::t!("status.no_file_to_note", locale = self.locale()).into_owned();
                 } else {
+                    self.inspector_dismissed = false;
                     self.input_mode = InputMode::AddNote;
                     self.input_buffer.clear();
                     self.input_cursor = 0;
                 }
             }
             KeyCode::Char('A') => {
-                self.input_mode = InputMode::AskAi;
-                self.input_buffer.clear();
-                self.input_cursor = 0;
+                if ai::resolve_provider(&self.active_ai_provider_id, &self.config).is_none() {
+                    self.status_message =
+                        rust_i18n::t!("status.ai_no_provider", locale = self.locale()).into_owned();
+                } else {
+                    self.inspector_dismissed = false;
+                    self.input_mode = InputMode::AskAi;
+                    self.input_buffer.clear();
+                    self.input_cursor = 0;
+                }
+            }
+            KeyCode::Char('I') => {
+                self.show_inspector = !self.show_inspector;
+                self.inspector_dismissed = !self.show_inspector;
+                self.inspector_scroll_y = 0;
             }
             KeyCode::Char('J') => {
                 if self.show_inspector {
@@ -3742,7 +4105,13 @@ impl App {
             }
             KeyCode::Esc => {
                 self.show_inspector = false;
+                self.inspector_dismissed = true;
                 self.inspector_scroll_y = 0;
+                if self.ai_followup_running {
+                    self.cancel_followup_task();
+                    self.ai_followup_generation += 1;
+                    self.ai_followup_running = false;
+                }
             }
             KeyCode::Char('a') => {
                 self.user_forced_flat_tree = false;
@@ -3753,8 +4122,9 @@ impl App {
             }
             KeyCode::Char('P') => {
                 self.available_providers = ai::detect_available_providers(&self.config);
+                self.ai_picker_from_settings = false;
+                self.ai_picker_cursor = self.default_ai_picker_cursor();
                 self.overlay = OverlayKind::AiPicker;
-                self.ai_picker_cursor = 0;
             }
             KeyCode::Char('C') => {
                 self.open_commit_picker();
@@ -3773,6 +4143,8 @@ impl App {
             }
             KeyCode::Char('d') => {
                 self.display_mode = self.display_mode.next();
+                self.config.display_mode = self.display_mode;
+                self.settings_dirty_mask.display_mode = true;
                 self.re_render_all_for_mode_or_width();
                 self.status_message = rust_i18n::t!(
                     "status.difft_mode",
@@ -3815,30 +4187,7 @@ impl App {
             }
             KeyCode::Char('e') => {
                 let path = self.bundle.repo_root.join("codeduck-review.md");
-                match export_review_markdown_with_locale(
-                    &path,
-                    &self.bundle,
-                    self.ai_review.as_ref(),
-                    &self.session,
-                    self.locale(),
-                ) {
-                    Ok(()) => {
-                        self.status_message = rust_i18n::t!(
-                            "status.exported_to",
-                            locale = self.locale(),
-                            path = path.display()
-                        )
-                        .into_owned();
-                    }
-                    Err(e) => {
-                        self.status_message = rust_i18n::t!(
-                            "status.export_failed",
-                            locale = self.locale(),
-                            err = e
-                        )
-                        .into_owned();
-                    }
-                }
+                self.request_export(path, false);
             }
             KeyCode::Char('g') => self.pending_key = Some('g'),
             KeyCode::Char('f') => self.step_file(true),
@@ -3903,12 +4252,34 @@ impl App {
     fn move_right(&mut self) {
         match self.focus {
             PaneFocus::Diff => {
-                self.diff_scroll_x = self.diff_scroll_x.saturating_add(4);
+                let max_x = self.max_diff_scroll_x();
+                self.diff_scroll_x = self.diff_scroll_x.saturating_add(4).min(max_x);
             }
             PaneFocus::Tree => {
                 self.focus = PaneFocus::Diff;
             }
         }
+    }
+
+    fn max_diff_scroll_x(&self) -> u16 {
+        let visible_h = self.diff_pane_height.max(1) as usize;
+        let max_line_w = self
+            .continuous
+            .lines
+            .iter()
+            .skip(self.diff_scroll_y)
+            .take(visible_h)
+            .map(Line::width)
+            .max()
+            .unwrap_or(0);
+        let content_w = max_line_w.saturating_add(2); // leading "  "/"▶ " gutter
+        let view_w = self.diff_pane_width.max(2) as usize;
+        let limit = if self.diff_pane_width == 0 || content_w <= view_w {
+            max_line_w.saturating_sub(4).max(4)
+        } else {
+            content_w.saturating_sub(view_w)
+        };
+        limit.min(u16::MAX as usize) as u16
     }
 
     fn scroll_half_page(&mut self, down: bool) {
@@ -4233,18 +4604,52 @@ impl App {
         self.inspector_scroll_y = 0;
         self.selected_file_idx = Some(change_idx);
         self.diff_scroll_x = 0;
-        if let Some(target_y) = find_finding_global_y(&self.continuous, change_idx, line, range) {
+        let accuracy = if let Some((target_y, acc)) =
+            find_finding_global_y(&self.continuous, change_idx, line, range)
+        {
             self.diff_cursor_y = target_y;
             self.diff_scroll_y = target_y.saturating_sub((self.diff_pane_height / 4) as usize);
-        }
+            acc
+        } else {
+            FindingJumpAccuracy::Exact
+        };
         self.last_stepped_finding_id = Some(finding_id.to_string());
         if let Some(title) = status_title {
-            self.status_message = rust_i18n::t!(
-                "status.finding_status",
-                locale = self.locale(),
-                title = title
-            )
-            .into_owned();
+            self.status_message = match accuracy {
+                FindingJumpAccuracy::Approximate(actual_ln) => {
+                    let target_lbl = line
+                        .map(|l| format!("L{}", l))
+                        .unwrap_or_else(|| "?".to_string());
+                    let actual_lbl = actual_ln
+                        .map(|l| format!("L{}", l))
+                        .unwrap_or_else(|| "file header".to_string());
+                    rust_i18n::t!(
+                        "status.finding_status_approx",
+                        locale = self.locale(),
+                        target = target_lbl,
+                        actual = actual_lbl,
+                        title = title
+                    )
+                    .into_owned()
+                }
+                FindingJumpAccuracy::FileHeader if line.is_some() => {
+                    let target_lbl = format!("L{}", line.unwrap());
+                    rust_i18n::t!(
+                        "status.finding_status_approx",
+                        locale = self.locale(),
+                        target = target_lbl,
+                        actual = "header",
+                        title = title
+                    )
+                    .into_owned()
+                }
+                _ => rust_i18n::t!(
+                    "status.finding_status",
+                    locale = self.locale(),
+                    title = title
+                )
+                .into_owned(),
+            };
         }
     }
 
@@ -4305,7 +4710,7 @@ impl App {
                     let cidx = *self.path_to_index.get(&it.file)?;
                     let jump_ln = it.jump_line();
                     let range = it.range();
-                    let y = find_finding_global_y(&self.continuous, cidx, jump_ln, range)?;
+                    let (y, _) = find_finding_global_y(&self.continuous, cidx, jump_ln, range)?;
                     Some((
                         y,
                         jump_ln.unwrap_or(0),
@@ -4448,6 +4853,7 @@ impl App {
             return;
         }
         self.commits_loading = true;
+        self.commits_started_at = Some(Instant::now());
         let vcs = Arc::clone(&self.vcs);
         let use_cache = self.config.cache_history;
         let tx = self.bg_tx.clone();
@@ -4460,12 +4866,21 @@ impl App {
 
     fn open_commit_picker(&mut self) {
         self.overlay = OverlayKind::CommitPicker;
-        self.commit_picker_cursor = 0;
         if self.commits_cache.is_empty() && self.config.cache_history {
             if let Some(cached) = crate::vcs::load_history_disk_cache(&*self.vcs, 30) {
                 self.commits_cache = cached;
             }
         }
+        self.commit_picker_cursor = match &self.bundle.target {
+            DiffTarget::Uncommitted => 0,
+            DiffTarget::Commit(rev) => self
+                .commits_cache
+                .iter()
+                .position(|c| &c.revision == rev)
+                .map(|p| p + 1)
+                .unwrap_or(0),
+            DiffTarget::Range { .. } => 0,
+        };
         self.spawn_commits_refresh(false);
     }
 
@@ -4514,11 +4929,83 @@ impl App {
         });
     }
 
-    fn execute_ex_command(&mut self, raw: &str) {
-        let parts: Vec<&str> = raw.split_whitespace().collect();
-        let Some(&cmd) = parts.first() else {
+    fn parse_export_path_arg(rest: &str) -> String {
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            return "codeduck-review.md".to_string();
+        }
+        if ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+            && trimmed.len() >= 2
+        {
+            let inner = trimmed[1..trimmed.len() - 1].trim();
+            if inner.is_empty() {
+                "codeduck-review.md".to_string()
+            } else {
+                inner.to_string()
+            }
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn execute_export_to_path(&mut self, out: &std::path::Path) {
+        match export_review_markdown_with_locale(
+            out,
+            &self.bundle,
+            self.ai_review.as_ref(),
+            &self.session,
+            self.locale(),
+        ) {
+            Ok(()) => {
+                self.status_message = rust_i18n::t!(
+                    "status.exported_to",
+                    locale = self.locale(),
+                    path = out.display()
+                )
+                .into_owned();
+            }
+            Err(e) => {
+                self.status_message = rust_i18n::t!(
+                    "status.export_failed",
+                    locale = self.locale(),
+                    err = e
+                )
+                .into_owned();
+            }
+        }
+    }
+
+    fn request_export(&mut self, out: PathBuf, force: bool) {
+        if self.diff_loading {
+            self.status_message =
+                rust_i18n::t!("export.err_loading", locale = self.locale()).into_owned();
             return;
+        }
+        if self.diff_error.is_some() {
+            self.status_message =
+                rust_i18n::t!("export.err_failed", locale = self.locale()).into_owned();
+            return;
+        }
+        if !force && out.exists() {
+            self.export_pending_path = Some(out);
+            self.overlay = OverlayKind::ExportOverwriteConfirm;
+            return;
+        }
+        self.execute_export_to_path(&out);
+    }
+
+    fn execute_ex_command(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let split_idx = trimmed.find(char::is_whitespace);
+        let (cmd, rest) = match split_idx {
+            Some(i) => (&trimmed[..i], trimmed[i..].trim()),
+            None => (trimmed, ""),
         };
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
         match cmd {
             "q" | "quit" | "wq" => self.should_quit = true,
             "help" | "h" => {
@@ -4621,7 +5108,8 @@ impl App {
                     self.apply_ai_provider_change(p, true);
                 } else {
                     self.available_providers = ai::detect_available_providers(&self.config);
-                    self.ai_picker_cursor = 0;
+                    self.ai_picker_from_settings = false;
+                    self.ai_picker_cursor = self.default_ai_picker_cursor();
                     self.overlay = OverlayKind::AiPicker;
                 }
             }
@@ -4634,7 +5122,8 @@ impl App {
                     self.user_forced_flat_tree = false;
                     self.trigger_ai_analysis(true);
                 } else {
-                    let cur = self.config.ai_model.as_deref().unwrap_or("<default>");
+                    let def = rust_i18n::t!("ui.default_value", locale = self.locale()).into_owned();
+                    let cur = self.config.ai_model.as_deref().unwrap_or(def.as_str());
                     self.status_message = rust_i18n::t!(
                         "status.model_current",
                         locale = self.locale(),
@@ -4650,7 +5139,8 @@ impl App {
                     self.user_forced_flat_tree = false;
                     self.trigger_ai_analysis(true);
                 } else {
-                    let cur = self.config.ai_fast_model.as_deref().unwrap_or("<default>");
+                    let def = rust_i18n::t!("ui.default_value", locale = self.locale()).into_owned();
+                    let cur = self.config.ai_fast_model.as_deref().unwrap_or(def.as_str());
                     self.status_message = rust_i18n::t!(
                         "status.fast_model_current",
                         locale = self.locale(),
@@ -4684,7 +5174,8 @@ impl App {
                         },
                     }
                 } else {
-                    let cur = self.config.ai_effort.as_deref().unwrap_or("<default>");
+                    let def = rust_i18n::t!("ui.default_value", locale = self.locale()).into_owned();
+                    let cur = self.config.ai_effort.as_deref().unwrap_or(def.as_str());
                     self.status_message = rust_i18n::t!(
                         "status.effort_current",
                         locale = self.locale(),
@@ -4720,7 +5211,8 @@ impl App {
                         },
                     }
                 } else {
-                    let cur = self.config.ai_fast_effort.as_deref().unwrap_or("<default>");
+                    let def = rust_i18n::t!("ui.default_value", locale = self.locale()).into_owned();
+                    let cur = self.config.ai_fast_effort.as_deref().unwrap_or(def.as_str());
                     self.status_message = rust_i18n::t!(
                         "status.fast_effort_current",
                         locale = self.locale(),
@@ -4733,6 +5225,14 @@ impl App {
                 let q = parts[1..].join(" ");
                 if !q.is_empty() {
                     self.run_ai_followup(q);
+                } else if ai::resolve_provider(&self.active_ai_provider_id, &self.config).is_some()
+                {
+                    self.input_mode = InputMode::AskAi;
+                    self.input_buffer.clear();
+                    self.input_cursor = 0;
+                } else {
+                    self.status_message =
+                        rust_i18n::t!("status.ai_no_provider", locale = self.locale()).into_owned();
                 }
             }
             "ignore" => {
@@ -4744,45 +5244,27 @@ impl App {
                     self.add_ignore_pattern(pat.trim());
                 }
             }
-            "export" => {
-                let file = parts.get(1).copied().unwrap_or("codeduck-review.md");
+            "export" | "export!" => {
+                let force = cmd == "export!";
+                let file = Self::parse_export_path_arg(rest);
                 let path = PathBuf::from(file);
                 let out = if path.is_absolute() {
                     path
                 } else {
                     self.bundle.repo_root.join(path)
                 };
-                match export_review_markdown_with_locale(
-                    &out,
-                    &self.bundle,
-                    self.ai_review.as_ref(),
-                    &self.session,
-                    self.locale(),
-                ) {
-                    Ok(()) => {
-                        self.status_message = rust_i18n::t!(
-                            "status.exported_to",
-                            locale = self.locale(),
-                            path = out.display()
-                        )
-                        .into_owned();
-                    }
-                    Err(e) => {
-                        self.status_message = rust_i18n::t!(
-                            "status.export_failed",
-                            locale = self.locale(),
-                            err = e
-                        )
-                        .into_owned();
-                    }
-                }
+                self.request_export(out, force);
             }
             "inline" => {
                 self.display_mode = DifftDisplayMode::Inline;
+                self.config.display_mode = self.display_mode;
+                self.settings_dirty_mask.display_mode = true;
                 self.re_render_all_for_mode_or_width();
             }
             "sbs" | "side-by-side" => {
                 self.display_mode = DifftDisplayMode::SideBySide;
+                self.config.display_mode = self.display_mode;
+                self.settings_dirty_mask.display_mode = true;
                 self.re_render_all_for_mode_or_width();
             }
             "tree" => {
@@ -4955,13 +5437,13 @@ fn find_finding_global_y(
     change_idx: usize,
     line: Option<u32>,
     range: Option<(u32, u32)>,
-) -> Option<usize> {
+) -> Option<(usize, FindingJumpAccuracy)> {
     let sec = continuous
         .sections
         .iter()
         .find(|s| s.change_idx == change_idx)?;
     let Some(ln) = line else {
-        return Some(sec.start_y);
+        return Some((sec.start_y, FindingJumpAccuracy::Exact));
     };
     if let Some(exact) = (sec.body_start_y..sec.end_y).find(|&gy| {
         continuous
@@ -4971,7 +5453,7 @@ fn find_finding_global_y(
             .flatten()
             == Some(ln)
     }) {
-        return Some(exact);
+        return Some((exact, FindingJumpAccuracy::Exact));
     }
 
     // For multi-line hunks, prefer the last rendered line inside [start_line, end_line]
@@ -4983,7 +5465,7 @@ fn find_finding_global_y(
                 Some(sl) if sl >= lo && sl <= hi
             )
         }) {
-            return Some(last_in_range);
+            return Some((last_in_range, FindingJumpAccuracy::Exact));
         }
     }
 
@@ -5013,9 +5495,14 @@ fn find_finding_global_y(
             })
             .min_by_key(|&(_, d)| d)
         {
-            return Some(best_y);
+            let actual_ln = continuous
+                .line_to_source_line
+                .get(best_y)
+                .copied()
+                .flatten();
+            return Some((best_y, FindingJumpAccuracy::Approximate(actual_ln)));
         }
-        return Some(h.global_y);
+        return Some((h.global_y, FindingJumpAccuracy::Approximate(h.start_line)));
     }
 
     // Fallback 2: closest source line anywhere in this file's rendered diff
@@ -5029,8 +5516,11 @@ fn find_finding_global_y(
                 .map(|sl| (gy, sl.abs_diff(ln)))
         })
         .min_by_key(|&(_, d)| d)
-        .map(|(y, _)| y)
-        .or(Some(sec.start_y))
+        .map(|(y, _)| {
+            let actual_ln = continuous.line_to_source_line.get(y).copied().flatten();
+            (y, FindingJumpAccuracy::Approximate(actual_ln))
+        })
+        .or(Some((sec.start_y, FindingJumpAccuracy::FileHeader)))
 }
 
 struct TreeIssueEntry {
@@ -5166,10 +5656,33 @@ fn line_is_blank(line: &Line<'_>) -> bool {
     line.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
+fn format_key_code(key: &KeyEvent) -> String {
+    match key.code {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "Shift-Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::F(n) => format!("F{}", n),
+        other => format!("{:?}", other),
+    }
+}
+
 fn wrap_inline_text(text: &str, max_cols: usize) -> Vec<String> {
     let width = max_cols.max(16);
+    let expanded = text.replace('\t', "    ");
     let mut out = Vec::new();
-    for raw_line in text.lines() {
+    for raw_line in expanded.lines() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
             continue;
@@ -5229,7 +5742,7 @@ fn append_inline_card(
     max_cols: usize,
 ) {
     let box_w = max_cols.max(36);
-    let inner_w = box_w.saturating_sub(4).max(20);
+    let inner_w = box_w.saturating_sub(6).max(20);
 
     // Ensure a single blank spacer line above the card
     if !out.last().is_some_and(line_is_blank) {
@@ -5237,15 +5750,15 @@ fn append_inline_card(
     }
 
     let badge_w = UnicodeWidthStr::width(badge_label);
-    let top_title_budget = box_w.saturating_sub(6 + badge_w).max(8);
+    let top_title_budget = box_w.saturating_sub(8 + badge_w).max(8);
     let wrapped_titles = wrap_inline_text(title_text, top_title_budget);
     let first_title = wrapped_titles
         .first()
         .map(String::as_str)
         .unwrap_or("");
     let header_content_w = badge_w + UnicodeWidthStr::width(first_title);
-    // "  ┌─ " uses 3 box chars on left, plus " " + "─"*fill + "┐" on right
-    let fill = box_w.saturating_sub(5 + header_content_w);
+    // "  ┌─ " (5) + header_content_w + " " (1) + "─"*fill + "┐" (1) == box_w
+    let fill = box_w.saturating_sub(7 + header_content_w);
 
     out.push(Line::from(vec![
         Span::styled("  ┌─ ", Style::default().fg(accent)),
@@ -5299,7 +5812,7 @@ fn append_inline_card(
     }
 
     out.push(Line::from(Span::styled(
-        format!("  └{}┘", "─".repeat(box_w.saturating_sub(2))),
+        format!("  └{}┘", "─".repeat(box_w.saturating_sub(4))),
         Style::default().fg(accent),
     )));
     // Blank spacer line below the card

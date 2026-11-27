@@ -3,14 +3,14 @@ pub mod export;
 pub mod text_input;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::i18n;
@@ -51,6 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_revert_confirm(frame, app, root);
             draw_revert_double_confirm(frame, app, root);
         }
+        OverlayKind::ExportOverwriteConfirm => draw_export_overwrite_confirm(frame, app, root),
     }
 }
 
@@ -102,9 +103,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else if let Some(ai) = &app.ai_review {
         let short_prov = app
-            .resolved_ai_provider_id
+            .ai_review_provider_id
             .as_deref()
+            .or(app.resolved_ai_provider_id.as_deref())
             .unwrap_or(&app.active_ai_provider_id);
+        let stage_suffix = match app.ai_review_stage {
+            crate::ui::app::AiReviewStage::GroupingOnly => {
+                t!("header.stage_groups", locale = locale).into_owned()
+            }
+            crate::ui::app::AiReviewStage::DeepFailed => {
+                t!("header.stage_partial", locale = locale).into_owned()
+            }
+            _ => String::new(),
+        };
         let deep = if app.ai_deep_running {
             let (spin, elapsed) = spinner_frame(app.ai_started_at);
             Some(Span::styled(
@@ -122,7 +133,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         (
             Span::styled(
-                format!(" {} [{}] ", short_prov, ai.overall_risk.localized_label(locale)),
+                format!(
+                    " {} [{}]{} ",
+                    short_prov,
+                    ai.overall_risk.localized_label(locale),
+                    stage_suffix
+                ),
                 Style::default()
                     .fg(Color::Black)
                     .bg(risk_color(ai.overall_risk))
@@ -158,7 +174,32 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_default();
 
-    let project_label = format_project_label(app);
+    let project_label_raw = format_project_label(app);
+    let target_label = app.bundle.target.localized_label(locale);
+    let vcs_badge = format!("[{}]", app.bundle.vcs);
+    let total_w = area.width as usize;
+    let fixed_w = 10 /* " codeduck " */
+        + 1 /* " " */
+        + 2 /* "  " inside project badge */
+        + 1 /* " " */
+        + UnicodeWidthStr::width(vcs_badge.as_str())
+        + 1 /* " " */
+        + UnicodeWidthStr::width(target_label.as_str());
+    let avail_after_fixed = total_w.saturating_sub(fixed_w);
+    let proj_budget = if commit_hint.is_empty() {
+        avail_after_fixed.max(8)
+    } else {
+        avail_after_fixed.min(32).max(8)
+    };
+    let project_label = truncate_display_width(&project_label_raw, proj_budget);
+    let shown_proj_w = UnicodeWidthStr::width(project_label.as_str());
+    let hint_budget = avail_after_fixed.saturating_sub(shown_proj_w);
+    let shown_commit_hint = if !commit_hint.is_empty() && hint_budget >= 6 {
+        truncate_display_width(&commit_hint, hint_budget)
+    } else {
+        String::new()
+    };
+
     let line1 = Line::from(vec![
         Span::styled(
             " codeduck ",
@@ -177,19 +218,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("[{}]", app.bundle.vcs),
+            vcs_badge,
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
-            app.bundle.target.localized_label(locale),
+            target_label,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(commit_hint, Style::default().fg(Color::Gray)),
+        Span::styled(shown_commit_hint, Style::default().fg(Color::Gray)),
     ]);
 
     let view_mode = match app.tree_mode {
@@ -223,6 +264,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         line2_spans.push(Span::raw(" "));
         line2_spans.push(deep);
     }
+    let line2_width = |spans: &[Span<'_>]| -> usize {
+        spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
+    };
     let ai_disabled = app.active_ai_provider_id.eq_ignore_ascii_case("none")
         || app.active_ai_provider_id.eq_ignore_ascii_case("off");
     if !ai_disabled {
@@ -235,10 +282,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             app.config.ai_model.as_deref()
         };
         if let Some(m) = shown_model {
-            line2_spans.push(Span::styled(
-                t!("header.model_badge", locale = locale, model = m).into_owned(),
-                Style::default().fg(Color::Magenta),
-            ));
+            let model_str = t!("header.model_badge", locale = locale, model = m).into_owned();
+            let cur_w = line2_width(&line2_spans);
+            if cur_w + UnicodeWidthStr::width(model_str.as_str()) <= total_w {
+                line2_spans.push(Span::styled(model_str, Style::default().fg(Color::Magenta)));
+            } else if total_w.saturating_sub(cur_w) >= 12 {
+                let clipped = truncate_display_width(&model_str, total_w - cur_w);
+                line2_spans.push(Span::styled(clipped, Style::default().fg(Color::Magenta)));
+            }
         }
         let shown_effort = if app.ai_running {
             app.config
@@ -250,22 +301,29 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             app.config.ai_effort.as_deref()
         };
         if let Some(e) = shown_effort {
-            line2_spans.push(Span::styled(
-                t!("header.effort_badge", locale = locale, effort = e).into_owned(),
-                Style::default().fg(Color::Yellow),
-            ));
+            let effort_str = t!("header.effort_badge", locale = locale, effort = e).into_owned();
+            if line2_width(&line2_spans) + UnicodeWidthStr::width(effort_str.as_str()) <= total_w {
+                line2_spans.push(Span::styled(effort_str, Style::default().fg(Color::Yellow)));
+            }
         }
         if app.config.reuse_session && !app.ai_running && !app.ai_deep_running {
             if let Some(sid) = app
                 .active_ai_session_id
                 .as_ref()
+                .or_else(|| {
+                    app.resolved_ai_provider_id
+                        .as_deref()
+                        .and_then(|id| app.config.ai_sessions.get(id))
+                })
                 .or_else(|| app.config.ai_sessions.get(&app.active_ai_provider_id))
             {
                 let short: String = sid.chars().take(8).collect();
-                line2_spans.push(Span::styled(
-                    t!("header.session_badge", locale = locale, session = short).into_owned(),
-                    Style::default().fg(Color::Green),
-                ));
+                let sess_str =
+                    t!("header.session_badge", locale = locale, session = short).into_owned();
+                if line2_width(&line2_spans) + UnicodeWidthStr::width(sess_str.as_str()) <= total_w
+                {
+                    line2_spans.push(Span::styled(sess_str, Style::default().fg(Color::Green)));
+                }
             }
         }
     }
@@ -350,28 +408,30 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                 order,
                 ..
             } => {
+                let order_str = format!("{}. ", order);
+                let tag_str = format!(" [{}|{}]", category, risk_label);
+                let count_str = format!(" ({})", file_count);
+                let fixed_cols = 2
+                    + UnicodeWidthStr::width(order_str.as_str())
+                    + UnicodeWidthStr::width(tag_str.as_str())
+                    + UnicodeWidthStr::width(count_str.as_str());
+                let title_budget = (area.width as usize).saturating_sub(fixed_cols).max(8);
+                let shown_title = truncate_display_width(title, title_budget);
                 let line1 = Line::from(vec![
                     Span::styled(
-                        format!("{}. ", order),
+                        order_str,
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        title.clone(),
+                        shown_title,
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("[{}|{}]", category, risk_label),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(
-                        format!(" ({})", file_count),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(tag_str, Style::default().fg(Color::Cyan)),
+                    Span::styled(count_str, Style::default().fg(Color::DarkGray)),
                 ]);
 
                 if description.trim().is_empty() {
@@ -399,7 +459,15 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                     "M" | "R" => Color::Yellow,
                     _ => Color::Cyan,
                 };
-                let shown_path = truncate_path_middle(path, max_path_cols);
+                let finding_tag = if *finding_count > 0 {
+                    format!(" ({}!)", finding_count)
+                } else {
+                    String::new()
+                };
+                let path_budget = max_path_cols
+                    .saturating_sub(indent.len() + UnicodeWidthStr::width(finding_tag.as_str()))
+                    .max(8);
+                let shown_path = truncate_path_middle(path, path_budget);
                 let mut spans = vec![
                     Span::raw(indent),
                     Span::styled(
@@ -410,9 +478,9 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                     Span::raw(shown_path),
                 ];
-                if *finding_count > 0 {
+                if !finding_tag.is_empty() {
                     spans.push(Span::styled(
-                        format!(" ({}!)", finding_count),
+                        finding_tag,
                         Style::default()
                             .fg(Color::LightRed)
                             .add_modifier(Modifier::BOLD),
@@ -460,7 +528,24 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let total_rows = items.len();
+    let total_visual_rows: usize = app
+        .tree_rows
+        .iter()
+        .map(|row| match row {
+            TreeRow::GroupHeader { description, .. } if !description.trim().is_empty() => 2,
+            _ => 1,
+        })
+        .sum();
+    let cursor_visual_row: usize = app
+        .tree_rows
+        .iter()
+        .take(app.tree_cursor)
+        .map(|row| match row {
+            TreeRow::GroupHeader { description, .. } if !description.trim().is_empty() => 2,
+            _ => 1,
+        })
+        .sum();
+
     let mut state = ListState::default();
     if !app.tree_rows.is_empty() {
         state.select(Some(app.tree_cursor.min(app.tree_rows.len() - 1)));
@@ -484,8 +569,9 @@ fn draw_tree_pane(frame: &mut Frame, app: &App, area: Rect) {
         );
 
     frame.render_stateful_widget(list, area, &mut state);
-    if total_rows > area.height.saturating_sub(2) as usize {
-        let mut sb_state = ScrollbarState::new(total_rows).position(app.tree_cursor);
+    if total_visual_rows > area.height.saturating_sub(2) as usize {
+        let mut sb_state =
+            ScrollbarState::new(total_visual_rows).position(cursor_visual_row);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,
@@ -504,8 +590,13 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let (title, text) = if app.diff_loading {
         let target_label = app.bundle.target.localized_label(locale);
+        let (spin, _) = spinner_frame(app.diff_started_at);
         (
-            t!("diff.loading_title", locale = locale, target = target_label).into_owned(),
+            format!(
+                "{}{}",
+                spin,
+                t!("diff.loading_title", locale = locale, target = target_label)
+            ),
             Text::raw(
                 t!(
                     "diff.loading_body",
@@ -545,11 +636,13 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|ai| crate::ui::app::count_file_tree_issues(ai, active_path))
             .unwrap_or(0);
+        let path_budget = (area.width as usize).saturating_sub(28).max(16);
+        let shown_path = truncate_path_middle(active_path, path_budget);
         let title = if file_finding_cnt > 0 {
             t!(
                 "diff.pane_title_findings",
                 locale = locale,
-                path = active_path,
+                path = shown_path,
                 hunk = active_hunk_num,
                 total = hunk_total,
                 count = file_finding_cnt
@@ -559,7 +652,7 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             t!(
                 "diff.pane_title",
                 locale = locale,
-                path = active_path,
+                path = shown_path,
                 hunk = active_hunk_num,
                 total = hunk_total
             )
@@ -574,13 +667,14 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
         for (y, src_line) in app.continuous.lines[start..end].iter().enumerate() {
             let abs_y = start + y;
-            let mut spans = Vec::with_capacity(src_line.spans.len() + 1);
-            if abs_y == app.diff_cursor_y {
-                let cursor_bg = if focused {
-                    Color::Rgb(38, 48, 66)
-                } else {
-                    Color::Rgb(28, 32, 42)
-                };
+            let is_cursor = abs_y == app.diff_cursor_y;
+            let cursor_bg = if focused {
+                Color::Rgb(38, 48, 66)
+            } else {
+                Color::Rgb(28, 32, 42)
+            };
+            let mut spans = Vec::with_capacity(src_line.spans.len() + 2);
+            if is_cursor {
                 spans.push(Span::styled(
                     "▶ ",
                     Style::default()
@@ -588,13 +682,26 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                         .bg(cursor_bg)
                         .add_modifier(Modifier::BOLD),
                 ));
-                for sp in &src_line.spans {
-                    spans.push(Span::styled(sp.content.as_ref(), sp.style.bg(cursor_bg)));
-                }
             } else {
                 spans.push(Span::raw("  "));
-                for sp in &src_line.spans {
-                    spans.push(Span::styled(sp.content.as_ref(), sp.style));
+            }
+            for sp in &src_line.spans {
+                let base_style = if is_cursor
+                    && !(sp.style.bg.is_some() || sp.style.fg == Some(Color::Black))
+                {
+                    sp.style.bg(cursor_bg)
+                } else {
+                    sp.style
+                };
+                if app.search_query.is_empty() {
+                    spans.push(Span::styled(sp.content.as_ref(), base_style));
+                } else {
+                    append_search_highlighted_spans(
+                        &mut spans,
+                        sp.content.as_ref(),
+                        base_style,
+                        &app.search_query,
+                    );
                 }
             }
             visible_lines.push(Line::from(spans));
@@ -602,14 +709,15 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         (title, Text::from(visible_lines))
     };
 
-    // Since we already sliced `start..end` when rendering `continuous.lines`, vertical scroll is 0!
-    let v_scroll = if app.diff_loading || app.diff_error.is_some() || app.continuous.lines.is_empty() {
+    let placeholder_mode =
+        app.diff_loading || app.diff_error.is_some() || app.continuous.lines.is_empty();
+    let v_scroll = if placeholder_mode {
         app.diff_scroll_y.min(u16::MAX as usize) as u16
     } else {
         0
     };
 
-    let diff_widget = Paragraph::new(text)
+    let mut diff_widget = Paragraph::new(text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -617,6 +725,9 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                 .title(title),
         )
         .scroll((v_scroll, app.diff_scroll_x));
+    if placeholder_mode {
+        diff_widget = diff_widget.wrap(Wrap { trim: false });
+    }
 
     frame.render_widget(diff_widget, area);
     if !app.continuous.lines.is_empty()
@@ -678,7 +789,6 @@ fn append_qa_and_notes(lines: &mut Vec<Line<'static>>, app: &App, file_path: Opt
         )));
     } else if let Some(last_qa) = file_path
         .and_then(|fp| app.qa_history.iter().rev().find(|q| q.file.as_deref() == Some(fp)))
-        .or_else(|| app.qa_history.last())
     {
         lines.push(Line::raw(""));
         let tag = last_qa
@@ -764,11 +874,16 @@ fn build_inspector_content(app: &App) -> (String, Vec<Line<'static>>) {
 
 fn draw_passive_info_pane_with(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: Rect,
     title: String,
     lines: Vec<Line<'static>>,
 ) {
+    let inner_h = area.height.saturating_sub(2);
+    let wrapped_total = estimate_wrapped_line_count(&lines, area.width.saturating_sub(2));
+    let max_scroll = wrapped_total.saturating_sub(inner_h);
+    app.inspector_scroll_y = app.inspector_scroll_y.min(max_scroll);
+
     let widget = Paragraph::new(lines)
         .block(
             Block::default()
@@ -780,6 +895,53 @@ fn draw_passive_info_pane_with(
         .wrap(Wrap { trim: false });
 
     frame.render_widget(widget, area);
+    if wrapped_total > inner_h {
+        let mut sb_state =
+            ScrollbarState::new(wrapped_total as usize).position(app.inspector_scroll_y as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut sb_state,
+        );
+    }
+}
+
+fn append_group_details_lines(
+    lines: &mut Vec<Line<'static>>,
+    locale: &str,
+    grp: &crate::model::ReviewGroup,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("#{}. {} ", grp.review_order, grp.title),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("[{} | {}]", grp.category, grp.risk_level.localized_label(locale)),
+            Style::default()
+                .fg(risk_color(grp.risk_level))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if !grp.description.is_empty() {
+        push_multiline(
+            lines,
+            &t!("inspector.purpose_prefix", locale = locale),
+            &grp.description,
+            Style::default().fg(Color::Cyan),
+        );
+    }
+    if !grp.key_points.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t!("inspector.checkpoints_title", locale = locale).into_owned(),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )));
+        for kp in &grp.key_points {
+            lines.push(Line::from(format!("  • {}", kp)));
+        }
+    }
 }
 
 fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
@@ -803,37 +965,7 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
     }
 
     if let Some(grp) = app.active_group_in_tree() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("#{}. {} ", grp.review_order, grp.title),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("[{} | {}]", grp.category, grp.risk_level.localized_label(locale)),
-                Style::default()
-                    .fg(risk_color(grp.risk_level))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        if !grp.description.is_empty() {
-            push_multiline(
-                &mut lines,
-                &t!("inspector.purpose_prefix", locale = locale),
-                &grp.description,
-                Style::default().fg(Color::Cyan),
-            );
-        }
-        if !grp.key_points.is_empty() {
-            lines.push(Line::from(Span::styled(
-                t!("inspector.checkpoints_title", locale = locale).into_owned(),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )));
-            for kp in &grp.key_points {
-                lines.push(Line::from(format!("  • {}", kp)));
-            }
-        }
+        append_group_details_lines(&mut lines, locale, grp);
     }
 
     // If cursor is on a FileItem or FindingItem, also show file-level summary & selected finding
@@ -942,6 +1074,14 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
     let title = t!("inspector.code_inspector", locale = locale, loc = loc_label).into_owned();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    if let Some(err) = &app.ai_error {
+        lines.push(Line::from(Span::styled(
+            t!("inspector.analysis_error", locale = locale, err = err).into_owned(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::raw(""));
+    }
+
     if app.ai_running
         || (app.ai_deep_running && hunk_analysis.is_none() && findings.is_empty())
     {
@@ -1001,6 +1141,30 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         append_finding_lines(&mut lines, locale, &findings);
     }
 
+    if let Some(grp) = app.active_group_for_current_file() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        append_group_details_lines(&mut lines, locale, grp);
+    } else if let Some(ai) = &app.ai_review {
+        if lines.is_empty() && !ai.summary.is_empty() {
+            push_multiline(
+                &mut lines,
+                &t!("inspector.summary_prefix", locale = locale),
+                &ai.summary,
+                Style::default().fg(Color::White),
+            );
+            if !ai.review_strategy.is_empty() {
+                push_multiline(
+                    &mut lines,
+                    &t!("inspector.strategy_prefix", locale = locale),
+                    &ai.review_strategy,
+                    Style::default().fg(Color::Yellow),
+                );
+            }
+        }
+    }
+
     append_qa_and_notes(&mut lines, app, fd.map(|f| f.path.as_str()));
 
     if lines.is_empty() {
@@ -1022,24 +1186,26 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let pending = app
         .pending_key
-        .map(|k| format!(" [{}]", k))
+        .map(|k| format!("[{}] ", k))
         .unwrap_or_default();
 
-    let mut status_spans = vec![
-        Span::styled(
-            mode_label.0,
-            Style::default()
-                .fg(Color::Black)
-                .bg(mode_label.1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" [{}]{} ", app.focus.label(locale), pending),
+    let mut status_spans = vec![Span::styled(
+        mode_label.0,
+        Style::default()
+            .fg(Color::Black)
+            .bg(mode_label.1)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !pending.is_empty() {
+        status_spans.push(Span::styled(
+            format!(" {}", pending),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ),
-    ];
+        ));
+    } else {
+        status_spans.push(Span::raw(" "));
+    }
 
     if app.ai_running || app.ai_deep_running || app.ai_followup_running {
         let (spin, elapsed) = spinner_frame(app.ai_started_at);
@@ -1060,37 +1226,79 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
-        let stage = if app.ai_followup_running && app.ai_progress_stage.is_empty() {
-            t!("inspector.querying_ai", locale = locale).into_owned()
+        let fresh_user_status = app
+            .user_status_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+            && !app.status_message.is_empty();
+        if fresh_user_status {
+            status_spans.push(Span::styled(
+                app.status_message.clone(),
+                Style::default().fg(Color::Cyan),
+            ));
         } else {
-            app.ai_progress_stage.clone()
-        };
-        status_spans.push(Span::styled(stage, Style::default().fg(Color::White)));
+            let stage = if app.ai_followup_running && app.ai_progress_stage.is_empty() {
+                t!("inspector.querying_ai", locale = locale).into_owned()
+            } else {
+                app.ai_progress_stage.clone()
+            };
+            status_spans.push(Span::styled(stage, Style::default().fg(Color::White)));
+        }
     } else {
         status_spans.push(Span::raw(&app.status_message));
     }
 
     let status_line = Line::from(status_spans);
 
-    let avail_w = area.width.saturating_sub(28) as usize;
-    let edited = || text_input::format_with_cursor(&app.input_buffer, app.input_cursor, avail_w);
-    let cmd_line = match app.input_mode {
-        InputMode::Normal => Line::from(Span::styled(
-            t!("footer.normal_hints", locale = locale).into_owned(),
-            Style::default().fg(Color::DarkGray),
-        )),
-        InputMode::Command => Line::from(format!(":{}", edited())),
-        InputMode::Search => Line::from(format!("/{}", edited())),
-        InputMode::AddNote => Line::from(format!("{}{}", t!("footer.note_prompt", locale = locale), edited())),
-        InputMode::AskAi => Line::from(format!("{}{}", t!("footer.ask_prompt", locale = locale), edited())),
+    let (cmd_line, ime_cursor_x) = match app.input_mode {
+        InputMode::Normal => {
+            let full = t!("footer.normal_hints", locale = locale).into_owned();
+            let chosen = if UnicodeWidthStr::width(full.as_str()) <= area.width as usize {
+                full
+            } else {
+                let compact = t!("footer.normal_hints_compact", locale = locale).into_owned();
+                if UnicodeWidthStr::width(compact.as_str()) <= area.width as usize {
+                    compact
+                } else {
+                    truncate_display_width(&compact, area.width as usize)
+                }
+            };
+            (
+                Line::from(Span::styled(chosen, Style::default().fg(Color::DarkGray))),
+                None,
+            )
+        }
+        InputMode::Command | InputMode::Search | InputMode::AddNote | InputMode::AskAi => {
+            let prompt: String = match app.input_mode {
+                InputMode::Command => ":".to_string(),
+                InputMode::Search => "/".to_string(),
+                InputMode::AddNote => t!("footer.note_prompt", locale = locale).into_owned(),
+                InputMode::AskAi => t!("footer.ask_prompt", locale = locale).into_owned(),
+                InputMode::Normal => unreachable!(),
+            };
+            let prompt_w = UnicodeWidthStr::width(prompt.as_str());
+            let avail_w = (area.width as usize).saturating_sub(prompt_w).max(1);
+            let (edited, cur_col) =
+                text_input::format_with_cursor_and_col(&app.input_buffer, app.input_cursor, avail_w);
+            (
+                Line::from(format!("{}{}", prompt, edited)),
+                Some((prompt_w as u16).saturating_add(cur_col)),
+            )
+        }
     };
 
     let footer = Paragraph::new(vec![status_line, cmd_line]);
     frame.render_widget(footer, area);
+    if let Some(rel_x) = ime_cursor_x {
+        if area.height >= 2 && area.width > 0 {
+            let abs_x = area.x.saturating_add(rel_x).min(area.x + area.width - 1);
+            frame.set_cursor_position(Position::new(abs_x, area.y + 1));
+        }
+    }
 }
 
-fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
-    let locale = app.locale();
+fn draw_help_modal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let locale = app.locale().to_string();
+    let locale = locale.as_str();
     let popup = centered_rect(78, 84, area);
     frame.render_widget(Clear, popup);
 
@@ -1138,6 +1346,10 @@ fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     )));
 
+    let inner_h = popup.height.saturating_sub(2);
+    let wrapped_total = estimate_wrapped_line_count(&help_text, popup.width.saturating_sub(2));
+    app.help_scroll_y = app.help_scroll_y.min(wrapped_total.saturating_sub(inner_h));
+
     let widget = Paragraph::new(help_text)
         .block(
             Block::default()
@@ -1148,6 +1360,15 @@ fn draw_help_modal(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((app.help_scroll_y, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, popup);
+    if wrapped_total > inner_h {
+        let mut sb_state =
+            ScrollbarState::new(wrapped_total as usize).position(app.help_scroll_y as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            popup,
+            &mut sb_state,
+        );
+    }
 }
 
 fn draw_settings_modal(frame: &mut Frame, app: &App, area: Rect) {
@@ -1166,11 +1387,20 @@ fn draw_settings_modal(frame: &mut Frame, app: &App, area: Rect) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.codeduck/configs.toml".to_string());
 
+    let settings_title = if app.settings_dirty_mask.any() {
+        format!(
+            " {}{} ",
+            t!("settings.title", locale = locale).trim(),
+            t!("settings.unsaved_tag", locale = locale)
+        )
+    } else {
+        t!("settings.title", locale = locale).into_owned()
+    };
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .border_style(Style::default().fg(Color::Cyan))
-        .title(t!("settings.title", locale = locale).into_owned());
+        .title(settings_title);
     let inner = outer_block.inner(popup);
     frame.render_widget(outer_block, popup);
 
@@ -1285,11 +1515,11 @@ fn draw_settings_modal(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_stateful_widget(list, sections[0], &mut state);
 
-    let status_line = if let Some(msg) = &app.settings_status {
+    let status_line = if let Some((msg, is_err)) = &app.settings_status {
         Line::from(Span::styled(
             msg.clone(),
             Style::default()
-                .fg(Color::Green)
+                .fg(if *is_err { Color::Red } else { Color::Green })
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -1314,7 +1544,37 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(76, 70, area);
     frame.render_widget(Clear, popup);
 
+    let title = if app.commits_loading {
+        let (spin, _) = spinner_frame(app.commits_started_at);
+        format!(
+            " {}{}",
+            spin,
+            t!("commit_picker.title_loading", locale = locale).trim_start()
+        )
+    } else {
+        t!("commit_picker.title_ready", locale = locale).into_owned()
+    };
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let err_h: u16 = if app.commits_error.is_some() { 1 } else { 0 };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(err_h)])
+        .split(inner);
+
+    let is_wc = matches!(app.bundle.target, crate::model::DiffTarget::Uncommitted);
     let mut items = vec![ListItem::new(Line::from(vec![
+        Span::styled(
+            if is_wc { "* " } else { "  " },
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             t!("commit_picker.wc_badge", locale = locale).into_owned(),
             Style::default()
@@ -1324,61 +1584,91 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(t!("commit_picker.wc_label", locale = locale).into_owned()),
     ]))];
 
+    let inner_w = sections[0].width.saturating_sub(2) as usize;
     for ci in &app.commits_cache {
-        let msg = ci.message.lines().next().unwrap_or("");
+        let is_cur = matches!(
+            &app.bundle.target,
+            crate::model::DiffTarget::Commit(rev) if rev == &ci.revision
+        );
+        let rev_tag = format!("[{}] ", ci.revision);
+        let meta = if ci.date.is_empty() {
+            format!(" — {}", ci.author)
+        } else {
+            format!(" — {} · {}", ci.author, ci.date)
+        };
+        let used = 2 + UnicodeWidthStr::width(rev_tag.as_str()) + UnicodeWidthStr::width(meta.as_str());
+        let msg_budget = inner_w.saturating_sub(used).max(12);
+        let msg = truncate_display_width(ci.message.lines().next().unwrap_or(""), msg_budget);
         items.push(ListItem::new(Line::from(vec![
             Span::styled(
-                format!("[{}] ", ci.revision),
+                if is_cur { "* " } else { "  " },
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                rev_tag,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("{} ", msg)),
-            Span::styled(
-                format!("— {}", ci.author),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::raw(msg),
+            Span::styled(meta, Style::default().fg(Color::DarkGray)),
         ])));
     }
 
     let mut state = ListState::default();
     state.select(Some(app.commit_picker_cursor.min(items.len().saturating_sub(1))));
-    let title = if app.commits_loading {
-        t!("commit_picker.title_loading", locale = locale).into_owned()
-    } else {
-        t!("commit_picker.title_ready", locale = locale).into_owned()
-    };
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(title),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(45, 60, 80))
-                .add_modifier(Modifier::BOLD),
-        );
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Rgb(45, 60, 80))
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, sections[0], &mut state);
 
-    frame.render_stateful_widget(list, popup, &mut state);
+    if let Some(err) = &app.commits_error {
+        let err_msg = truncate_display_width(err, sections[1].width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                err_msg,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))),
+            sections[1],
+        );
+    }
 }
 
 fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
     let locale = app.locale();
-    let popup = centered_rect(60, 45, area);
+    let popup = centered_rect(64, 48, area);
     frame.render_widget(Clear, popup);
 
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(t!("ai_picker.title", locale = locale).into_owned());
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(1)])
+        .split(inner);
+
     let active_tag = t!("ai_picker.active_tag", locale = locale);
+    let is_off_active = app.active_ai_provider_id.eq_ignore_ascii_case("none")
+        || app.active_ai_provider_id.eq_ignore_ascii_case("off");
     let mut items: Vec<ListItem> = app
         .available_providers
         .iter()
         .map(|p| {
-            let active = if app
-                .resolved_ai_provider_id
-                .as_deref()
-                .unwrap_or(&app.active_ai_provider_id)
-                == p.id
+            let active = if !is_off_active
+                && app
+                    .resolved_ai_provider_id
+                    .as_deref()
+                    .unwrap_or(&app.active_ai_provider_id)
+                    == p.id
             {
                 active_tag.as_ref()
             } else {
@@ -1397,27 +1687,44 @@ fn draw_ai_picker(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            t!("ai_picker.no_cli_hint", locale = locale).into_owned(),
+            Style::default().fg(Color::Yellow),
+        ))));
+    }
+
+    let off_active = if is_off_active { active_tag.as_ref() } else { "" };
     items.push(ListItem::new(Line::from(Span::styled(
-        t!("ai_picker.off_label", locale = locale).into_owned(),
+        format!("{}{}", t!("ai_picker.off_label", locale = locale), off_active),
         Style::default().fg(Color::Gray),
     ))));
 
     let mut state = ListState::default();
-    state.select(Some(app.ai_picker_cursor));
+    let total = app.available_providers.len() + 1;
+    let selected = if app.available_providers.is_empty() && app.ai_picker_cursor == 0 {
+        1
+    } else if app.available_providers.is_empty() {
+        1
+    } else {
+        app.ai_picker_cursor.min(total.saturating_sub(1))
+    };
+    state.select(Some(selected));
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(t!("ai_picker.title", locale = locale).into_owned()),
-        )
         .highlight_style(
             Style::default()
                 .bg(Color::Rgb(45, 60, 80))
                 .add_modifier(Modifier::BOLD),
         );
 
-    frame.render_stateful_widget(list, popup, &mut state);
+    frame.render_stateful_widget(list, sections[0], &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            t!("ai_picker.footer_hints", locale = locale).into_owned(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))),
+        sections[1],
+    );
 }
 
 fn commit_msg_box_title<'a>(
@@ -1487,12 +1794,13 @@ fn render_commit_msg_box(
             || !params.stream_logs.is_empty()
             || !params.stream_thinking.is_empty()
             || !params.stream_text.is_empty());
-    let msg_lines: Vec<Line<'static>> = if params.editing {
-        vec![Line::from(text_input::format_with_cursor(
+    let (msg_lines, ime_cursor_col): (Vec<Line<'static>>, Option<u16>) = if params.editing {
+        let (formatted, col) = text_input::format_with_cursor_and_col(
             params.message,
             params.cursor,
-            area.width.saturating_sub(4) as usize,
-        ))]
+            area.width.saturating_sub(4).max(1) as usize,
+        );
+        (vec![Line::from(formatted)], Some(col))
     } else {
         let mut lines = vec![Line::from(Span::styled(
             params.message.to_string(),
@@ -1516,7 +1824,7 @@ fn render_commit_msg_box(
                 3,
             );
         }
-        lines
+        (lines, None)
     };
     let msg_widget = Paragraph::new(msg_lines)
         .block(
@@ -1532,6 +1840,16 @@ fn render_commit_msg_box(
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(msg_widget, area);
+    if let Some(col) = ime_cursor_col {
+        if area.height >= 3 && area.width > 4 {
+            let abs_x = area
+                .x
+                .saturating_add(2)
+                .saturating_add(col)
+                .min(area.x + area.width - 2);
+            frame.set_cursor_position(Position::new(abs_x, area.y + 1));
+        }
+    }
 }
 
 fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
@@ -1577,13 +1895,32 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         4
     };
-    let footer_h: u16 = if app.commit_error.is_some() { 2 } else { 1 };
+    let locale = app.locale();
+    let step1_key = if app.commit_editing_msg {
+        "commit.step1_actions_editing"
+    } else if has_ext && has_main_box {
+        "commit.step1_actions_split"
+    } else {
+        "commit.step1_actions"
+    };
+    let mut footer_lines = Vec::new();
+    if let Some(err) = &app.commit_error {
+        footer_lines.push(Line::from(Span::styled(
+            t!("commit.footer_error", locale = locale, err = err).into_owned(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    footer_lines.push(Line::from(Span::styled(
+        t!(step1_key, locale = locale).into_owned(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    let step1_est_inner_w = modal_step1_rect(area, 16).width.saturating_sub(4);
+    let footer_h: u16 = estimate_wrapped_line_count(&footer_lines, step1_est_inner_w).clamp(1, 5);
     let desired_list_h = (app.commit_rows.len() as u16 + 2).clamp(5, 22);
     let desired_h = 2 + desired_list_h + main_box_h + ext_box_h + footer_h;
     let popup = modal_step1_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
-    let locale = app.locale();
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
@@ -1671,7 +2008,7 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 ];
                 if f.is_external {
                     spans.push(Span::styled(
-                        " [external]",
+                        t!("commit.external_tag", locale = locale).into_owned(),
                         Style::default().fg(Color::Magenta),
                     ));
                 }
@@ -1787,22 +2124,6 @@ fn draw_commit_confirm(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // 3. Footer (error only if any + action bar)
-    let mut footer_lines = Vec::new();
-    if let Some(err) = &app.commit_error {
-        footer_lines.push(Line::from(Span::styled(
-            t!("commit.footer_error", locale = locale, err = err).into_owned(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )));
-    }
-    let step1_key = if has_ext && has_main_box {
-        "commit.step1_actions_split"
-    } else {
-        "commit.step1_actions"
-    };
-    footer_lines.push(Line::from(Span::styled(
-        t!(step1_key, locale = locale).into_owned(),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
     frame.render_widget(
         Paragraph::new(footer_lines).wrap(Wrap { trim: false }),
         footer_sec,
@@ -1859,8 +2180,9 @@ fn render_double_confirm_msg_box(
     );
 }
 
-fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let locale = app.locale();
+fn draw_commit_double_confirm(frame: &mut Frame, app: &mut App, area: Rect) {
+    let locale = app.locale().to_string();
+    let locale = locale.as_str();
     let selected_files: Vec<_> = app.commit_files.iter().filter(|f| f.included).collect();
     let main_cnt = selected_files.iter().filter(|f| !f.is_external).count();
     let ext_cnt = selected_files.iter().filter(|f| f.is_external).count();
@@ -1982,15 +2304,43 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let status_h: u16 = if app.commit_executing
-        || app.commit_error.is_some()
-        || app.commit_hint_notice.is_some()
-    {
-        1
+    let est_w = modal_step2_rect(area, 16).width.saturating_sub(4);
+    let status_line: Option<Line<'static>> = if app.commit_executing {
+        let (spin, _) = spinner_frame(app.commit_exec_started_at);
+        Some(Line::from(Span::styled(
+            format!("{} {}", spin, t!("commit.committing", locale = locale)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )))
+    } else if let Some(err) = &app.commit_error {
+        Some(Line::from(Span::styled(
+            t!("commit.commit_failed", locale = locale, err = err).into_owned(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )))
     } else {
-        0
+        app.commit_hint_notice.as_ref().map(|hint| {
+            Line::from(Span::styled(
+                t!("commit.hint_prefix", locale = locale, hint = hint).into_owned(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+        })
     };
-    let top_line_cnt = top_lines.len().min(6) as u16;
+    let status_h: u16 = status_line
+        .as_ref()
+        .map(|l| estimate_wrapped_line_count(std::slice::from_ref(l), est_w).clamp(1, 3))
+        .unwrap_or(0);
+    let action_bar = Line::from(Span::styled(
+        if app.any_commit_msg_generating() {
+            t!("commit.step2_actions_wait", locale = locale).into_owned()
+        } else {
+            t!("commit.step2_actions", locale = locale).into_owned()
+        },
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+    let action_h: u16 =
+        estimate_wrapped_line_count(std::slice::from_ref(&action_bar), est_w).clamp(1, 3);
+    let top_line_cnt = estimate_wrapped_line_count(&top_lines, est_w).clamp(2, 10);
     let main_msg_h: u16 = if !has_main_box {
         0
     } else if app.commit_main.generating {
@@ -2009,7 +2359,7 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         4
     };
-    let desired_h = 2 + top_line_cnt + main_msg_h + ext_msg_h + status_h + 1;
+    let desired_h = 2 + top_line_cnt + main_msg_h + ext_msg_h + status_h + action_h;
     let popup = modal_step2_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
@@ -2030,17 +2380,31 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         constraints.push(Constraint::Length(ext_msg_h));
     }
     constraints.push(Constraint::Length(status_h));
-    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(action_h));
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
 
+    let top_total = estimate_wrapped_line_count(&top_lines, sections[0].width);
+    let top_max_scroll = top_total.saturating_sub(sections[0].height);
+    app.modal_confirm_scroll_y = app.modal_confirm_scroll_y.min(top_max_scroll);
     frame.render_widget(
-        Paragraph::new(top_lines).wrap(Wrap { trim: false }),
+        Paragraph::new(top_lines)
+            .scroll((app.modal_confirm_scroll_y, 0))
+            .wrap(Wrap { trim: false }),
         sections[0],
     );
+    if top_total > sections[0].height {
+        let mut sb_state =
+            ScrollbarState::new(top_total as usize).position(app.modal_confirm_scroll_y as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            sections[0],
+            &mut sb_state,
+        );
+    }
 
     let prov = app
         .resolved_ai_provider_id
@@ -2097,38 +2461,15 @@ fn draw_commit_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let actions_sec = sections[sec_idx + 1];
 
     if status_h > 0 {
-        let status_widget = if app.commit_executing {
-            Paragraph::new(Line::from(Span::styled(
-                t!("commit.committing", locale = locale).into_owned(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )))
-        } else if let Some(err) = &app.commit_error {
-            Paragraph::new(Line::from(Span::styled(
-                t!("commit.commit_failed", locale = locale, err = err).into_owned(),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )))
-        } else if let Some(hint) = &app.commit_hint_notice {
-            Paragraph::new(Line::from(Span::styled(
-                t!("commit.hint_prefix", locale = locale, hint = hint).into_owned(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )))
-        } else {
-            Paragraph::new(Line::raw(""))
-        };
-        frame.render_widget(status_widget.wrap(Wrap { trim: false }), status_sec);
+        if let Some(line) = status_line {
+            frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), status_sec);
+        }
     }
 
-    let action_bar = Line::from(Span::styled(
-        if app.any_commit_msg_generating() {
-            t!("commit.step2_actions_wait", locale = locale).into_owned()
-        } else {
-            t!("commit.step2_actions", locale = locale).into_owned()
-        },
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(action_bar), actions_sec);
+    frame.render_widget(
+        Paragraph::new(action_bar).wrap(Wrap { trim: false }),
+        actions_sec,
+    );
 }
 
 fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
@@ -2170,9 +2511,34 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
     )
     .into_owned();
 
+    let step1_est_w = modal_step1_rect(area, 16).width.saturating_sub(4);
+    let summary_h = estimate_wrapped_line_count(
+        &[Line::from(summary_text.clone())],
+        step1_est_w,
+    )
+    .clamp(1, 3);
+    let mut footer = Vec::new();
+    if let Some(err) = &app.revert_error {
+        footer.push(Line::from(Span::styled(
+            t!("commit.footer_error", locale = locale, err = err).into_owned(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    let mut action_hint = if multi_file {
+        t!("revert.step1_actions_multi", locale = locale).into_owned()
+    } else {
+        t!("revert.step1_actions_single", locale = locale).into_owned()
+    };
+    if app.revert_can_toggle_group {
+        action_hint.push_str(t!("revert.step1_toggle_scope", locale = locale).as_ref());
+    }
+    footer.push(Line::from(Span::styled(
+        action_hint,
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    let footer_h = estimate_wrapped_line_count(&footer, step1_est_w).clamp(1, 5);
     let desired_list_h = (app.revert_files.len() as u16 + 2).clamp(5, 22);
-    let footer_h: u16 = if app.revert_error.is_some() { 2 } else { 1 };
-    let desired_h = 2 + 1 + desired_list_h + footer_h;
+    let desired_h = 2 + summary_h + desired_list_h + footer_h;
     let popup = modal_step1_rect(area, desired_h);
     frame.render_widget(Clear, popup);
 
@@ -2195,9 +2561,9 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),        // Single crisp summary line
-            Constraint::Min(4),           // Clean file list
-            Constraint::Length(footer_h), // Error (optional) + action bar
+            Constraint::Length(summary_h),
+            Constraint::Min(4),
+            Constraint::Length(footer_h),
         ])
         .split(inner);
 
@@ -2205,7 +2571,8 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(Span::styled(
             summary_text,
             Style::default().fg(Color::Yellow),
-        ))),
+        )))
+        .wrap(Wrap { trim: false }),
         sections[0],
     );
 
@@ -2216,8 +2583,12 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .map(|f| {
             let check = if f.included { "[x]" } else { "[ ]" };
             let ext_len = if f.is_external { 11 } else { 0 };
+            let raw_display = match &f.old_path {
+                Some(old) => format!("{} -> {}", old, f.path),
+                None => f.path.clone(),
+            };
             let shown_path = truncate_path_middle(
-                &f.path,
+                &raw_display,
                 inner_list_w.saturating_sub(10 + ext_len).max(16),
             );
             let mut spans = vec![
@@ -2237,7 +2608,7 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
             ];
             if f.is_external {
                 spans.push(Span::styled(
-                    " [external]",
+                    t!("commit.external_tag", locale = locale).into_owned(),
                     Style::default().fg(Color::Magenta),
                 ));
             }
@@ -2275,28 +2646,12 @@ fn draw_revert_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_stateful_widget(list, sections[1], &mut state);
-
-    let mut footer = Vec::new();
-    if let Some(err) = &app.revert_error {
-        footer.push(Line::from(Span::styled(
-            t!("commit.footer_error", locale = locale, err = err).into_owned(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )));
-    }
-    let action_hint = if multi_file {
-        t!("revert.step1_actions_multi", locale = locale).into_owned()
-    } else {
-        t!("revert.step1_actions_single", locale = locale).into_owned()
-    };
-    footer.push(Line::from(Span::styled(
-        action_hint,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
     frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), sections[2]);
 }
 
-fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let locale = app.locale();
+fn draw_revert_double_confirm(frame: &mut Frame, app: &mut App, area: Rect) {
+    let locale = app.locale().to_string();
+    let locale = locale.as_str();
     let selected: Vec<_> = app.revert_files.iter().filter(|f| f.included).collect();
     let has_added = selected.iter().any(|f| f.badge == "A");
     let ext_cnt = selected.iter().filter(|f| f.is_external).count();
@@ -2306,16 +2661,38 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
         t!("revert.note_default", locale = locale)
     };
 
-    let status_h: u16 = if app.revert_executing || app.revert_error.is_some() {
-        1
+    let est_w = modal_step2_rect(area, 12).width.saturating_sub(4);
+    let status_line: Option<Line<'static>> = if app.revert_executing {
+        let (spin, _) = spinner_frame(app.revert_exec_started_at);
+        Some(Line::from(Span::styled(
+            format!("{} {}", spin, t!("revert.reverting", locale = locale)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )))
     } else {
-        0
+        app.revert_error.as_ref().map(|err| {
+            Line::from(Span::styled(
+                t!("revert.revert_failed", locale = locale, err = err).into_owned(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))
+        })
     };
+    let status_h: u16 = status_line
+        .as_ref()
+        .map(|l| estimate_wrapped_line_count(std::slice::from_ref(l), est_w).clamp(1, 3))
+        .unwrap_or(0);
+    let action_bar = Line::from(Span::styled(
+        t!("revert.step2_actions", locale = locale).into_owned(),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    ));
+    let action_h: u16 =
+        estimate_wrapped_line_count(std::slice::from_ref(&action_bar), est_w).clamp(1, 3);
+    let has_rename_note = u16::from(selected.iter().any(|f| f.old_path.is_some()));
     let preview_cnt = selected.len().min(3) as u16;
     let has_more = u16::from(selected.len() > 3);
-    let scope_line_cnt = 1u16; // 1 warning + 1 blank + 1 scope + preview + (more)
-    let body_h = 2 + scope_line_cnt + preview_cnt + has_more;
-    let desired_h = 2 + body_h + status_h + 1 + 1;
+    let body_h = 2 + has_rename_note + 1 + preview_cnt + has_more;
+    let desired_h = 2 + body_h + status_h + action_h + 1;
     let popup = modal_step2_rect(area, desired_h);
     let path_budget = (popup.width as usize).saturating_sub(20).max(16);
 
@@ -2330,8 +2707,15 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
             .into_owned(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
-        Line::raw(""),
-        Line::from(vec![
+    ];
+    if selected.iter().any(|f| f.old_path.is_some()) {
+        lines.push(Line::from(Span::styled(
+            t!("revert.note_rename", locale = locale).into_owned(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
             Span::styled(
                 t!("revert.target_label", locale = locale).into_owned(),
                 Style::default().fg(Color::Gray),
@@ -2350,12 +2734,19 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 },
                 Style::default().fg(Color::Magenta),
             ),
-        ]),
-    ];
+        ]));
     for f in selected.iter().take(3) {
-        let ext_tag = if f.is_external { " [external]" } else { "" };
+        let ext_tag = if f.is_external {
+            t!("commit.external_tag", locale = locale).into_owned()
+        } else {
+            String::new()
+        };
+        let raw_display = match &f.old_path {
+            Some(old) => format!("{} -> {}", old, f.path),
+            None => f.path.clone(),
+        };
         let shown_path = truncate_path_middle(
-            &f.path,
+            &raw_display,
             path_budget.saturating_sub(ext_tag.len()).max(14),
         );
         lines.push(Line::from(format!("  • [{}] {}{}", f.badge, shown_path, ext_tag)));
@@ -2381,42 +2772,76 @@ fn draw_revert_double_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(4),           // Concise summary + up to 3 sample files
+            Constraint::Min(4),           // Summary + up to 3 sample files (scrollable)
             Constraint::Length(status_h), // Active status / error only
-            Constraint::Length(1),        // Action bar
+            Constraint::Length(action_h), // Action bar
         ])
         .split(inner);
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sections[0]);
+    let body_total = estimate_wrapped_line_count(&lines, sections[0].width);
+    let body_max_scroll = body_total.saturating_sub(sections[0].height);
+    app.modal_confirm_scroll_y = app.modal_confirm_scroll_y.min(body_max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((app.modal_confirm_scroll_y, 0))
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    if body_total > sections[0].height {
+        let mut sb_state =
+            ScrollbarState::new(body_total as usize).position(app.modal_confirm_scroll_y as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            sections[0],
+            &mut sb_state,
+        );
+    }
 
     if status_h > 0 {
-        if app.revert_executing {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    t!("revert.reverting", locale = locale).into_owned(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))),
-                sections[1],
-            );
-        } else if let Some(err) = &app.revert_error {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    t!("revert.revert_failed", locale = locale, err = err).into_owned(),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )))
-                .wrap(Wrap { trim: false }),
-                sections[1],
-            );
+        if let Some(line) = status_line {
+            frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), sections[1]);
         }
     }
 
-    let action_bar = Line::from(Span::styled(
-        t!("revert.step2_actions", locale = locale).into_owned(),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(action_bar), sections[2]);
+    frame.render_widget(
+        Paragraph::new(action_bar).wrap(Wrap { trim: false }),
+        sections[2],
+    );
+}
+
+fn draw_export_overwrite_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let locale = app.locale();
+    let path_str = app
+        .export_pending_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let popup = modal_step2_rect(area, 9);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow))
+        .padding(Padding::horizontal(1))
+        .title(t!("export.overwrite_title", locale = locale).into_owned());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+    let body = t!("export.overwrite_prompt", locale = locale, path = path_str).into_owned();
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), sections[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            t!("export.overwrite_actions", locale = locale).into_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        sections[1],
+    );
 }
 
 fn pane_border_style(focused: bool) -> Style {
@@ -2433,6 +2858,42 @@ pub fn pad_display_width(s: &str, target_cols: usize) -> String {
         s.to_string()
     } else {
         format!("{}{}", s, " ".repeat(target_cols - w))
+    }
+}
+
+fn append_search_highlighted_spans<'a>(
+    dst: &mut Vec<Span<'a>>,
+    text: &'a str,
+    base_style: Style,
+    query: &str,
+) {
+    let q_lower = query.to_lowercase();
+    if q_lower.is_empty() || text.is_empty() {
+        dst.push(Span::styled(text, base_style));
+        return;
+    }
+    let hay_lower = text.to_lowercase();
+    if hay_lower.len() != text.len() {
+        // Fallback when case folding shifts UTF-8 byte offsets
+        dst.push(Span::styled(text, base_style));
+        return;
+    }
+    let hl_style = base_style
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut pos = 0usize;
+    while let Some(rel) = hay_lower[pos..].find(&q_lower) {
+        let start = pos + rel;
+        let end = start + q_lower.len();
+        if start > pos {
+            dst.push(Span::styled(&text[pos..start], base_style));
+        }
+        dst.push(Span::styled(&text[start..end], hl_style));
+        pos = end;
+    }
+    if pos < text.len() {
+        dst.push(Span::styled(&text[pos..], base_style));
     }
 }
 
@@ -2628,7 +3089,7 @@ fn modal_step1_rect(area: Rect, desired_h: u16) -> Rect {
 fn modal_step2_rect(area: Rect, desired_h: u16) -> Rect {
     let target_w = (area.width * 54 / 100).max(52.min(area.width));
     let min_h = 10.min(area.height);
-    let max_h = (area.height * 46 / 100).max(min_h);
+    let max_h = (area.height * 72 / 100).max(min_h);
     centered_rect_sized(target_w, desired_h.clamp(min_h, max_h), area)
 }
 

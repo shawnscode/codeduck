@@ -7,6 +7,44 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use crate::i18n;
 use crate::model::DifftDisplayMode;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserSettingsMask {
+    pub ui_language: bool,
+    pub review_language: bool,
+    pub ai_provider: bool,
+    pub display_mode: bool,
+    pub ignore_comments: bool,
+    pub cache_ai_results: bool,
+    pub cache_history: bool,
+    pub reuse_session: bool,
+}
+
+impl UserSettingsMask {
+    pub fn all() -> Self {
+        Self {
+            ui_language: true,
+            review_language: true,
+            ai_provider: true,
+            display_mode: true,
+            ignore_comments: true,
+            cache_ai_results: true,
+            cache_history: true,
+            reuse_session: true,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.ui_language
+            || self.review_language
+            || self.ai_provider
+            || self.display_mode
+            || self.ignore_comments
+            || self.cache_ai_results
+            || self.cache_history
+            || self.reuse_session
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomAiConfig {
     pub name: String,
@@ -602,6 +640,16 @@ impl AppConfig {
     /// into `~/.codeduck/configs.toml` (or `explicit_path`) while preserving existing comments
     /// and unrelated sections such as `[ignore]` and `[[custom_ai]]`.
     pub fn save_user_settings(&self, explicit_path: Option<&Path>) -> Result<PathBuf> {
+        self.save_user_settings_mask(explicit_path, UserSettingsMask::all())
+    }
+
+    /// Persist only user settings flagged in `mask` into `~/.codeduck/configs.toml` (or `explicit_path`),
+    /// avoiding leaking unedited project-level `.codeduck` overrides into the user's global file.
+    pub fn save_user_settings_mask(
+        &self,
+        explicit_path: Option<&Path>,
+        mask: UserSettingsMask,
+    ) -> Result<PathBuf> {
         let target = explicit_path
             .map(PathBuf::from)
             .or_else(Self::config_path)
@@ -620,34 +668,50 @@ impl AppConfig {
             d
         };
 
-        ensure_table(&mut doc, "ui")?
-            .insert("language", Item::Value(Value::from(self.ui_language.as_str())));
-
-        {
-            let ai_tbl = ensure_table(&mut doc, "ai")?;
-            ai_tbl.insert("provider", Item::Value(Value::from(self.ai_provider.as_str())));
-            ai_tbl.insert(
-                "language",
-                Item::Value(Value::from(self.review_language.as_str())),
-            );
-            ai_tbl.insert(
-                "cache_ai_results",
-                Item::Value(Value::from(self.cache_ai_results)),
-            );
-            ai_tbl.insert("reuse_session", Item::Value(Value::from(self.reuse_session)));
+        if mask.ui_language {
+            ensure_table(&mut doc, "ui")?
+                .insert("language", Item::Value(Value::from(self.ui_language.as_str())));
         }
 
-        {
+        if mask.ai_provider || mask.review_language || mask.cache_ai_results || mask.reuse_session {
+            let ai_tbl = ensure_table(&mut doc, "ai")?;
+            if mask.ai_provider {
+                ai_tbl.insert("provider", Item::Value(Value::from(self.ai_provider.as_str())));
+            }
+            if mask.review_language {
+                ai_tbl.insert(
+                    "language",
+                    Item::Value(Value::from(self.review_language.as_str())),
+                );
+            }
+            if mask.cache_ai_results {
+                ai_tbl.insert(
+                    "cache_ai_results",
+                    Item::Value(Value::from(self.cache_ai_results)),
+                );
+            }
+            if mask.reuse_session {
+                ai_tbl.insert("reuse_session", Item::Value(Value::from(self.reuse_session)));
+            }
+        }
+
+        if mask.display_mode || mask.ignore_comments || mask.cache_history {
             let diff_tbl = ensure_table(&mut doc, "diff")?;
-            diff_tbl.insert(
-                "display_mode",
-                Item::Value(Value::from(self.display_mode.as_cli_arg())),
-            );
-            diff_tbl.insert(
-                "ignore_comments",
-                Item::Value(Value::from(self.ignore_comments)),
-            );
-            diff_tbl.insert("cache_history", Item::Value(Value::from(self.cache_history)));
+            if mask.display_mode {
+                diff_tbl.insert(
+                    "display_mode",
+                    Item::Value(Value::from(self.display_mode.as_cli_arg())),
+                );
+            }
+            if mask.ignore_comments {
+                diff_tbl.insert(
+                    "ignore_comments",
+                    Item::Value(Value::from(self.ignore_comments)),
+                );
+            }
+            if mask.cache_history {
+                diff_tbl.insert("cache_history", Item::Value(Value::from(self.cache_history)));
+            }
         }
 
         atomic_write_file(&target, &doc.to_string())?;

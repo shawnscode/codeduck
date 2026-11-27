@@ -29,6 +29,17 @@ pub fn export_review_markdown_with_locale(
     session: &ReviewSessionState,
     locale: &str,
 ) -> Result<()> {
+    let md = render_review_markdown_with_locale(bundle, ai_review, session, locale);
+    std::fs::write(output_path, md)?;
+    Ok(())
+}
+
+pub fn render_review_markdown_with_locale(
+    bundle: &DiffBundle,
+    ai_review: Option<&AiReviewResult>,
+    session: &ReviewSessionState,
+    locale: &str,
+) -> String {
     let mut md = String::new();
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
 
@@ -143,6 +154,38 @@ pub fn export_review_markdown_with_locale(
             }
             md.push('\n');
         }
+
+        let elevated_hunks: Vec<_> = ai
+            .hunks
+            .iter()
+            .filter(|h| {
+                h.risk_level.is_elevated()
+                    && (!h.title.trim().is_empty() || !h.analysis.trim().is_empty())
+            })
+            .collect();
+        if !elevated_hunks.is_empty() {
+            md.push_str(&t!("export.ai_hunks", locale = locale));
+            for h in elevated_hunks {
+                let loc = match (h.start_line, h.end_line) {
+                    (Some(s), Some(e)) if s != e => format!("{}:L{}-L{}", h.file, s, e),
+                    (Some(s), _) => format!("{}:L{}", h.file, s),
+                    _ => h.file.clone(),
+                };
+                let title = if h.title.trim().is_empty() {
+                    h.analysis.as_str()
+                } else {
+                    h.title.as_str()
+                };
+                md.push_str(&format!(
+                    "- **[{}] {}** (`{}`)\n  {}\n",
+                    h.risk_level.localized_label(locale),
+                    title,
+                    loc,
+                    h.analysis
+                ));
+            }
+            md.push('\n');
+        }
     }
 
     md.push_str(&t!("export.changed_files", locale = locale));
@@ -166,6 +209,5 @@ pub fn export_review_markdown_with_locale(
         md.push('\n');
     }
 
-    std::fs::write(output_path, md)?;
-    Ok(())
+    md
 }
