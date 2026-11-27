@@ -100,7 +100,7 @@ fn run_with_stdin(
     work_dir: &Path,
     timeout_secs: u64,
 ) -> Result<String> {
-    run_with_stdin_streaming(bin, args, stdin_data, work_dir, timeout_secs, |_| {})
+    run_with_stdin_streaming(bin, args, stdin_data, work_dir, timeout_secs, |_| false)
 }
 
 fn run_with_stdin_streaming<F>(
@@ -112,7 +112,7 @@ fn run_with_stdin_streaming<F>(
     mut on_stdout_line: F,
 ) -> Result<String>
 where
-    F: FnMut(&str),
+    F: FnMut(&str) -> bool,
 {
     let mut child = Command::new(bin)
         .args(args)
@@ -148,10 +148,22 @@ where
         })
     });
 
-    let mut drain_events = |stderr_hook: bool| {
+    let mut collected_stdout = String::new();
+    let mut terminal_result_at: Option<Instant> = None;
+
+    let drain_events = |stderr_hook: bool,
+                        on_line: &mut F,
+                        acc: &mut String,
+                        done_at: &mut Option<Instant>| {
         while let Ok(ev) = rx.try_recv() {
             match ev {
-                CliStreamEvent::StdoutLine(line) => on_stdout_line(&line),
+                CliStreamEvent::StdoutLine(line) => {
+                    acc.push_str(&line);
+                    acc.push('\n');
+                    if on_line(&line) && done_at.is_none() {
+                        *done_at = Some(Instant::now());
+                    }
+                }
                 CliStreamEvent::StderrLine(line) => {
                     if stderr_hook {
                         let trimmed = line.trim();
@@ -166,16 +178,31 @@ where
     };
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(5));
+    let mut lingering_reap = false;
     let status = loop {
-        drain_events(true);
+        drain_events(
+            true,
+            &mut on_stdout_line,
+            &mut collected_stdout,
+            &mut terminal_result_at,
+        );
         if crate::ai::is_current_task_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
             bail!("`{}` cancelled", bin);
         }
         match child.try_wait()? {
-            Some(st) => break st,
+            Some(st) => break Some(st),
             None => {
+                // Once an authoritative terminal `result` event has arrived in stream-json mode,
+                // give the CLI a brief grace window to exit naturally, then return immediately so
+                // slow sidecar/telemetry teardown never stalls the UI after output is complete.
+                if terminal_result_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(250)) {
+                    lingering_reap = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -186,20 +213,37 @@ where
         }
     };
 
+    if lingering_reap {
+        drain_events(
+            false,
+            &mut on_stdout_line,
+            &mut collected_stdout,
+            &mut terminal_result_at,
+        );
+        return Ok(collected_stdout);
+    }
+
     let stdout_text = out_handle.join().unwrap_or_default();
     let stderr_text = err_handle.join().unwrap_or_default();
-    drain_events(false);
+    drain_events(
+        false,
+        &mut on_stdout_line,
+        &mut collected_stdout,
+        &mut terminal_result_at,
+    );
 
-    if !status.success() {
-        let stderr = stderr_text.trim();
-        let stdout = stdout_text.trim();
-        bail!(
-            "`{}` exited with status {}: {}{}",
-            bin,
-            status,
-            stderr,
-            if stderr.is_empty() { stdout } else { "" }
-        );
+    if let Some(st) = status {
+        if !st.success() {
+            let stderr = stderr_text.trim();
+            let stdout = stdout_text.trim();
+            bail!(
+                "`{}` exited with status {}: {}{}",
+                bin,
+                st,
+                stderr,
+                if stderr.is_empty() { stdout } else { "" }
+            );
+        }
     }
 
     Ok(stdout_text)
@@ -386,7 +430,7 @@ impl AiProvider for CodexCliProvider {
             |line| {
                 let trimmed = line.trim();
                 if !trimmed.starts_with('{') {
-                    return;
+                    return false;
                 }
                 if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
                     match v.get("type").and_then(|t| t.as_str()) {
@@ -439,6 +483,7 @@ impl AiProvider for CodexCliProvider {
                         _ => {}
                     }
                 }
+                false
             },
         )?;
         let from_file = std::fs::read_to_string(out_file.path()).unwrap_or_default();
@@ -554,14 +599,14 @@ impl AiProvider for AgyCliProvider {
 
         let raw = run_with_stdin_streaming("agy", &args, "", work_dir, self.timeout_secs, |line| {
             if !want_json_envelope {
-                return;
+                return false;
             }
             let trimmed = line.trim();
             if !trimmed.starts_with('{') {
-                return;
+                return false;
             }
             let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
-                return;
+                return false;
             };
             match v.get("event").and_then(|e| e.as_str()) {
                 Some("init") => {
@@ -732,16 +777,32 @@ impl AiProvider for AgyCliProvider {
                                 .into_owned(),
                             ));
                         }
+                        let is_err = res
+                            .get("is_error")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
+                            || res.get("error").is_some();
+                        if !is_err
+                            && (stream_result.is_some() || !stream_text_buf.trim().is_empty())
+                        {
+                            return true;
+                        }
                     }
                 }
                 _ => {}
             }
+            false
         })?;
 
         if want_json_envelope {
             if let Some(resp) = stream_result {
+                let text = if json_mode && !resp.contains('{') && stream_text_buf.contains('{') {
+                    stream_text_buf
+                } else {
+                    resp
+                };
                 return Ok(AiPromptOutput {
-                    text: resp,
+                    text,
                     session_id: stream_sid.or_else(|| session_id.map(|s| s.to_string())),
                 });
             }
@@ -890,5 +951,34 @@ impl AiProvider for CustomCliProvider {
             text,
             session_id: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stream_finishes_promptly_after_terminal_result() {
+        let cwd = std::env::temp_dir();
+        let start = Instant::now();
+        let out = run_with_stdin_streaming(
+            "sh",
+            &[
+                "-c",
+                r#"echo '{"event":"result","result":{"response":"done"}}'; sleep 5"#,
+            ],
+            "",
+            &cwd,
+            10,
+            |line| line.contains(r#""event":"result""#),
+        )
+        .unwrap();
+        assert!(out.contains("done"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should not block waiting on post-result teardown: {:?}",
+            start.elapsed()
+        );
     }
 }

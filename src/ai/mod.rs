@@ -1,7 +1,6 @@
 pub mod cli_providers;
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -708,11 +707,11 @@ where
         rust_i18n::t!("ai.parsing_groups", locale = locale.as_str()).into_owned(),
     ));
     let mut stage1 =
-        parse_ai_review_json(&out1.text, deep_provider.display_name(), rendered_diffs)
+        parse_ai_review_json(&out1.text, fast_provider.display_name(), rendered_diffs)
             .with_context(|| {
                 format!(
                     "Failed to parse Stage 1 grouping JSON from {}",
-                    fast_provider.display_name()
+                    fast_provider.id()
                 )
             })?;
     if stage1.summary.trim().is_empty() && stage1.groups.is_empty() {
@@ -751,9 +750,18 @@ where
     ));
     let stage2 = parse_ai_review_json(&out2.text, deep_provider.display_name(), rendered_diffs)
         .with_context(|| {
+            let preview: String = out2
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect();
             format!(
-                "Failed to parse Stage 2 findings JSON from {}",
-                deep_provider.display_name()
+                "Stage 2 JSON parse failed ({}): {}",
+                deep_provider.id(),
+                preview
             )
         })?;
 
@@ -1129,94 +1137,6 @@ Rules:
     prompt
 }
 
-#[derive(Debug, Deserialize)]
-struct RawAiReview {
-    #[serde(default)]
-    summary: String,
-    #[serde(default)]
-    overall_risk: String,
-    #[serde(default)]
-    review_strategy: String,
-    #[serde(default)]
-    groups: Vec<RawGroup>,
-    #[serde(default)]
-    files: Vec<RawFile>,
-    #[serde(default)]
-    hunks: Vec<RawHunk>,
-    #[serde(default)]
-    findings: Vec<RawFinding>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawGroup {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    risk_level: String,
-    #[serde(default)]
-    review_order: u32,
-    #[serde(default)]
-    files: Vec<String>,
-    #[serde(default)]
-    key_points: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawFile {
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    risk_level: String,
-    #[serde(default)]
-    summary: String,
-    #[serde(default)]
-    review_focus: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawHunk {
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    chunk_index: Option<usize>,
-    #[serde(default)]
-    start_line: Option<u32>,
-    #[serde(default)]
-    end_line: Option<u32>,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    analysis: String,
-    #[serde(default)]
-    risk_level: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawFinding {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    line: Option<u32>,
-    #[serde(default)]
-    severity: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    suggestion: Option<String>,
-}
-
 fn scan_balanced_json_object(s: &str) -> Option<&str> {
     for (start, ch) in s.char_indices() {
         if ch != '{' {
@@ -1243,7 +1163,7 @@ fn scan_balanced_json_object(s: &str) -> Option<&str> {
                     depth -= 1;
                     if depth == 0 {
                         let candidate = &s[start..start + rel_idx + c.len_utf8()];
-                        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                        if parse_json_lenient(candidate).is_some() {
                             return Some(candidate);
                         }
                         break;
@@ -1256,12 +1176,52 @@ fn scan_balanced_json_object(s: &str) -> Option<&str> {
     None
 }
 
+/// Remove trailing commas before `}` or `]` outside JSON string literals.
+fn strip_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some((idx, c)) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == ',' {
+            let rest = &s[idx + 1..];
+            let next_non_ws = rest.chars().find(|ch| !ch.is_ascii_whitespace());
+            if !matches!(next_non_ws, Some('}') | Some(']')) {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_json_lenient(s: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        return Some(v);
+    }
+    let cleaned = strip_trailing_commas(s);
+    serde_json::from_str::<serde_json::Value>(&cleaned).ok()
+}
+
 pub fn extract_json_block(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
-    if trimmed.starts_with('{')
-        && trimmed.ends_with('}')
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
-    {
+    if trimmed.starts_with('{') && trimmed.ends_with('}') && parse_json_lenient(trimmed).is_some() {
         return Some(trimmed);
     }
 
@@ -1323,7 +1283,42 @@ fn is_review_json_object(val: &serde_json::Value) -> bool {
     EXPECTED_KEYS.iter().any(|k| obj.contains_key(*k))
 }
 
-fn find_review_json_object(s: &str) -> Option<&str> {
+fn unwrap_review_object<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    if is_review_json_object(val) {
+        return val.as_object();
+    }
+    let obj = val.as_object()?;
+    for wrapper_key in ["review", "data", "result", "response"] {
+        if let Some(inner) = obj.get(wrapper_key) {
+            if is_review_json_object(inner) {
+                return inner.as_object();
+            }
+        }
+    }
+    None
+}
+
+fn review_object_richness_score(obj: &serde_json::Map<String, serde_json::Value>, byte_len: usize) -> usize {
+    let count_arr = |k: &str| -> usize {
+        obj.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+    };
+    let structural_items =
+        count_arr("findings") + count_arr("hunks") + count_arr("files") + count_arr("groups");
+    let key_hits = ["summary", "overall_risk", "groups", "files", "hunks", "findings"]
+        .iter()
+        .filter(|k| obj.contains_key(**k))
+        .count();
+    structural_items * 10_000 + key_hits * 1_000 + byte_len.min(999)
+}
+
+fn find_best_review_json_value(s: &str) -> Option<serde_json::Value> {
+    if let Some(val) = parse_json_lenient(s.trim()) {
+        if let Some(obj) = unwrap_review_object(&val) {
+            return Some(serde_json::Value::Object(obj.clone()));
+        }
+    }
+
+    let mut best: Option<(usize, serde_json::Value)> = None;
     for (start, ch) in s.char_indices() {
         if ch != '{' {
             continue;
@@ -1349,9 +1344,15 @@ fn find_review_json_object(s: &str) -> Option<&str> {
                     depth -= 1;
                     if depth == 0 {
                         let candidate = &s[start..start + rel_idx + c.len_utf8()];
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
-                            if is_review_json_object(&val) {
-                                return Some(candidate);
+                        if let Some(val) = parse_json_lenient(candidate) {
+                            if let Some(obj) = unwrap_review_object(&val) {
+                                let score = review_object_richness_score(obj, candidate.len());
+                                if best
+                                    .as_ref()
+                                    .is_none_or(|(best_score, _)| score >= *best_score)
+                                {
+                                    best = Some((score, serde_json::Value::Object(obj.clone())));
+                                }
                             }
                         }
                         break;
@@ -1361,7 +1362,74 @@ fn find_review_json_object(s: &str) -> Option<&str> {
             }
         }
     }
-    None
+    best.map(|(_, v)| v)
+}
+
+fn val_str(v: Option<&serde_json::Value>) -> String {
+    match v {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn val_opt_str(v: Option<&serde_json::Value>) -> Option<String> {
+    match v {
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| s.clone())
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|x| val_str(Some(x)))
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn val_str_vec(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(|x| val_str(Some(x)))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn val_opt_u32(v: Option<&serde_json::Value>) -> Option<u32> {
+    match v {
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|u| u32::try_from(u).ok())
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u32)),
+        Some(serde_json::Value::String(s)) => {
+            let digits: String = s
+                .trim()
+                .trim_start_matches(['L', 'l', '#'])
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            (!digits.is_empty()).then(|| digits.parse::<u32>().ok()).flatten()
+        }
+        _ => None,
+    }
+}
+
+fn val_opt_usize(v: Option<&serde_json::Value>) -> Option<usize> {
+    val_opt_u32(v).map(|n| n as usize)
+}
+
+fn val_array<'a>(v: Option<&'a serde_json::Value>) -> &'a [serde_json::Value] {
+    v.and_then(|x| x.as_array()).map(Vec::as_slice).unwrap_or(&[])
 }
 
 pub fn parse_ai_review_json(
@@ -1369,101 +1437,112 @@ pub fn parse_ai_review_json(
     provider_name: &str,
     _rendered_diffs: &[FileDiffRendered],
 ) -> Result<AiReviewResult> {
-    let json_slice = match extract_json_block(raw_output) {
-        Some(slice)
-            if serde_json::from_str::<serde_json::Value>(slice)
-                .map(|v| is_review_json_object(&v))
-                .unwrap_or(false) =>
-        {
-            slice
-        }
-        _ => find_review_json_object(raw_output)
-            .context("No valid review JSON object found in AI provider response")?,
-    };
+    let root_val = find_best_review_json_value(raw_output)
+        .context("No valid review JSON object found in AI provider response")?;
 
-    let raw: RawAiReview = serde_json::from_str(json_slice)
+    let root = root_val
+        .as_object()
         .context("Invalid JSON schema in AI provider response")?;
 
-    let mut groups: Vec<ReviewGroup> = raw
-        .groups
-        .into_iter()
+    let mut groups: Vec<ReviewGroup> = val_array(root.get("groups"))
+        .iter()
         .enumerate()
-        .map(|(i, g)| ReviewGroup {
-            id: if g.id.is_empty() {
-                format!("g{}", i + 1)
-            } else {
-                g.id
-            },
-            title: if g.title.is_empty() {
-                format!("Group {}", i + 1)
-            } else {
-                g.title
-            },
-            description: g.description,
-            category: if g.category.is_empty() {
-                "other".to_string()
-            } else {
-                g.category
-            },
-            risk_level: RiskLevel::from_str_loose(&g.risk_level),
-            review_order: if g.review_order == 0 {
-                (i + 1) as u32
-            } else {
-                g.review_order
-            },
-            files: g.files,
-            key_points: g.key_points,
+        .filter_map(|(i, item)| {
+            let g = item.as_object()?;
+            let id = val_str(g.get("id"));
+            let title = val_str(g.get("title"));
+            let category = val_str(g.get("category"));
+            let order = val_opt_u32(g.get("review_order")).unwrap_or(0);
+            Some(ReviewGroup {
+                id: if id.is_empty() {
+                    format!("g{}", i + 1)
+                } else {
+                    id
+                },
+                title: if title.is_empty() {
+                    format!("Group {}", i + 1)
+                } else {
+                    title
+                },
+                description: val_str(g.get("description")),
+                category: if category.is_empty() {
+                    "other".to_string()
+                } else {
+                    category
+                },
+                risk_level: RiskLevel::from_str_loose(&val_str(g.get("risk_level"))),
+                review_order: if order == 0 { (i + 1) as u32 } else { order },
+                files: val_str_vec(g.get("files")),
+                key_points: val_str_vec(g.get("key_points")),
+            })
         })
         .collect();
 
     groups.sort_by_key(|g| g.review_order);
 
-    let files: Vec<FileAnalysis> = raw
-        .files
-        .into_iter()
-        .map(|f| FileAnalysis {
-            path: f.path,
-            category: if f.category.is_empty() {
-                "other".to_string()
-            } else {
-                f.category
-            },
-            risk_level: RiskLevel::from_str_loose(&f.risk_level),
-            summary: f.summary,
-            review_focus: f.review_focus,
+    let files: Vec<FileAnalysis> = val_array(root.get("files"))
+        .iter()
+        .filter_map(|item| {
+            let f = item.as_object()?;
+            let path = val_str(f.get("path").or_else(|| f.get("file")));
+            let category = val_str(f.get("category"));
+            Some(FileAnalysis {
+                path,
+                category: if category.is_empty() {
+                    "other".to_string()
+                } else {
+                    category
+                },
+                risk_level: RiskLevel::from_str_loose(&val_str(f.get("risk_level"))),
+                summary: val_str(f.get("summary").or_else(|| f.get("description"))),
+                review_focus: val_str_vec(f.get("review_focus")),
+            })
         })
         .collect();
 
-    let hunks: Vec<HunkAnalysis> = raw
-        .hunks
-        .into_iter()
-        .map(|h| HunkAnalysis {
-            file: h.file,
-            chunk_index: h.chunk_index,
-            start_line: h.start_line,
-            end_line: h.end_line,
-            title: h.title,
-            analysis: h.analysis,
-            risk_level: RiskLevel::from_str_loose(&h.risk_level),
+    let hunks: Vec<HunkAnalysis> = val_array(root.get("hunks"))
+        .iter()
+        .filter_map(|item| {
+            let h = item.as_object()?;
+            Some(HunkAnalysis {
+                file: val_str(h.get("file").or_else(|| h.get("path"))),
+                chunk_index: val_opt_usize(h.get("chunk_index")),
+                start_line: val_opt_u32(h.get("start_line").or_else(|| h.get("line"))),
+                end_line: val_opt_u32(h.get("end_line")),
+                title: val_str(h.get("title")),
+                analysis: val_str(
+                    h.get("analysis")
+                        .or_else(|| h.get("description"))
+                        .or_else(|| h.get("rationale")),
+                ),
+                risk_level: RiskLevel::from_str_loose(&val_str(h.get("risk_level"))),
+            })
         })
         .collect();
 
-    let mut findings: Vec<ReviewFinding> = raw
-        .findings
-        .into_iter()
+    let mut findings: Vec<ReviewFinding> = val_array(root.get("findings"))
+        .iter()
         .enumerate()
-        .map(|(i, f)| ReviewFinding {
-            id: if f.id.is_empty() {
-                format!("f{}", i + 1)
-            } else {
-                f.id
-            },
-            file: f.file,
-            line: f.line,
-            severity: Severity::from_str_loose(&f.severity),
-            title: f.title,
-            description: f.description,
-            suggestion: f.suggestion,
+        .filter_map(|(i, item)| {
+            let f = item.as_object()?;
+            let id = val_str(f.get("id"));
+            Some(ReviewFinding {
+                id: if id.is_empty() {
+                    format!("f{}", i + 1)
+                } else {
+                    id
+                },
+                file: val_str(f.get("file").or_else(|| f.get("path"))),
+                line: val_opt_u32(f.get("line").or_else(|| f.get("start_line"))),
+                severity: Severity::from_str_loose(&val_str(f.get("severity"))),
+                title: val_str(f.get("title")),
+                description: val_str(
+                    f.get("description")
+                        .or_else(|| f.get("message"))
+                        .or_else(|| f.get("detail")),
+                ),
+                suggestion: val_opt_str(f.get("suggestion")),
+            })
         })
         .collect();
 
@@ -1471,9 +1550,9 @@ pub fn parse_ai_review_json(
 
     Ok(AiReviewResult {
         provider_name: provider_name.to_string(),
-        summary: raw.summary,
-        overall_risk: RiskLevel::from_str_loose(&raw.overall_risk),
-        review_strategy: raw.review_strategy,
+        summary: val_str(root.get("summary")),
+        overall_risk: RiskLevel::from_str_loose(&val_str(root.get("overall_risk"))),
+        review_strategy: val_str(root.get("review_strategy")),
         groups,
         files,
         hunks,
