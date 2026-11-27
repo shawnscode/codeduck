@@ -1942,3 +1942,418 @@ fn test_localization_config_and_settings_modal() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(app.config.ui_language, "en");
 }
+
+#[test]
+fn git_submodule_uncommitted_commit_and_revert_flow() {
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Create child repo to serve as submodule upstream
+    let sub_origin = tmp.path().join("sub_origin");
+    fs::create_dir_all(sub_origin.join("docs")).unwrap();
+    run("git", &["init", "-b", "main"], &sub_origin);
+    run("git", &["config", "user.email", "t@example.com"], &sub_origin);
+    run("git", &["config", "user.name", "Tester"], &sub_origin);
+    fs::write(sub_origin.join("lib.rs"), "pub fn v() -> i32 { 1 }\n").unwrap();
+    fs::write(sub_origin.join("docs/guide.md"), "# Guide\n").unwrap();
+    run("git", &["add", "."], &sub_origin);
+    run("git", &["commit", "-m", "sub init"], &sub_origin);
+
+    // 2. Create superproject and add submodule at `moss`
+    let super_dir = tmp.path().join("super_repo");
+    fs::create_dir_all(&super_dir).unwrap();
+    run("git", &["init", "-b", "main"], &super_dir);
+    run("git", &["config", "user.email", "t@example.com"], &super_dir);
+    run("git", &["config", "user.name", "Tester"], &super_dir);
+    fs::write(super_dir.join("README.md"), "# Super\n").unwrap();
+    run("git", &["add", "README.md"], &super_dir);
+    run("git", &["commit", "-m", "super init"], &super_dir);
+
+    let sub_url = sub_origin.to_string_lossy().to_string();
+    run(
+        "git",
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &sub_url,
+            "moss",
+        ],
+        &super_dir,
+    );
+    run("git", &["commit", "-m", "add moss submodule"], &super_dir);
+
+    let sub_dir = super_dir.join("moss");
+    run("git", &["config", "user.email", "t@example.com"], &sub_dir);
+    run("git", &["config", "user.name", "Tester"], &sub_dir);
+
+    // 3. Modify main repo + modify/untracked/rename inside submodule
+    fs::write(super_dir.join("README.md"), "# Super\nupdated\n").unwrap();
+    fs::write(sub_dir.join("lib.rs"), "pub fn v() -> i32 { 2 }\n").unwrap();
+    fs::write(sub_dir.join("notes.txt"), "scratch note\n").unwrap();
+    run("git", &["mv", "docs/guide.md", "docs/trade.md"], &sub_dir);
+
+    let backend = vcs::open_vcs(&super_dir, Some(VcsKind::Git)).unwrap();
+    assert_eq!(backend.external_prefixes(), vec!["moss".to_string()]);
+
+    let bundle = backend
+        .collect_changes_filtered(&DiffTarget::Uncommitted, None)
+        .unwrap();
+    let paths: Vec<&str> = bundle.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "README.md",
+            "moss/docs/trade.md",
+            "moss/lib.rs",
+            "moss/notes.txt",
+        ]
+    );
+
+    let renamed = bundle
+        .changes
+        .iter()
+        .find(|c| c.path == "moss/docs/trade.md")
+        .unwrap();
+    assert_eq!(
+        renamed.kind,
+        codeduck::model::ChangeKind::Renamed {
+            from: "moss/docs/guide.md".to_string()
+        }
+    );
+    let lib_change = bundle
+        .changes
+        .iter()
+        .find(|c| c.path == "moss/lib.rs")
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(lib_change.old_content.as_deref().unwrap()),
+        "pub fn v() -> i32 { 1 }\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(lib_change.new_content.as_deref().unwrap()),
+        "pub fn v() -> i32 { 2 }\n"
+    );
+
+    // 4. Verify App marks submodule files `is_external: true` and main repo `false`
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "none".to_string();
+    let mut app = App::new(
+        std::sync::Arc::clone(&backend),
+        cfg,
+        DiffTarget::Uncommitted,
+        120,
+    )
+    .unwrap();
+    app.open_commit_confirm();
+    assert!(
+        !app.commit_files
+            .iter()
+            .find(|f| f.path == "README.md")
+            .unwrap()
+            .is_external
+    );
+    assert!(
+        app.commit_files
+            .iter()
+            .find(|f| f.path == "moss/lib.rs")
+            .unwrap()
+            .is_external
+    );
+
+    // 5. Revert modified + untracked file inside submodule without touching README.md or rename
+    let rev_outcome = backend.revert_files_detailed(&[
+        "moss/lib.rs".to_string(),
+        "moss/notes.txt".to_string(),
+    ]);
+    assert!(rev_outcome.error.is_none(), "err={:?}", rev_outcome.error);
+    assert!(!sub_dir.join("notes.txt").exists());
+    assert_eq!(
+        fs::read_to_string(sub_dir.join("lib.rs")).unwrap(),
+        "pub fn v() -> i32 { 1 }\n"
+    );
+
+    // 6. Commit remaining changes across main repo + submodule with separate messages:
+    //    submodule commits `docs/trade.md` first, then superproject merges updated `moss` gitlink!
+    let c_outcome = backend.commit_files_with_external_message(
+        &[
+            "README.md".to_string(),
+            "moss/docs/trade.md".to_string(),
+        ],
+        "feat: update super docs and sync moss",
+        Some("docs: rename guide.md to trade.md"),
+    );
+    assert!(c_outcome.error.is_none(), "err={:?}", c_outcome.error);
+    assert_eq!(c_outcome.committed_paths.len(), 2);
+
+    // 7. Because superproject commit automatically synced `moss` gitlink, working tree is now clean
+    let after_bundle = backend
+        .collect_changes_filtered(&DiffTarget::Uncommitted, None)
+        .unwrap();
+    assert!(
+        after_bundle.changes.is_empty(),
+        "expected clean tree after merged commit, got: {:?}",
+        after_bundle
+            .changes
+            .iter()
+            .map(|c| &c.path)
+            .collect::<Vec<_>>()
+    );
+
+    // Verify both repos received their own independent commit log messages,
+    // and superproject HEAD recorded both README.md and `moss` gitlink update!
+    let head_bundle = backend
+        .collect_changes_filtered(&DiffTarget::Commit("HEAD".to_string()), None)
+        .unwrap();
+    let head_paths: Vec<&str> = head_bundle.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(head_paths, vec!["README.md", "moss"]);
+    let sm_gitlink = head_bundle
+        .changes
+        .iter()
+        .find(|c| c.path == "moss")
+        .unwrap();
+    assert!(String::from_utf8_lossy(sm_gitlink.old_content.as_deref().unwrap()).starts_with("Submodule commit "));
+    assert!(String::from_utf8_lossy(sm_gitlink.new_content.as_deref().unwrap()).starts_with("Submodule commit "));
+
+    let sub_log = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(&sub_dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&sub_log.stdout).trim(),
+        "docs: rename guide.md to trade.md"
+    );
+    let super_log = backend.recent_commits(1).unwrap();
+    assert_eq!(super_log[0].message, "feat: update super docs and sync moss");
+
+    // 8. Also test submodule-only uncommitted edit through App Commit modal with mock AI
+    //    -> verifies separate external log generation + single-action merged superproject gitlink commit!
+    use codeduck::ui::app::CommitModalFocus;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fs::write(sub_dir.join("lib.rs"), "pub fn v() -> i32 { 42 }\n").unwrap();
+    let app_backend = vcs::open_vcs(&super_dir, Some(VcsKind::Git)).unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.ai_provider = "mock".to_string();
+    let mut app = App::new(app_backend, cfg, DiffTarget::Uncommitted, 120).unwrap();
+
+    // Open CommitConfirm ('S')
+    app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::CommitConfirm);
+    // In submodule-only selection, external log is separate (`ext_commit_message`)
+    // and main message auto-derives submodule link log (`Update submodule moss: ...`).
+    for _ in 0..40 {
+        app.poll_background();
+        if !app.any_commit_msg_generating() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!app.ext_commit_message.trim().is_empty());
+    assert!(
+        app.commit_message.starts_with("Update submodule moss:"),
+        "commit_message={:?}",
+        app.commit_message
+    );
+
+    // Tab cycles Files -> Message -> ExternalMessage -> Files, and rendering both boxes panics nowhere
+    let mut term = Terminal::new(TestBackend::new(110, 36)).unwrap();
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.commit_modal_focus, CommitModalFocus::Message);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.commit_modal_focus, CommitModalFocus::ExternalMessage);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.commit_modal_focus, CommitModalFocus::Files);
+
+    // Confirm -> Step 2 (renders both Main & External boxes cleanly) -> execute merged commit
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(
+        app.overlay,
+        codeduck::ui::app::OverlayKind::CommitDoubleConfirm
+    );
+    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    for _ in 0..40 {
+        app.poll_background();
+        if !app.commit_executing && !app.diff_loading {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::None);
+    assert!(
+        app.bundle.changes.is_empty(),
+        "expected completely clean superproject & submodule after merged commit, remaining={:?}",
+        app.bundle.changes
+    );
+}
+
+#[test]
+fn test_parse_stage2_review_json_lenient_variations() {
+    let raw = r#"
+I inspected the codebase first:
+```json
+{"summary": "preliminary note"}
+```
+
+Here is the final review:
+```json
+{
+  "overall_risk": "medium",
+  "files": [
+    {
+      "path": "src/lib.rs",
+      "category": null,
+      "risk_level": "medium",
+      "summary": null,
+      "review_focus": "Verify overflow guard",
+    },
+  ],
+  "hunks": [
+    {
+      "file": "src/lib.rs",
+      "chunk_index": "1",
+      "start_line": "40",
+      "end_line": "55",
+      "title": "Check math",
+      "analysis": "Handles saturating add",
+      "risk_level": "low",
+    },
+  ],
+  "findings": [
+    {
+      "id": null,
+      "file": null,
+      "line": "42-48",
+      "severity": "warning",
+      "title": "Global invariant",
+      "description": "Missing check when input is zero",
+      "suggestion": ["Add guard clause", "Add unit test"],
+    },
+  ],
+}
+```
+"#;
+    let parsed = ai::parse_ai_review_json(raw, "agy", &[]).unwrap();
+    assert_eq!(parsed.overall_risk, codeduck::model::RiskLevel::Medium);
+    assert_eq!(parsed.files.len(), 1);
+    assert_eq!(parsed.files[0].review_focus, vec!["Verify overflow guard"]);
+    assert_eq!(parsed.hunks.len(), 1);
+    assert_eq!(parsed.hunks[0].chunk_index, Some(1));
+    assert_eq!(parsed.hunks[0].start_line, Some(40));
+    assert_eq!(parsed.findings.len(), 1);
+    assert_eq!(parsed.findings[0].line, Some(42));
+    assert_eq!(
+        parsed.findings[0].suggestion.as_deref(),
+        Some("Add guard clause\nAdd unit test")
+    );
+}
+
+#[test]
+fn test_svn_same_repo_external_merges_commit_while_cross_repo_splits() {
+    let tmp = TempDir::new().unwrap();
+    let repo_a = tmp.path().join("repo_a");
+    let repo_b = tmp.path().join("repo_b");
+    let seed_a = tmp.path().join("seed_a");
+    let seed_b = tmp.path().join("seed_b");
+    let wc_main = tmp.path().join("wc_main");
+
+    run("svnadmin", &["create", repo_a.to_str().unwrap()], tmp.path());
+    run("svnadmin", &["create", repo_b.to_str().unwrap()], tmp.path());
+    let url_a = format!("file://{}", repo_a.display());
+    let url_b = format!("file://{}", repo_b.display());
+
+    // Populate repo_b (separate repository external)
+    run("svn", &["checkout", &url_b, seed_b.to_str().unwrap()], tmp.path());
+    fs::write(seed_b.join("cross.lua"), "return 1\n").unwrap();
+    run("svn", &["add", "cross.lua"], &seed_b);
+    run("svn", &["commit", "-m", "b r1"], &seed_b);
+
+    // Populate repo_a with /trunk and /shared, plus svn:externals pointing to BOTH:
+    //   - SameExt ^/shared (same SVN repo_a!)
+    //   - CrossExt <url_b> (different SVN repo_b!)
+    run("svn", &["checkout", &url_a, seed_a.to_str().unwrap()], tmp.path());
+    fs::create_dir_all(seed_a.join("trunk/Assets")).unwrap();
+    fs::create_dir_all(seed_a.join("shared")).unwrap();
+    fs::write(seed_a.join("trunk/main.lua"), "return 1\n").unwrap();
+    fs::write(seed_a.join("shared/same.lua"), "return 1\n").unwrap();
+    run("svn", &["add", "trunk", "shared"], &seed_a);
+    run(
+        "svn",
+        &[
+            "propset",
+            "svn:externals",
+            &format!("^/shared SameExt\nCrossExt {}\n", url_b),
+            "trunk/Assets",
+        ],
+        &seed_a,
+    );
+    run("svn", &["commit", "-m", "a r1"], &seed_a);
+
+    // Checkout trunk
+    let trunk_url = format!("{}/trunk", url_a);
+    run("svn", &["checkout", &trunk_url, wc_main.to_str().unwrap()], tmp.path());
+
+    // Modify main.lua, SameExt/same.lua (same repo), and CrossExt/cross.lua (different repo)
+    fs::write(wc_main.join("main.lua"), "return 2\n").unwrap();
+    fs::write(wc_main.join("Assets/SameExt/same.lua"), "return 2\n").unwrap();
+    fs::write(wc_main.join("Assets/CrossExt/cross.lua"), "return 2\n").unwrap();
+
+    let backend = vcs::open_vcs(&wc_main, Some(VcsKind::Svn)).unwrap();
+
+    // Only cross-repo external is returned as a split external prefix
+    let exts = backend.external_prefixes();
+    assert_eq!(exts, vec!["Assets/CrossExt".to_string()]);
+
+    // Uncommitted still collects all 3 changed files across main + both externals
+    let bundle = backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    let paths: Vec<&str> = bundle.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "Assets/CrossExt/cross.lua",
+            "Assets/SameExt/same.lua",
+            "main.lua",
+        ]
+    );
+
+    // Committing main.lua + Assets/SameExt/same.lua merges into ONE single SVN revision (r2)!
+    let head_before = backend.latest_revision().unwrap().unwrap();
+    assert_eq!(head_before, "1");
+    let merged_outcome = backend.commit_files_detailed(
+        &[
+            "main.lua".to_string(),
+            "Assets/SameExt/same.lua".to_string(),
+        ],
+        "feat: single atomic commit for main and same-repo external",
+    );
+    assert!(merged_outcome.error.is_none(), "err={:?}", merged_outcome.error);
+    assert_eq!(merged_outcome.committed_paths.len(), 2);
+
+    // Verify repo_a advanced by strictly 1 revision (r1 -> r2)
+    run("svn", &["update"], &wc_main);
+    let head_after = backend.latest_revision().unwrap().unwrap();
+    assert_eq!(head_after, "2");
+
+    // CrossExt still remains uncommitted until committed independently with external message
+    let remaining_bundle = backend.collect_changes(&DiffTarget::Uncommitted).unwrap();
+    assert_eq!(remaining_bundle.changes.len(), 1);
+    assert_eq!(remaining_bundle.changes[0].path, "Assets/CrossExt/cross.lua");
+
+    let cross_outcome = backend.commit_files_with_external_message(
+        &["Assets/CrossExt/cross.lua".to_string()],
+        "",
+        Some("ext: separate cross-repo update"),
+    );
+    assert!(cross_outcome.error.is_none(), "err={:?}", cross_outcome.error);
+    assert!(
+        backend
+            .collect_changes(&DiffTarget::Uncommitted)
+            .unwrap()
+            .changes
+            .is_empty()
+    );
+}
