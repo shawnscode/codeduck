@@ -1901,8 +1901,9 @@ fn test_localization_config_and_settings_modal() {
     assert_eq!(app.overlay, codeduck::ui::app::OverlayKind::Settings);
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     assert_eq!(app.config.ui_language, "zh-CN");
-    term.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
-    let zh_buf: String = term
+    let mut term_zh = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    term_zh.draw(|f| codeduck::ui::draw(f, &mut app)).unwrap();
+    let zh_buf: String = term_zh
         .backend()
         .buffer()
         .content()
@@ -1910,8 +1911,18 @@ fn test_localization_config_and_settings_modal() {
         .map(|c| c.symbol())
         .filter(|s| *s != " ")
         .collect();
-    assert!(zh_buf.contains("配置与语言设置"));
-    assert!(zh_buf.contains("简体中文"));
+    assert!(zh_buf.contains("配置与语言设置"), "zh_buf={}", zh_buf);
+    assert!(zh_buf.contains("简体中文"), "zh_buf={}", zh_buf);
+    assert!(
+        zh_buf.contains("未提交改动"),
+        "target_label={:?} zh_buf={}",
+        app.bundle.target.localized_label("zh-CN"),
+        zh_buf
+    );
+    assert!(zh_buf.contains("并排对照"), "zh_buf={}", zh_buf);
+    assert!(zh_buf.contains("浏览"), "zh_buf={}", zh_buf);
+    assert!(!zh_buf.contains("uncommitted"), "zh_buf={}", zh_buf);
+    assert!(!zh_buf.contains("NORMAL"), "zh_buf={}", zh_buf);
 
     // Press 's' to save and verify existing comment & [ignore] patterns are preserved
     app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));

@@ -38,6 +38,20 @@ impl DiffTarget {
             Self::Commit(spec.to_string())
         }
     }
+
+    pub fn localized_label(&self, locale: &str) -> String {
+        match self {
+            DiffTarget::Uncommitted => {
+                rust_i18n::t!("target.uncommitted", locale = locale).into_owned()
+            }
+            DiffTarget::Commit(rev) => {
+                rust_i18n::t!("target.commit", locale = locale, rev = rev).into_owned()
+            }
+            DiffTarget::Range { from, to } => {
+                rust_i18n::t!("target.range", locale = locale, from = from, to = to).into_owned()
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for DiffTarget {
@@ -237,6 +251,20 @@ impl DifftDisplayMode {
             DifftDisplayMode::Inline => "inline",
         }
     }
+
+    pub fn localized_label(&self, locale: &str) -> String {
+        match self {
+            DifftDisplayMode::SideBySide => {
+                rust_i18n::t!("display_mode.side_by_side", locale = locale).into_owned()
+            }
+            DifftDisplayMode::SideBySideShowBoth => {
+                rust_i18n::t!("display_mode.side_by_side_both", locale = locale).into_owned()
+            }
+            DifftDisplayMode::Inline => {
+                rust_i18n::t!("display_mode.inline", locale = locale).into_owned()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -330,6 +358,16 @@ impl RiskLevel {
             RiskLevel::Info => "INFO",
         }
     }
+
+    pub fn localized_label(&self, locale: &str) -> String {
+        match self {
+            RiskLevel::Critical => rust_i18n::t!("risk.critical", locale = locale).into_owned(),
+            RiskLevel::High => rust_i18n::t!("risk.high", locale = locale).into_owned(),
+            RiskLevel::Medium => rust_i18n::t!("risk.medium", locale = locale).into_owned(),
+            RiskLevel::Low => rust_i18n::t!("risk.low", locale = locale).into_owned(),
+            RiskLevel::Info => rust_i18n::t!("risk.info", locale = locale).into_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -361,6 +399,18 @@ impl Severity {
             Severity::Suggestion => "SUGG",
             Severity::Info => "INFO",
             Severity::Praise => "GOOD",
+        }
+    }
+
+    pub fn localized_label(&self, locale: &str) -> String {
+        match self {
+            Severity::Critical => rust_i18n::t!("severity.critical", locale = locale).into_owned(),
+            Severity::Warning => rust_i18n::t!("severity.warning", locale = locale).into_owned(),
+            Severity::Suggestion => {
+                rust_i18n::t!("severity.suggestion", locale = locale).into_owned()
+            }
+            Severity::Info => rust_i18n::t!("severity.info", locale = locale).into_owned(),
+            Severity::Praise => rust_i18n::t!("severity.praise", locale = locale).into_owned(),
         }
     }
 }

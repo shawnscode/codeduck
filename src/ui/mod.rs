@@ -101,7 +101,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         (
             Span::styled(
-                format!(" {} [{}] ", short_prov, ai.overall_risk.label()),
+                format!(" {} [{}] ", short_prov, ai.overall_risk.localized_label(locale)),
                 Style::default()
                     .fg(Color::Black)
                     .bg(risk_color(ai.overall_risk))
@@ -154,7 +154,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{}", app.bundle.target),
+            app.bundle.target.localized_label(locale),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -173,7 +173,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  |  "),
         Span::styled(
-            format!("Difft: {}", app.display_mode.label()),
+            t!(
+                "header.difft_label",
+                locale = locale,
+                mode = app.display_mode.localized_label(locale)
+            )
+            .into_owned(),
             Style::default().fg(Color::Cyan),
         ),
         Span::raw("  |  "),
@@ -201,7 +206,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         if let Some(m) = shown_model {
             line2_spans.push(Span::styled(
-                format!("  model:{}", m),
+                t!("header.model_badge", locale = locale, model = m).into_owned(),
                 Style::default().fg(Color::Magenta),
             ));
         }
@@ -216,7 +221,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         if let Some(e) = shown_effort {
             line2_spans.push(Span::styled(
-                format!("  effort:{}", e),
+                t!("header.effort_badge", locale = locale, effort = e).into_owned(),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -228,7 +233,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             {
                 let short: String = sid.chars().take(8).collect();
                 line2_spans.push(Span::styled(
-                    format!("  session:{}", short),
+                    t!("header.session_badge", locale = locale, session = short).into_owned(),
                     Style::default().fg(Color::Green),
                 ));
             }
@@ -409,13 +414,14 @@ fn draw_diff_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let locale = app.locale();
 
     let (title, text) = if app.diff_loading {
+        let target_label = app.bundle.target.localized_label(locale);
         (
-            t!("diff.loading_title", locale = locale, target = app.bundle.target).into_owned(),
+            t!("diff.loading_title", locale = locale, target = target_label).into_owned(),
             Text::raw(
                 t!(
                     "diff.loading_body",
                     locale = locale,
-                    target = app.bundle.target,
+                    target = target_label,
                     vcs = app.bundle.vcs
                 )
                 .into_owned(),
@@ -660,7 +666,7 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("[{} | {}]", grp.category, grp.risk_level.label()),
+                format!("[{} | {}]", grp.category, grp.risk_level.localized_label(locale)),
                 Style::default()
                     .fg(risk_color(grp.risk_level))
                     .add_modifier(Modifier::BOLD),
@@ -693,7 +699,12 @@ fn build_tree_context_info(app: &App) -> (String, Vec<Line<'static>>) {
             }
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{} [{}|{}]: ", fa.path, fa.category, fa.risk_level.label()),
+                    format!(
+                        "{} [{}|{}]: ",
+                        fa.path,
+                        fa.category,
+                        fa.risk_level.localized_label(locale)
+                    ),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(fa.summary.clone()),
@@ -758,7 +769,7 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("[{}] ", ha.risk_level.label()),
+                format!("[{}] ", ha.risk_level.localized_label(locale)),
                 Style::default()
                     .fg(risk_color(ha.risk_level))
                     .add_modifier(Modifier::BOLD),
@@ -780,7 +791,7 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
                     t!(
                         "inspector.file_badge",
                         locale = locale,
-                        risk = fa.risk_level.label()
+                        risk = fa.risk_level.localized_label(locale)
                     )
                     .into_owned(),
                     Style::default()
@@ -810,7 +821,7 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
             let line_tag = f.line.map(|l| format!("L{}: ", l)).unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("[{}] ", f.severity.label()),
+                    format!("[{}] ", f.severity.localized_label(locale)),
                     Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -844,11 +855,11 @@ fn build_diff_context_info(app: &App) -> (String, Vec<Line<'static>>) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let locale = app.locale();
     let mode_label = match app.input_mode {
-        InputMode::Normal => (" NORMAL ", Color::Green),
-        InputMode::Command => (" COMMAND ", Color::Yellow),
-        InputMode::Search => (" SEARCH ", Color::Cyan),
-        InputMode::AddNote => (" NOTE ", Color::Magenta),
-        InputMode::AskAi => (" ASK AI ", Color::Blue),
+        InputMode::Normal => (t!("mode.normal", locale = locale).into_owned(), Color::Green),
+        InputMode::Command => (t!("mode.command", locale = locale).into_owned(), Color::Yellow),
+        InputMode::Search => (t!("mode.search", locale = locale).into_owned(), Color::Cyan),
+        InputMode::AddNote => (t!("mode.note", locale = locale).into_owned(), Color::Magenta),
+        InputMode::AskAi => (t!("mode.ask_ai", locale = locale).into_owned(), Color::Blue),
     };
 
     let pending = app
@@ -1018,7 +1029,7 @@ fn draw_settings_modal(frame: &mut Frame, app: &App, area: Rect) {
         ),
         (
             t!("settings.display_mode", locale = locale).into_owned(),
-            format!("< {} >", app.display_mode.label()),
+            format!("< {} >", app.display_mode.localized_label(locale)),
         ),
         (
             t!("settings.ignore_comments", locale = locale).into_owned(),
@@ -1117,7 +1128,7 @@ fn draw_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut items = vec![ListItem::new(Line::from(vec![
         Span::styled(
-            "[WC] ",
+            t!("commit_picker.wc_badge", locale = locale).into_owned(),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),

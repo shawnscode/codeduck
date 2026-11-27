@@ -682,7 +682,7 @@ impl App {
         self.status_message = rust_i18n::t!(
             "status.fetching_diff",
             locale = self.locale(),
-            target = target
+            target = target.localized_label(self.locale())
         )
         .into_owned();
 
@@ -1017,7 +1017,7 @@ impl App {
                                 rust_i18n::t!(
                                     "status.diff_loaded",
                                     locale = self.locale(),
-                                    target = self.bundle.target,
+                                    target = self.bundle.target.localized_label(self.locale()),
                                     count = self.bundle.changes.len()
                                 )
                                 .into_owned()
@@ -1502,7 +1502,7 @@ impl App {
                         title: g.title.clone(),
                         description: g.description.clone(),
                         category: g.category.clone(),
-                        risk_label: g.risk_level.label().to_string(),
+                        risk_label: g.risk_level.localized_label(self.locale()),
                         file_count: valid_files.len(),
                         expanded,
                         order: g.review_order,
@@ -2040,6 +2040,7 @@ impl App {
                         let new_loc = i18n::next_locale(&self.config.ui_language, forward);
                         self.config.ui_language = new_loc.clone();
                         self.config.ui_language_explicit = true;
+                        self.rebuild_tree_rows();
                         let disp = i18n::display_name(&new_loc);
                         self.status_message = rust_i18n::t!(
                             "status.settings_ui_lang_hint",
@@ -3156,7 +3157,7 @@ impl App {
                 self.status_message = rust_i18n::t!(
                     "status.difft_mode",
                     locale = self.locale(),
-                    mode = self.display_mode.label()
+                    mode = self.display_mode.localized_label(self.locale())
                 )
                 .into_owned();
             }
@@ -3958,6 +3959,7 @@ impl App {
                         self.config.ui_language = loc.clone();
                         self.config.ui_language_explicit = true;
                         self.config.review_language = loc.clone();
+                        self.rebuild_tree_rows();
                         let disp = i18n::display_name(&loc);
                         self.status_message = rust_i18n::t!(
                             "status.lang_both_updated",
@@ -3987,6 +3989,7 @@ impl App {
                     if let Some(loc) = i18n::resolve_locale(arg) {
                         self.config.ui_language = loc.clone();
                         self.config.ui_language_explicit = true;
+                        self.rebuild_tree_rows();
                         let disp = i18n::display_name(&loc);
                         self.status_message = rust_i18n::t!(
                             "status.ui_lang_updated",

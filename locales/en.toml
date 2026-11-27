@@ -8,6 +8,37 @@ aliases = "en,en-us,en-gb,english"
 tree = "Focus Tree"
 diff = "Continuous Diff"
 
+[mode]
+normal = " NORMAL "
+command = " COMMAND "
+search = " SEARCH "
+note = " NOTE "
+ask_ai = " ASK AI "
+
+[target]
+uncommitted = "uncommitted"
+commit = "commit %{rev}"
+range = "%{from}..%{to}"
+
+[display_mode]
+side_by_side = "side-by-side"
+side_by_side_both = "side-by-side-both"
+inline = "inline"
+
+[risk]
+critical = "CRITICAL"
+high = "HIGH"
+medium = "MEDIUM"
+low = "LOW"
+info = "INFO"
+
+[severity]
+critical = "CRIT"
+warning = "WARN"
+suggestion = "SUGG"
+info = "INFO"
+praise = "GOOD"
+
 [status]
 startup_hint = "Tab:switch pane  j/k:move  n/N:next/prev diff  O:settings  ?:help"
 loading_diff = "Loading diff..."
@@ -67,9 +98,13 @@ grouping = " %{spin} Grouping %{secs}s "
 risks = " %{spin} Risks %{secs}s "
 ai_failed = " Analysis failed (a:retry/P:switch) "
 files_count = "Files: %{count}"
+difft_label = "Difft: %{mode}"
 view_label = "View: %{mode}"
 view_groups = "Groups"
 view_files = "Files"
+model_badge = "  model:%{model}"
+effort_badge = "  effort:%{effort}"
+session_badge = "  session:%{session}"
 
 [tree]
 title_grouped = " Change Groups (j/k:move  l:Diff  S:commit) "
@@ -164,6 +199,7 @@ config_file = "Config file: %{path}"
 actions = "[j/k] Move   [Space/h/l/Enter] Change   [s] Save   [Esc] Close"
 
 [commit_picker]
+wc_badge = "[WC] "
 wc_label = "Uncommitted working copy changes"
 title_loading = " Select Target to Review (checking history... | r:refresh, Esc:cancel) "
 title_ready = " Select Target to Review (Enter:load, r:refresh, Esc:cancel) "

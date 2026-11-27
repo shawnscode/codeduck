@@ -8,6 +8,37 @@ aliases = "zh,zh-cn,zh-hans,zh-sg,cn,chinese,中文,简体中文"
 tree = "左侧列表"
 diff = "右侧 Diff"
 
+[mode]
+normal = " 浏览 "
+command = " 命令 "
+search = " 搜索 "
+note = " 批注 "
+ask_ai = " 提问 "
+
+[target]
+uncommitted = "未提交改动"
+commit = "提交 %{rev}"
+range = "%{from}..%{to}"
+
+[display_mode]
+side_by_side = "并排对照"
+side_by_side_both = "并排完整"
+inline = "行内"
+
+[risk]
+critical = "严重"
+high = "高风险"
+medium = "中风险"
+low = "低风险"
+info = "信息"
+
+[severity]
+critical = "严重"
+warning = "警告"
+suggestion = "建议"
+info = "信息"
+praise = "好评"
+
 [status]
 startup_hint = "Tab:切换窗口  j/k:移动  n/N:跳块  O:设置  ?:帮助"
 loading_diff = "正在加载 Diff..."
@@ -67,9 +98,13 @@ grouping = " %{spin} 分组中 %{secs}s "
 risks = " %{spin} 风险分析 %{secs}s "
 ai_failed = " 分析失败 (a重试/P切换) "
 files_count = "文件: %{count}"
-view_label = "视图: %{mode}"
+difft_label = "视图模式: %{mode}"
+view_label = "列表: %{mode}"
 view_groups = "分组"
 view_files = "文件"
+model_badge = "  模型:%{model}"
+effort_badge = "  强度:%{effort}"
+session_badge = "  会话:%{session}"
 
 [tree]
 title_grouped = " 改动分组 (j/k:移动  l:Diff  S:提交) "
@@ -164,7 +199,8 @@ config_file = "配置文件: %{path}"
 actions = "[j/k] 移动   [Space/h/l/Enter] 切换   [s] 保存   [Esc] 关闭"
 
 [commit_picker]
-wc_label = "工作区未提交改动"
+wc_badge = "[工作区] "
+wc_label = "未提交改动"
 title_loading = " 选择审阅目标 (加载历史中... | r:刷新, Esc:取消) "
 title_ready = " 选择审阅目标 (Enter:加载, r:刷新, Esc:取消) "
 

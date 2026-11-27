@@ -47,7 +47,7 @@ pub fn export_review_markdown_with_locale(
     md.push_str(&format!(
         "- **{}**: {}\n",
         t!("export.target", locale = locale),
-        bundle.target
+        bundle.target.localized_label(locale)
     ));
     md.push_str(&format!(
         "- **{}**: {}\n",
@@ -77,7 +77,7 @@ pub fn export_review_markdown_with_locale(
         md.push_str(&format!(
             "- **{}**: {}\n",
             t!("export.overall_risk", locale = locale),
-            ai.overall_risk.label()
+            ai.overall_risk.localized_label(locale)
         ));
         md.push_str(&format!(
             "- **{}**: {}\n",
@@ -101,7 +101,7 @@ pub fn export_review_markdown_with_locale(
                     g.review_order,
                     g.title,
                     g.category,
-                    g.risk_level.label()
+                    g.risk_level.localized_label(locale)
                 ));
                 if !g.description.is_empty() {
                     md.push_str(&format!("{}\n\n", g.description));
@@ -128,7 +128,7 @@ pub fn export_review_markdown_with_locale(
                 };
                 md.push_str(&format!(
                     "- **[{}] {}** (`{}`)\n  {}\n",
-                    f.severity.label(),
+                    f.severity.localized_label(locale),
                     f.title,
                     loc,
                     f.description
